@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import json
 import os
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ from .export_store import ExportLedger, compute_hash
 from .fixture import PipelineStageError, run_overture_fixture
 from .intake import create_intake_record, load_intake_record
 from .linear_client import LinearAPIError, LinearClient
+from .metrics_store import DEFAULT_METRICS_DB_PATH, MetricsStore
 from .research_llm import (
     LLMSuggestedSourceAdapter,
     cli_approver,
@@ -128,6 +130,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="SQLite export ledger path. Defaults to $OVERTURE_HOME/.overture/exports.sqlite.",
     )
 
+    metrics = subparsers.add_parser(
+        "metrics",
+        help="Summarize recorded fixture stage metrics.",
+    )
+    metrics.add_argument(
+        "--db-path",
+        type=Path,
+        default=DEFAULT_METRICS_DB_PATH,
+        help="SQLite metrics database path. Defaults to .overture/metrics.sqlite.",
+    )
+    metrics.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default="table",
+        help="Output format. Defaults to table.",
+    )
+
     return parser
 
 
@@ -192,8 +211,52 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "export":
         return _export_ticket(args)
 
+    if args.command == "metrics":
+        return _metrics_summary(args)
+
     parser.print_help(sys.stderr)
     return 2
+
+
+def _metrics_summary(args: argparse.Namespace) -> int:
+    store = MetricsStore(args.db_path)
+    payload = _metrics_summary_payload(store, args.db_path)
+
+    if args.format == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    print(f"metrics db: {payload['db_path']}")
+    print(f"total runs: {payload['total_runs']}")
+    print("stage          count  median_ms  p95_ms  success_rate")
+    print("-----------------------------------------------------")
+    for stage_name in sorted(payload["stages"]):
+        stats = payload["stages"][stage_name]
+        print(
+            f"{stage_name:<14} "
+            f"{stats['count']:>5} "
+            f"{_format_metric_number(stats['median_ms']):>10} "
+            f"{_format_metric_number(stats['p95_ms']):>7} "
+            f"{stats['success_rate']:>12.0%}"
+        )
+    return 0
+
+
+def _metrics_summary_payload(store: MetricsStore, db_path: Path) -> dict[str, object]:
+    rows = list(store.iter_stages())
+    summary = store.summary()
+    return {
+        "db_path": str(db_path),
+        "total_runs": len({row.run_id for row in rows}),
+        "total_stage_rows": len(rows),
+        "stages": summary,
+    }
+
+
+def _format_metric_number(value: float | int) -> str:
+    if isinstance(value, float) and not value.is_integer():
+        return f"{value:.1f}"
+    return str(int(value))
 
 
 def _export_ticket(args: argparse.Namespace) -> int:
