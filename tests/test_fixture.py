@@ -58,6 +58,27 @@ class FixtureTests(unittest.TestCase):
             validate_ticket_draft(ticket)
             self.assertIn("# Add Overture end-to-end fixture", ticket)
             self.assertIn("## Graph provenance", ticket)
+            self.assertIn("- Nodes:", ticket)
+            self.assertIn("- Edges:", ticket)
+            self.assertIn("- Confidence:", ticket)
+            self.assertIn("- Conflicts:", ticket)
+
+            export_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "overture",
+                    "export",
+                    str(ticket_path),
+                    "--team-id",
+                    "team-id",
+                    "--dry-run",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("would create: title=Add Overture end-to-end fixture", export_result.stdout)
 
     def test_fixture_starts_from_raw_idea_override(self) -> None:
         idea = "Use Overture to test raw idea intake through ticket generation."
