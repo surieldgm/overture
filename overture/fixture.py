@@ -9,6 +9,7 @@ import re
 from typing import Any, Callable, Mapping
 
 from .graph import GraphRecord, research_result_to_graph_records
+from .graph_store import SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record
 from .research import CuratedSourceResearchAdapter, ResearchError, ResearchItem, ResearchResult
 from .synthesis import GraphContext, SynthesisBrief, synthesize_graph_context
@@ -87,6 +88,9 @@ def run_overture_fixture(
 
     try:
         graph_records = research_result_to_graph_records(research_result)
+        store = SqliteGraphStore()
+        for record in graph_records:
+            store.upsert_record(record)
         graph_context = _graph_context_from_fixture(intake_record, research_result, graph_records)
         graph_path = _write_json(
             base_dir / "graph" / "graph-records.json",
