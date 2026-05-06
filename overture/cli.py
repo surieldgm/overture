@@ -2,12 +2,16 @@
 
 Tests may temporarily replace `_linear_client_factory` to stub Linear HTTP while
 still exercising the real export command path.
+
+Metrics table output assumes the canonical fixture stage names fit in a
+12-character stage column to keep line lengths stable in narrow terminals.
 """
 
 from __future__ import annotations
 
 import argparse
 import inspect
+import json
 import os
 import sys
 from pathlib import Path
@@ -18,6 +22,7 @@ from .export_store import ExportLedger, compute_hash
 from .fixture import PipelineStageError, run_overture_fixture
 from .intake import create_intake_record, load_intake_record
 from .linear_client import LinearAPIError, LinearClient
+from .metrics_store import DEFAULT_METRICS_DB_PATH, MetricsStore
 from .research_llm import (
     LLMSuggestedSourceAdapter,
     cli_approver,
@@ -128,6 +133,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="SQLite export ledger path. Defaults to $OVERTURE_HOME/.overture/exports.sqlite.",
     )
 
+    metrics = subparsers.add_parser(
+        "metrics",
+        help="Summarize recorded fixture pipeline stage timings.",
+    )
+    metrics.add_argument(
+        "--db-path",
+        type=Path,
+        default=DEFAULT_METRICS_DB_PATH,
+        help="SQLite metrics DB path. Defaults to .overture/metrics.sqlite.",
+    )
+    metrics.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default="table",
+        help="Output format. Defaults to table.",
+    )
+    metrics.add_argument(
+        "--last",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="Restrict summary to the last N distinct runs by started_at.",
+    )
+
     return parser
 
 
@@ -192,6 +221,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "export":
         return _export_ticket(args)
 
+    if args.command == "metrics":
+        return _metrics(args)
+
     parser.print_help(sys.stderr)
     return 2
 
@@ -252,6 +284,74 @@ def _export_ticket(args: argparse.Namespace) -> int:
     ledger.record(ticket_path_key, ticket_hash, issue.id, issue.url)
     print(issue.url)
     return 0
+
+
+def _metrics(args: argparse.Namespace) -> int:
+    store = MetricsStore(args.db_path)
+    summary = store.summary(last_runs=args.last)
+    if not summary:
+        print("no metrics recorded yet", file=sys.stderr)
+        return 1
+
+    total_runs = store.count_runs(args.last)
+    if args.format == "json":
+        payload = dict(summary)
+        payload["total_runs"] = total_runs
+        print(json.dumps(payload, sort_keys=True))
+        return 0
+
+    print(_metrics_table(summary))
+    print(f"total runs: {total_runs}")
+    return 0
+
+
+def _metrics_table(summary: dict[str, dict[str, float | int]]) -> str:
+    widths = {
+        "stage": 12,
+        "count": 8,
+        "median_ms": 10,
+        "p95_ms": 10,
+        "success_rate": 12,
+    }
+    headers = ("stage", "count", "median_ms", "p95_ms", "success_rate")
+    lines = [_format_metrics_row(dict(zip(headers, headers)), widths)]
+    for stage_name in sorted(summary):
+        stats = summary[stage_name]
+        values = {
+            "stage": stage_name[: widths["stage"]],
+            "count": str(stats["count"]),
+            "median_ms": _format_number(stats["median_ms"]),
+            "p95_ms": _format_number(stats["p95_ms"]),
+            "success_rate": f"{float(stats['success_rate']):.2f}",
+        }
+        lines.append(_format_metrics_row(values, widths))
+    return "\n".join(lines)
+
+
+def _format_metrics_row(values: dict[str, str], widths: dict[str, int]) -> str:
+    return (
+        f"{values['stage']:<{widths['stage']}} "
+        f"{values['count']:>{widths['count']}} "
+        f"{values['median_ms']:>{widths['median_ms']}} "
+        f"{values['p95_ms']:>{widths['p95_ms']}} "
+        f"{values['success_rate']:>{widths['success_rate']}}"
+    ).rstrip()
+
+
+def _format_number(value: float | int) -> str:
+    if isinstance(value, float) and not value.is_integer():
+        return f"{value:.1f}"
+    return str(int(value))
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def _build_linear_client():
