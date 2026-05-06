@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,25 @@ class FixtureTests(unittest.TestCase):
             intake = json.loads(artifacts["intake"].read_text(encoding="utf-8"))
             self.assertEqual(intake["raw_text"], idea)
             self.assertTrue(artifacts["ticket_draft"].exists())
+
+    def test_fixture_reads_prior_store_context_for_synthesis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            previous_cwd = Path.cwd()
+            os.chdir(tmpdir)
+            try:
+                first = Path(tmpdir) / "first"
+                second = Path(tmpdir) / "second"
+                run_overture_fixture(first, idea="first idea about graph storage")
+                artifacts = run_overture_fixture(second, idea="second idea about querying the graph")
+            finally:
+                os.chdir(previous_cwd)
+
+            synthesis = json.loads(artifacts["synthesis"].read_text(encoding="utf-8"))
+            prior_concepts = [concept for concept in synthesis["connected_concepts"] if concept.get("from_prior")]
+            self.assertGreater(len(prior_concepts), 0)
+
+            ticket = artifacts["ticket_draft"].read_text(encoding="utf-8")
+            self.assertIn("`prior:", ticket)
 
     def test_fixture_failure_identifies_stage(self) -> None:
         def broken_intake(_idea: str, _store_dir: Path):

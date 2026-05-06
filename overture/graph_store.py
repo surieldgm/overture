@@ -17,8 +17,21 @@ from .graph import GraphRecord
 from .synthesis import GraphContext
 
 DEFAULT_GRAPH_DB_PATH = Path(".overture") / "graph.sqlite"
-NODE_KINDS = {"Source", "ResearchItem", "Claim"}
-EDGE_KINDS = {"CITES", "HAS_CLAIM"}
+NODE_KINDS = {
+    "Source",
+    "ResearchItem",
+    "Evidence",
+    "Claim",
+    "Idea",
+    "Need",
+    "Component",
+    "Capability",
+    "Constraint",
+    "Risk",
+    "TicketCandidate",
+    "UserInput",
+}
+EDGE_KINDS = {"CITES", "HAS_CLAIM", "derived_from", "supports", "addresses", "depends_on"}
 
 
 class SqliteGraphStore:
