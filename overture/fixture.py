@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
-from typing import Any, Callable, Mapping
+from time import perf_counter
+from typing import Any, Callable, Mapping, TypeVar
+from uuid import uuid4
 
 from .graph import GraphRecord, research_result_to_graph_records
 from .graph_store import DEFAULT_GRAPH_DB_PATH, SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record
+from .metrics_store import MetricsStore, StageMetric
 from .research import CuratedSourceResearchAdapter, ResearchError, ResearchItem, ResearchResult
 from .synthesis import GraphContext, SynthesisBrief, synthesize_graph_context
 from .ticket_writer import validate_linear_issue_payload
@@ -46,6 +50,8 @@ IMPERATIVE_TITLE_VERBS = (
     "Document",
 )
 
+T = TypeVar("T")
+
 
 class PipelineStageError(RuntimeError):
     """Raised when a fixture stage fails with stage-specific context."""
@@ -72,15 +78,31 @@ def run_overture_fixture(
     base_dir = Path(output_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
     artifacts: dict[str, Path] = {}
+    run_id = uuid4().hex
+    metrics = MetricsStore()
+    intake_id: str | None = None
 
     try:
-        intake_record, intake_path = (intake_factory or _create_fixture_intake)(idea, base_dir / "intake")
+        intake_record, intake_path = _record_fixture_stage(
+            metrics,
+            run_id,
+            "intake",
+            intake_id,
+            lambda: (intake_factory or _create_fixture_intake)(idea, base_dir / "intake"),
+        )
+        intake_id = intake_record.id
         artifacts["intake"] = intake_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
         _raise_stage("intake", exc)
 
     try:
-        research_result = _research_overture(intake_record)
+        research_result = _record_fixture_stage(
+            metrics,
+            run_id,
+            "research",
+            intake_id,
+            lambda: _research_overture(intake_record),
+        )
         if not research_result.ok:
             raise ValueError(_research_errors_text(research_result.errors))
         research_path = _write_json(base_dir / "research" / "research-notes.json", research_result)
@@ -89,44 +111,120 @@ def run_overture_fixture(
         _raise_stage("research", exc)
 
     try:
-        graph_records = research_result_to_graph_records(research_result)
-        store = SqliteGraphStore(_graph_store_db_path(graph_store_base_path))
-        prior_context = store.load_context()
-        for record in graph_records:
-            store.upsert_record(record)
-        graph_context = _graph_context_from_fixture(intake_record, research_result, graph_records)
-        for record in _graph_context_to_records(graph_context):
-            store.upsert_record(record)
-        graph_path = _write_json(
-            base_dir / "graph" / "graph-records.json",
-            {
-                "schema_version": "kg-minimal-v1",
-                "ingestion_records": graph_records,
-                "context": graph_context,
-            },
+        graph_records, prior_context, graph_context, graph_path = _record_fixture_stage(
+            metrics,
+            run_id,
+            "graph",
+            intake_id,
+            lambda: _run_graph_stage(
+                base_dir,
+                graph_store_base_path,
+                intake_record,
+                research_result,
+            ),
         )
         artifacts["graph"] = graph_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
         _raise_stage("graph", exc)
 
     try:
-        synthesis = synthesize_graph_context(graph_context, prior_context=prior_context)
+        synthesis = _record_fixture_stage(
+            metrics,
+            run_id,
+            "synthesis",
+            intake_id,
+            lambda: synthesize_graph_context(graph_context, prior_context=prior_context),
+        )
         synthesis_path = _write_json(base_dir / "synthesis" / "synthesis-brief.json", synthesis)
         artifacts["synthesis"] = synthesis_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
         _raise_stage("synthesis", exc)
 
     try:
-        ticket = render_ticket_draft(synthesis, graph_context)
-        validate_ticket_draft(ticket)
-        ticket_path = base_dir / "ticket" / "symphony-ticket-draft.md"
-        ticket_path.parent.mkdir(parents=True, exist_ok=True)
-        ticket_path.write_text(ticket, encoding="utf-8")
+        ticket_path = _record_fixture_stage(
+            metrics,
+            run_id,
+            "ticket_draft",
+            intake_id,
+            lambda: _run_ticket_draft_stage(base_dir, synthesis, graph_context),
+        )
         artifacts["ticket_draft"] = ticket_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
         _raise_stage("ticket_draft", exc)
 
     return artifacts
+
+
+def _record_fixture_stage(
+    metrics: MetricsStore,
+    run_id: str,
+    stage_name: str,
+    intake_id: str | None,
+    operation: Callable[[], T],
+) -> T:
+    started_at = _utc_now_iso()
+    started_monotonic = perf_counter()
+    status = "success"
+    error_message: str | None = None
+    try:
+        return operation()
+    except Exception as exc:
+        status = "failed"
+        error_message = str(exc)
+        raise
+    finally:
+        completed_at = _utc_now_iso()
+        duration_ms = max(0, int((perf_counter() - started_monotonic) * 1000))
+        metrics.record(
+            StageMetric(
+                run_id=run_id,
+                intake_id=intake_id,
+                stage_name=stage_name,
+                started_at=started_at,
+                completed_at=completed_at,
+                duration_ms=duration_ms,
+                status=status,
+                error_message=error_message,
+            )
+        )
+
+
+def _run_graph_stage(
+    base_dir: Path,
+    graph_store_base_path: Path | str | None,
+    intake_record: IntakeRecord,
+    research_result: ResearchResult,
+) -> tuple[list[GraphRecord], GraphContext, GraphContext, Path]:
+    graph_records = research_result_to_graph_records(research_result)
+    store = SqliteGraphStore(_graph_store_db_path(graph_store_base_path))
+    prior_context = store.load_context()
+    for record in graph_records:
+        store.upsert_record(record)
+    graph_context = _graph_context_from_fixture(intake_record, research_result, graph_records)
+    for record in _graph_context_to_records(graph_context):
+        store.upsert_record(record)
+    graph_path = _write_json(
+        base_dir / "graph" / "graph-records.json",
+        {
+            "schema_version": "kg-minimal-v1",
+            "ingestion_records": graph_records,
+            "context": graph_context,
+        },
+    )
+    return graph_records, prior_context, graph_context, graph_path
+
+
+def _run_ticket_draft_stage(base_dir: Path, synthesis: SynthesisBrief, graph_context: GraphContext) -> Path:
+    ticket = render_ticket_draft(synthesis, graph_context)
+    validate_ticket_draft(ticket)
+    ticket_path = base_dir / "ticket" / "symphony-ticket-draft.md"
+    ticket_path.parent.mkdir(parents=True, exist_ok=True)
+    ticket_path.write_text(ticket, encoding="utf-8")
+    return ticket_path
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def render_ticket_draft(synthesis: SynthesisBrief, graph_context: GraphContext) -> str:

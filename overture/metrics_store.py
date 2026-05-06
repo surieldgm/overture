@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 import sqlite3
 import statistics
-from typing import Iterator
+from typing import Iterable, Iterator
 
 DEFAULT_METRICS_DB_PATH = Path(".overture") / "metrics.sqlite"
 
@@ -89,9 +89,71 @@ class MetricsStore:
         for row in rows:
             yield _metric_from_row(row)
 
-    def summary(self) -> dict[str, dict[str, float | int]]:
+    def iter_stages_for_last_runs(self, run_limit: int) -> Iterator[StageMetric]:
+        if run_limit < 1:
+            raise ValueError("run_limit must be at least 1")
+
+        with self._connect() as connection:
+            run_rows = connection.execute(
+                """
+                SELECT run_id
+                FROM stage_metrics
+                GROUP BY run_id
+                ORDER BY max(started_at) DESC
+                LIMIT ?
+                """,
+                (run_limit,),
+            ).fetchall()
+            run_ids = [row["run_id"] for row in run_rows]
+            if not run_ids:
+                return
+
+            placeholders = ", ".join("?" for _ in run_ids)
+            rows = connection.execute(
+                f"""
+                SELECT run_id, intake_id, stage_name, started_at, completed_at, duration_ms, status, error_message
+                FROM stage_metrics
+                WHERE run_id IN ({placeholders})
+                ORDER BY started_at
+                """,
+                tuple(run_ids),
+            ).fetchall()
+
+        for row in rows:
+            yield _metric_from_row(row)
+
+    def count_runs(self, run_limit: int | None = None) -> int:
+        if run_limit is not None and run_limit < 1:
+            raise ValueError("run_limit must be at least 1")
+
+        with self._connect() as connection:
+            if run_limit is None:
+                row = connection.execute("SELECT count(DISTINCT run_id) FROM stage_metrics").fetchone()
+                return int(row[0])
+            row = connection.execute(
+                """
+                SELECT count(*)
+                FROM (
+                    SELECT run_id
+                    FROM stage_metrics
+                    GROUP BY run_id
+                    ORDER BY max(started_at) DESC
+                    LIMIT ?
+                )
+                """,
+                (run_limit,),
+            ).fetchone()
+            return int(row[0])
+
+    def summary(self, *, last_runs: int | None = None) -> dict[str, dict[str, float | int]]:
         grouped: dict[str, list[StageMetric]] = {}
-        for metric in self.iter_stages():
+        metrics: Iterable[StageMetric]
+        if last_runs is None:
+            metrics = self.iter_stages()
+        else:
+            metrics = self.iter_stages_for_last_runs(last_runs)
+
+        for metric in metrics:
             grouped.setdefault(metric.stage_name, []).append(metric)
 
         summaries: dict[str, dict[str, float | int]] = {}
