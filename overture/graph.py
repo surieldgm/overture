@@ -7,7 +7,26 @@ from typing import Any, Literal
 
 from .research import ResearchResult
 
-GraphRecordKind = Literal["Source", "ResearchItem", "Claim", "CITES", "HAS_CLAIM"]
+GraphRecordKind = Literal[
+    "Source",
+    "ResearchItem",
+    "Evidence",
+    "Claim",
+    "Idea",
+    "Need",
+    "Component",
+    "Capability",
+    "Constraint",
+    "Risk",
+    "TicketCandidate",
+    "UserInput",
+    "CITES",
+    "HAS_CLAIM",
+    "derived_from",
+    "supports",
+    "addresses",
+    "depends_on",
+]
 
 
 @dataclass(frozen=True)
