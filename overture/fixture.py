@@ -291,7 +291,8 @@ def _research_overture(intake: IntakeRecord) -> ResearchResult:
                     "TicketCandidate nodes represent implementation work derived from idea, evidence, and synthesis records.",
                 ],
             },
-        ]
+        ],
+        min_relevance=0,
     )
     return adapter.research(intake)
 
