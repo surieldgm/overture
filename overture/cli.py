@@ -7,13 +7,14 @@ still exercising the real export command path.
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import sys
 from pathlib import Path
 from typing import Sequence
 
 from .export import parse_ticket_file
-from .export_store import ExportStore
+from .export_store import ExportLedger, compute_hash
 from .fixture import PipelineStageError, run_overture_fixture
 from .intake import create_intake_record, load_intake_record
 from .linear_client import LinearAPIError, LinearClient
@@ -93,26 +94,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     export = subparsers.add_parser(
         "export",
-        help="Export a validated Symphony ticket draft to Linear.",
+        help="Create a Linear issue from a generated ticket Markdown file.",
     )
     export.add_argument(
         "ticket_path",
         type=Path,
-        help="Path to a Symphony-ready ticket Markdown draft.",
+        help="Path to the Markdown ticket draft to export.",
     )
     export.add_argument(
         "--team-id",
-        required=True,
-        help="Linear team ID for the created issue.",
+        default=os.environ.get("LINEAR_TEAM_ID"),
+        help="Linear team ID. Defaults to LINEAR_TEAM_ID.",
     )
     export.add_argument(
         "--project-id",
-        help="Optional Linear project ID for the created issue.",
+        default=os.environ.get("LINEAR_PROJECT_ID"),
+        help="Linear project ID. Defaults to LINEAR_PROJECT_ID.",
     )
     export.add_argument(
         "--dry-run",
         action="store_true",
-        help="Parse and validate the ticket without creating a Linear issue.",
+        help="Validate and print the issue payload without calling Linear.",
+    )
+    export.add_argument(
+        "--force-recreate",
+        action="store_true",
+        help="Create a new Linear issue even when this ticket path was exported before.",
     )
     export.add_argument(
         "--ledger-db",
@@ -183,50 +190,85 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result.items else 1
 
     if args.command == "export":
-        try:
-            parsed = parse_ticket_file(args.ticket_path)
-        except (OSError, ValueError) as exc:
-            print(f"invalid ticket {args.ticket_path}: {exc}", file=sys.stderr)
-            return 1
-
-        if args.dry_run:
-            print(f"title: {parsed.title}")
-            print(f"body: {_one_line_summary(parsed.description, 200)}")
-            return 0
-
-        store = ExportStore(args.ledger_db or _default_export_store_path())
-        existing = store.get(args.ticket_path)
-        if existing is not None:
-            print(f"already exported: {existing.linear_url}")
-            return 0
-
-        try:
-            issue = _linear_client_factory().create_issue(
-                team_id=args.team_id,
-                title=parsed.title,
-                description=parsed.description,
-                project_id=args.project_id,
-            )
-        except (RuntimeError, LinearAPIError) as exc:
-            print(f"export failed: {exc}", file=sys.stderr)
-            return 1
-
-        store.insert(
-            ticket_path=args.ticket_path,
-            title=parsed.title,
-            linear_issue_id=issue.id,
-            linear_identifier=issue.identifier,
-            linear_url=issue.url,
-        )
-        print(issue.url)
-        return 0
+        return _export_ticket(args)
 
     parser.print_help(sys.stderr)
     return 2
 
 
-def _one_line_summary(text: str, limit: int) -> str:
-    summary = " ".join(text.split())
-    if len(summary) <= limit:
-        return summary
-    return summary[: limit - 3].rstrip() + "..."
+def _export_ticket(args: argparse.Namespace) -> int:
+    ticket_path = args.ticket_path.expanduser().resolve(strict=False)
+    if not ticket_path.exists():
+        print(f"ticket file not found: {ticket_path}", file=sys.stderr)
+        return 2
+
+    try:
+        ticket_text = ticket_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"could not read ticket file {ticket_path}: {exc}", file=sys.stderr)
+        return 2
+
+    ticket_hash = compute_hash(ticket_text)
+    ticket_path_key = str(ticket_path)
+    ledger = ExportLedger(args.ledger_db or _default_export_store_path())
+    record = None if args.dry_run else ledger.find(ticket_path_key)
+    if record is not None and not args.force_recreate:
+        if record.ticket_hash == ticket_hash:
+            print(f"already exported: {record.linear_url}")
+            return 0
+        print(f"ticket changed since last export: {record.linear_url}", file=sys.stderr)
+        return 3
+
+    try:
+        parsed = parse_ticket_file(ticket_path)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if args.dry_run:
+        print(f"would create: title={parsed.title}")
+        print(parsed.description, end="" if parsed.description.endswith("\n") else "\n")
+        return 0
+
+    if not args.team_id:
+        print("missing required Linear team id: pass --team-id or set LINEAR_TEAM_ID", file=sys.stderr)
+        return 2
+
+    try:
+        client = _build_linear_client()
+        issue = client.create_issue(
+            team_id=args.team_id,
+            title=parsed.title,
+            description=parsed.description,
+            project_id=args.project_id,
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except LinearAPIError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    ledger.record(ticket_path_key, ticket_hash, issue.id, issue.url)
+    print(issue.url)
+    return 0
+
+
+def _build_linear_client():
+    signature = inspect.signature(_linear_client_factory)
+    required_positional = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.default is inspect.Parameter.empty
+        and parameter.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    if required_positional:
+        api_key = os.environ.get("LINEAR_API_KEY")
+        if not api_key:
+            raise RuntimeError("missing required environment variable: LINEAR_API_KEY")
+        return _linear_client_factory(api_key)
+    return _linear_client_factory()

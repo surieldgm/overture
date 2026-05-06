@@ -1,112 +1,125 @@
-"""SQLite ledger for Linear exports."""
+"""SQLite-backed export ledger for Linear issue creation.
+
+Ticket text is hashed after normalizing line endings to LF, stripping trailing
+whitespace from each line, and reducing trailing newlines to exactly one final
+newline. This keeps hashes stable across common editor and platform differences
+without storing ticket bodies in the ledger.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 import sqlite3
 from typing import Iterator
+
+DEFAULT_EXPORT_DB_PATH = Path(".overture") / "exports.sqlite"
 
 
 @dataclass(frozen=True)
 class ExportRecord:
     ticket_path: str
-    title: str
+    ticket_hash: str
     linear_issue_id: str
-    linear_identifier: str
     linear_url: str
-    created_at: str
+    exported_at: str
 
 
-class ExportStore:
-    """Persist exported ticket paths so re-runs are idempotent."""
+class ExportLedger:
+    """Persist exported ticket paths and their Linear issue destinations."""
 
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(self, db_path: Path | str = DEFAULT_EXPORT_DB_PATH) -> None:
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_schema()
+        with self._connect():
+            pass
 
-    def get(self, ticket_path: Path | str) -> ExportRecord | None:
-        key = _ticket_key(ticket_path)
+    def find(self, ticket_path: str) -> ExportRecord | None:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT ticket_path, title, linear_issue_id, linear_identifier, linear_url, created_at
+                SELECT ticket_path, ticket_hash, linear_issue_id, linear_url, exported_at
                 FROM exports
                 WHERE ticket_path = ?
                 """,
-                (key,),
+                (ticket_path,),
             ).fetchone()
-        if row is None:
-            return None
-        return ExportRecord(*row)
 
-    def insert(
+        return _record_from_row(row) if row else None
+
+    def record(
         self,
-        *,
-        ticket_path: Path | str,
-        title: str,
+        ticket_path: str,
+        ticket_hash: str,
         linear_issue_id: str,
-        linear_identifier: str,
         linear_url: str,
-    ) -> ExportRecord:
-        key = _ticket_key(ticket_path)
+    ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO exports (ticket_path, title, linear_issue_id, linear_identifier, linear_url)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (key, title, linear_issue_id, linear_identifier, linear_url),
-            )
-            row = connection.execute(
-                """
-                SELECT ticket_path, title, linear_issue_id, linear_identifier, linear_url, created_at
-                FROM exports
-                WHERE ticket_path = ?
-                """,
-                (key,),
-            ).fetchone()
-        return ExportRecord(*row)
-
-    def all(self) -> tuple[ExportRecord, ...]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT ticket_path, title, linear_issue_id, linear_identifier, linear_url, created_at
-                FROM exports
-                ORDER BY created_at, ticket_path
-                """
-            ).fetchall()
-        return tuple(ExportRecord(*row) for row in rows)
-
-    def _ensure_schema(self) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS exports (
-                    ticket_path TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    linear_issue_id TEXT NOT NULL,
-                    linear_identifier TEXT NOT NULL,
-                    linear_url TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                INSERT INTO exports (
+                    ticket_path,
+                    ticket_hash,
+                    linear_issue_id,
+                    linear_url,
+                    exported_at
                 )
-                """
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(ticket_path) DO UPDATE SET
+                    ticket_hash = excluded.ticket_hash,
+                    linear_issue_id = excluded.linear_issue_id,
+                    linear_url = excluded.linear_url,
+                    exported_at = excluded.exported_at
+                """,
+                (ticket_path, ticket_hash, linear_issue_id, linear_url, _utc_now()),
             )
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.db_path)
+        connection.row_factory = sqlite3.Row
+        _ensure_schema(connection)
+        return connection
 
 
-def _ticket_key(ticket_path: Path | str) -> str:
-    return str(Path(ticket_path).expanduser().resolve())
+def compute_hash(ticket_text: str) -> str:
+    normalized = "\n".join(line.rstrip() for line in ticket_text.splitlines()).rstrip("\n") + "\n"
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def iter_export_rows(db_path: Path | str) -> Iterator[sqlite3.Row]:
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     try:
-        yield from connection.execute("SELECT * FROM exports ORDER BY created_at, ticket_path")
+        yield from connection.execute("SELECT * FROM exports ORDER BY exported_at, ticket_path")
     finally:
         connection.close()
+
+
+def _ensure_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS exports (
+            ticket_path TEXT PRIMARY KEY,
+            ticket_hash TEXT NOT NULL,
+            linear_issue_id TEXT NOT NULL,
+            linear_url TEXT NOT NULL,
+            exported_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _record_from_row(row: sqlite3.Row) -> ExportRecord:
+    return ExportRecord(
+        ticket_path=row["ticket_path"],
+        ticket_hash=row["ticket_hash"],
+        linear_issue_id=row["linear_issue_id"],
+        linear_url=row["linear_url"],
+        exported_at=row["exported_at"],
+    )
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")

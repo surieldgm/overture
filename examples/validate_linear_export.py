@@ -31,8 +31,12 @@ def main() -> int:
             return exit_code
 
         lines = stdout.getvalue().splitlines()
-        title = next(line.removeprefix("title: ").strip() for line in lines if line.startswith("title: "))
-        body = next(line.removeprefix("body: ").strip() for line in lines if line.startswith("body: "))
+        title = next(
+            line.removeprefix("would create: title=").strip()
+            for line in lines
+            if line.startswith("would create: title=")
+        )
+        body = " ".join(lines[1:]).strip()
         print(f"Parsed title: {title}")
         print(f"Body summary: {body[:200]}")
         return 0

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .fixture import validate_ticket_draft
+from .ticket_writer import validate_linear_issue_payload
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,6 @@ class ParsedTicket:
 def parse_ticket_file(path: Path | str) -> ParsedTicket:
     ticket_path = Path(path)
     markdown = ticket_path.read_text(encoding="utf-8")
-    validate_ticket_draft(markdown)
 
     lines = markdown.splitlines()
     title = next((line[2:].strip() for line in lines if line.startswith("# ")), "")
@@ -28,4 +28,10 @@ def parse_ticket_file(path: Path | str) -> ParsedTicket:
         raise ValueError("ticket is missing section content")
 
     description = "\n".join(lines[description_start:]).strip() + "\n"
+    errors = validate_linear_issue_payload(title, markdown)
+    if errors:
+        try:
+            validate_ticket_draft(markdown)
+        except ValueError:
+            raise ValueError("; ".join(errors)) from None
     return ParsedTicket(title=title, description=description)
