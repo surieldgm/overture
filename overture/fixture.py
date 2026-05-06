@@ -13,6 +13,7 @@ from .graph_store import DEFAULT_GRAPH_DB_PATH, SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record
 from .research import CuratedSourceResearchAdapter, ResearchError, ResearchItem, ResearchResult
 from .synthesis import GraphContext, SynthesisBrief, synthesize_graph_context
+from .ticket_writer import validate_linear_issue_payload
 
 DEFAULT_FIXTURE_IDEA = (
     "Use Overture itself as the MVP idea: turn a raw product idea into durable "
@@ -197,10 +198,10 @@ def render_ticket_draft(synthesis: SynthesisBrief, graph_context: GraphContext) 
             *(evidence_lines or ["- Internal graph-only evidence from the Overture fixture context."]),
             "",
             "## Graph provenance",
-            f"- Source node IDs: {', '.join(f'`{node_id}`' for node_id in source_node_ids)}.",
-            f"- Relationships: {'; '.join(graph_relationships)}.",
-            "- Graph synthesis confidence: high.",
-            "- Unresolved graph conflicts: None.",
+            f"- Nodes: {', '.join(f'`{node_id}`' for node_id in source_node_ids)}.",
+            f"- Edges: {'; '.join(graph_relationships)}.",
+            "- Confidence: high.",
+            "- Conflicts: None.",
             "",
             "## Dependencies",
             "None",
@@ -248,11 +249,9 @@ def validate_ticket_draft(markdown: str) -> None:
     if not any("python -m " in line or "/" in line or "`" in line for line in validation_lines):
         raise TicketSchemaError("Validation plan must include executable commands or paths")
 
-    provenance = sections["Graph provenance"]
-    if "Graph synthesis confidence: high" not in provenance and "Graph synthesis confidence: medium" not in provenance and "Graph synthesis confidence: low" not in provenance:
-        raise TicketSchemaError("Graph provenance must include high, medium, or low synthesis confidence")
-    if "Unresolved graph conflicts:" not in provenance:
-        raise TicketSchemaError("Graph provenance must include unresolved graph conflicts")
+    errors = validate_linear_issue_payload(title, markdown)
+    if errors:
+        raise TicketSchemaError("; ".join(errors))
 
 
 def _create_fixture_intake(idea: str, store_dir: Path) -> tuple[IntakeRecord, Path]:

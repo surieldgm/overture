@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import overture.cli as cli
+from overture.fixture import run_overture_fixture
 from overture.linear_client import CreatedIssue
 
 
@@ -80,6 +81,24 @@ class ExportCliTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("required sections must appear in canonical order", result.stderr)
+
+    def test_dry_run_accepts_generated_fixture_ticket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifacts = run_overture_fixture(Path(tmpdir) / "fixture")
+
+            result = self._run_cli(
+                [
+                    "export",
+                    str(artifacts["ticket_draft"]),
+                    "--team-id",
+                    "team-id",
+                    "--dry-run",
+                ],
+                cwd=Path(tmpdir),
+            )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("would create: title=Add Overture end-to-end fixture", result.stdout)
 
     def test_missing_ticket_path_exits_2(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
