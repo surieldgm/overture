@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .fixture import PipelineStageError, run_overture_fixture
 from .intake import create_intake_record
 
 
@@ -30,6 +31,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory where intake records are stored.",
     )
 
+    fixture = subparsers.add_parser(
+        "fixture",
+        help="Run the deterministic Overture MVP end-to-end fixture.",
+    )
+    fixture.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(".overture") / "fixtures" / "overture-mvp",
+        help="Directory where fixture artifacts are written.",
+    )
+    fixture.add_argument(
+        "--idea",
+        help="Raw idea string to use instead of the built-in Overture MVP fixture idea.",
+    )
+
     return parser
 
 
@@ -47,6 +63,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print(path)
         print(record.id)
+        return 0
+
+    if args.command == "fixture":
+        try:
+            if args.idea:
+                artifacts = run_overture_fixture(args.output_dir, idea=args.idea)
+            else:
+                artifacts = run_overture_fixture(args.output_dir)
+        except PipelineStageError as exc:
+            print(f"fixture failed at {exc.stage}: {exc.message}", file=sys.stderr)
+            return 1
+
+        for stage, path in artifacts.items():
+            print(f"{stage}: {path}")
         return 0
 
     parser.print_help(sys.stderr)
