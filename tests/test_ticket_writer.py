@@ -1,3 +1,5 @@
+import unittest
+
 from overture.synthesis import GraphContext, synthesize_graph_context
 from overture.ticket_writer import (
     REQUIRED_SECTION_HEADINGS,
@@ -67,6 +69,35 @@ def test_validation_rejects_missing_required_ticket_sections() -> None:
 
     assert "required sections must appear in canonical order" in errors
     assert any("required sections cannot be empty" in error for error in errors)
+
+
+class TicketWriterGraphProvenanceContractTests(unittest.TestCase):
+    def test_generated_draft_uses_export_graph_provenance_labels(self) -> None:
+        draft = generate_linear_issue_draft(synthesize_graph_context(_overture_mvp_graph()))
+
+        self.assertIn("- Nodes:", draft.description)
+        self.assertIn("- Edges:", draft.description)
+        self.assertIn("- Confidence:", draft.description)
+        self.assertIn("- Conflicts:", draft.description)
+        self.assertNotIn("Source node IDs:", draft.description)
+        self.assertNotIn("Relationships:", draft.description)
+        self.assertEqual(validate_linear_issue_payload(draft.title, draft.description), ())
+
+    def test_export_validator_rejects_legacy_graph_provenance_labels(self) -> None:
+        draft = generate_linear_issue_draft(synthesize_graph_context(_overture_mvp_graph()))
+        legacy_description = (
+            draft.description.replace("Nodes:", "Source node IDs:")
+            .replace("Edges:", "Relationships:")
+            .replace("Confidence:", "Graph synthesis confidence:")
+            .replace("Conflicts:", "Unresolved graph conflicts:")
+        )
+
+        errors = validate_linear_issue_payload(draft.title, legacy_description)
+
+        self.assertIn("Graph provenance missing Nodes:", errors)
+        self.assertIn("Graph provenance missing Edges:", errors)
+        self.assertIn("Graph provenance missing Confidence:", errors)
+        self.assertIn("Graph provenance missing Conflicts:", errors)
 
 
 def _overture_mvp_graph() -> GraphContext:
