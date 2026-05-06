@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
 import sqlite3
+from typing import Iterator
 
 DEFAULT_EXPORT_DB_PATH = Path(".overture") / "exports.sqlite"
 
@@ -85,6 +86,15 @@ class ExportLedger:
 def compute_hash(ticket_text: str) -> str:
     normalized = "\n".join(line.rstrip() for line in ticket_text.splitlines()).rstrip("\n") + "\n"
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def iter_export_rows(db_path: Path | str) -> Iterator[sqlite3.Row]:
+    connection = sqlite3.connect(db_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        yield from connection.execute("SELECT * FROM exports ORDER BY exported_at, ticket_path")
+    finally:
+        connection.close()
 
 
 def _ensure_schema(connection: sqlite3.Connection) -> None:
