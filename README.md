@@ -52,6 +52,58 @@ ticket draft output. The generated ticket draft is written to:
 /tmp/overture-fixture/ticket/symphony-ticket-draft.md
 ```
 
+## Manual Workflow
+
+Use this workflow when manually exercising the current idea-to-research path.
+The commands below keep generated files outside the repository so repeated
+smoke tests do not dirty the working tree.
+
+1. Create an intake record:
+
+   ```sh
+   python -m overture intake "Manual smoke test for Overture" --store-dir /tmp/overture-store/intake
+   ```
+
+2. Copy the printed intake ID from the second output line.
+
+3. Run the research approval step for that intake:
+
+   ```sh
+   python -m overture research <intake-id> --store-dir /tmp/overture-store
+   ```
+
+   By default, this asks the local Codex CLI to suggest sources and then
+   prompts for manual approval of each candidate. Approve only sources you have
+   inspected. For deterministic local validation without calling Codex, use the
+   fake client:
+
+   ```sh
+   OVERTURE_LLM_CLIENT=fake python -m overture research <intake-id> --store-dir /tmp/overture-store
+   ```
+
+4. Inspect the generated research JSON:
+
+   ```sh
+   sed -n '1,200p' /tmp/overture-store/research/<intake-id>.json
+   ```
+
+5. Run the full deterministic fixture when you need the complete persisted MVP
+   artifact set:
+
+   ```sh
+   python -m overture fixture --output-dir /tmp/overture-fixture
+   ```
+
+   The fixture writes `intake`, `research`, `graph`, `synthesis`, and
+   `ticket_draft` artifacts and validates the Symphony-ready ticket draft before
+   writing it.
+
+6. To validate prior graph context across multiple runs, execute:
+
+   ```sh
+   python examples/validate_two_intake_loop.py
+   ```
+
 ## Manual Testing
 
 Use these checks when validating changes manually:
@@ -65,6 +117,10 @@ Use these checks when validating changes manually:
    `synthesis`, and `ticket_draft`.
 6. Inspect the generated ticket draft and confirm it contains the documented
    ticket sections in order.
+7. When research approval behavior changes, run the research command with
+   `OVERTURE_LLM_CLIENT=fake`, approve at least one suggested source, and
+   confirm `/tmp/overture-store/research/<intake-id>.json` contains approved
+   `items`.
 
 Example:
 
