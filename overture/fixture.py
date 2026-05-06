@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import sys
 from typing import Any, Callable, Mapping
+import uuid
 
 from .graph import GraphRecord, research_result_to_graph_records
 from .graph_store import DEFAULT_GRAPH_DB_PATH, SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record
+from .metrics_store import DEFAULT_METRICS_DB_PATH, MetricsStore, StageMetric, compute_duration_ms
 from .research import CuratedSourceResearchAdapter, ResearchError, ResearchItem, ResearchResult
 from .synthesis import GraphContext, SynthesisBrief, synthesize_graph_context
 from .ticket_writer import validate_linear_issue_payload
@@ -65,20 +69,27 @@ def run_overture_fixture(
     *,
     idea: str = DEFAULT_FIXTURE_IDEA,
     graph_store_base_path: Path | str | None = None,
+    metrics_db_path: Path | str | None = None,
     intake_factory: Callable[[str, Path], tuple[IntakeRecord, Path]] | None = None,
-) -> dict[str, Path]:
+) -> dict[str, Path | str]:
     """Run the deterministic Overture MVP fixture and persist every stage."""
 
+    run_id = uuid.uuid4().hex
+    metrics = _open_metrics_store(metrics_db_path or DEFAULT_METRICS_DB_PATH)
     base_dir = Path(output_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
-    artifacts: dict[str, Path] = {}
+    artifacts: dict[str, Path | str] = {"run_id": run_id}
 
+    started_at = _utc_now_iso()
     try:
         intake_record, intake_path = (intake_factory or _create_fixture_intake)(idea, base_dir / "intake")
         artifacts["intake"] = intake_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
+        _record_stage_metric(metrics, run_id, None, "intake", started_at, _utc_now_iso(), "failure", str(exc))
         _raise_stage("intake", exc)
+    _record_stage_metric(metrics, run_id, None, "intake", started_at, _utc_now_iso(), "success", None)
 
+    started_at = _utc_now_iso()
     try:
         research_result = _research_overture(intake_record)
         if not research_result.ok:
@@ -86,8 +97,11 @@ def run_overture_fixture(
         research_path = _write_json(base_dir / "research" / "research-notes.json", research_result)
         artifacts["research"] = research_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
+        _record_stage_metric(metrics, run_id, intake_record.id, "research", started_at, _utc_now_iso(), "failure", str(exc))
         _raise_stage("research", exc)
+    _record_stage_metric(metrics, run_id, intake_record.id, "research", started_at, _utc_now_iso(), "success", None)
 
+    started_at = _utc_now_iso()
     try:
         graph_records = research_result_to_graph_records(research_result)
         store = SqliteGraphStore(_graph_store_db_path(graph_store_base_path))
@@ -107,15 +121,23 @@ def run_overture_fixture(
         )
         artifacts["graph"] = graph_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
+        _record_stage_metric(metrics, run_id, intake_record.id, "graph", started_at, _utc_now_iso(), "failure", str(exc))
         _raise_stage("graph", exc)
+    _record_stage_metric(metrics, run_id, intake_record.id, "graph", started_at, _utc_now_iso(), "success", None)
 
+    started_at = _utc_now_iso()
     try:
         synthesis = synthesize_graph_context(graph_context, prior_context=prior_context)
         synthesis_path = _write_json(base_dir / "synthesis" / "synthesis-brief.json", synthesis)
         artifacts["synthesis"] = synthesis_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
+        _record_stage_metric(
+            metrics, run_id, intake_record.id, "synthesis", started_at, _utc_now_iso(), "failure", str(exc)
+        )
         _raise_stage("synthesis", exc)
+    _record_stage_metric(metrics, run_id, intake_record.id, "synthesis", started_at, _utc_now_iso(), "success", None)
 
+    started_at = _utc_now_iso()
     try:
         ticket = render_ticket_draft(synthesis, graph_context)
         validate_ticket_draft(ticket)
@@ -124,7 +146,11 @@ def run_overture_fixture(
         ticket_path.write_text(ticket, encoding="utf-8")
         artifacts["ticket_draft"] = ticket_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
+        _record_stage_metric(
+            metrics, run_id, intake_record.id, "ticket_draft", started_at, _utc_now_iso(), "failure", str(exc)
+        )
         _raise_stage("ticket_draft", exc)
+    _record_stage_metric(metrics, run_id, intake_record.id, "ticket_draft", started_at, _utc_now_iso(), "success", None)
 
     return artifacts
 
@@ -524,6 +550,47 @@ def _plain(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+def _open_metrics_store(db_path: Path | str) -> MetricsStore | None:
+    try:
+        return MetricsStore(db_path)
+    except Exception as exc:  # pragma: no cover - defensive metrics boundary
+        print(f"failed to open metrics store: {exc}", file=sys.stderr)
+        return None
+
+
+def _record_stage_metric(
+    metrics: MetricsStore | None,
+    run_id: str,
+    intake_id: str | None,
+    stage_name: str,
+    started_at: str,
+    completed_at: str,
+    status: str,
+    error_message: str | None,
+) -> None:
+    if metrics is None:
+        return
+
+    metric = StageMetric(
+        run_id=run_id,
+        intake_id=intake_id,
+        stage_name=stage_name,
+        started_at=started_at,
+        completed_at=completed_at,
+        duration_ms=compute_duration_ms(started_at, completed_at),
+        status=status,
+        error_message=error_message,
+    )
+    try:
+        metrics.record(metric)
+    except Exception as exc:  # pragma: no cover - defensive metrics boundary
+        print(f"failed to record stage metric for {stage_name}: {exc}", file=sys.stderr)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _raise_stage(stage: str, exc: Exception) -> None:
