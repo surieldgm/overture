@@ -54,9 +54,9 @@ ticket draft output. The generated ticket draft is written to:
 
 ## Manual Workflow
 
-Use this workflow when manually exercising the current idea-to-research path.
-The commands below keep generated files outside the repository so repeated
-smoke tests do not dirty the working tree.
+Use this workflow when manually exercising the current idea-to-ticket path. The
+commands below keep generated files outside the repository so repeated smoke
+tests do not dirty the working tree.
 
 1. Create an intake record:
 
@@ -98,7 +98,20 @@ smoke tests do not dirty the working tree.
    `ticket_draft` artifacts and validates the Symphony-ready ticket draft before
    writing it.
 
-6. To validate prior graph context across multiple runs, execute:
+6. Validate an export-ready ticket payload before creating a Linear issue:
+
+   ```sh
+   python -m overture export examples/overture_mvp_linear_issue_draft.md --team-id <linear-team-id> --dry-run
+   ```
+
+   To create the Linear issue, omit `--dry-run` and provide `LINEAR_API_KEY`.
+   Use `--project-id` when the issue should be assigned to a Linear project.
+   Overture records successful exports in `.overture/exports.sqlite`; rerunning
+   the same ticket path with unchanged content prints the existing Linear URL.
+   Use `--force-recreate` only when a changed ticket draft should create a new
+   issue.
+
+7. To validate prior graph context across multiple runs, execute:
 
    ```sh
    python examples/validate_two_intake_loop.py
@@ -121,12 +134,16 @@ Use these checks when validating changes manually:
    `OVERTURE_LLM_CLIENT=fake`, approve at least one suggested source, and
    confirm `/tmp/overture-store/research/<intake-id>.json` contains approved
    `items`.
+8. When export behavior changes, run `python -m overture export <ticket-path>
+   --team-id <linear-team-id> --dry-run` and confirm it prints the issue title
+   and body without calling Linear.
 
 Example:
 
 ```sh
 python -m overture intake "Manual smoke test for Overture" --store-dir /tmp/overture-intake
 python -m overture fixture --output-dir /tmp/overture-fixture
+python -m overture export examples/overture_mvp_linear_issue_draft.md --team-id team-id --dry-run
 sed -n '1,160p' /tmp/overture-fixture/ticket/symphony-ticket-draft.md
 ```
 
