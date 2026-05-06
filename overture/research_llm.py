@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 from typing import Any, Callable, Mapping
 
@@ -25,6 +27,7 @@ from .research import (
 )
 
 APPROVER_SKIP_VALUES = {"n", "no", "s", "skip"}
+CODEX_EXECUTABLE_ENV = "OVERTURE_CODEX_EXECUTABLE"
 
 
 class LLMSuggestedSourceAdapter(ResearchAdapter):
@@ -155,14 +158,37 @@ def cli_approver(source: CuratedSource) -> bool:
 def codex_cli_client(prompt: str) -> str:
     """Call the local Codex CLI. This opt-in client requires `codex` on PATH."""
 
+    codex_executable = _resolve_codex_executable()
     completed = subprocess.run(
-        ["codex", "exec", "--non-interactive"],
+        [codex_executable, "exec", "--non-interactive"],
         input=prompt,
         capture_output=True,
         check=True,
         text=True,
     )
     return completed.stdout
+
+
+def _resolve_codex_executable() -> str:
+    configured = os.environ.get(CODEX_EXECUTABLE_ENV)
+    if configured:
+        resolved = shutil.which(configured)
+        if resolved is not None:
+            return resolved
+        raise RuntimeError(
+            f"Codex CLI executable not found: {CODEX_EXECUTABLE_ENV}={configured!r} "
+            "does not resolve to an executable."
+        )
+
+    resolved = shutil.which("codex")
+    if resolved is not None:
+        return resolved
+
+    raise RuntimeError(
+        "Codex CLI executable not found on PATH. Install the Codex CLI, "
+        f"set {CODEX_EXECUTABLE_ENV}, or run with OVERTURE_LLM_CLIENT=fake "
+        "for deterministic local research."
+    )
 
 
 def fake_llm_client(prompt: str) -> str:

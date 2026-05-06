@@ -5,9 +5,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from overture.intake import create_intake_record
-from overture.research_llm import LLMSuggestedSourceAdapter
+from overture.research_llm import CODEX_EXECUTABLE_ENV, LLMSuggestedSourceAdapter, codex_cli_client
 
 
 def _intake() -> dict[str, str]:
@@ -127,6 +128,25 @@ class LLMSuggestedSourceAdapterTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(len(result.items), 1)
         self.assertNotEqual(result.items[0].source.url, "https://example.invalid/hallucinated")
+
+    def test_codex_cli_client_reports_missing_executable(self) -> None:
+        with mock.patch.dict(os.environ, {"PATH": "", CODEX_EXECUTABLE_ENV: ""}):
+            with self.assertRaisesRegex(RuntimeError, "Codex CLI executable not found on PATH"):
+                codex_cli_client("Suggest sources")
+
+    def test_codex_cli_client_uses_configured_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executable = Path(tmpdir) / "fake-codex"
+            executable.write_text(
+                "#!/bin/sh\n"
+                "cat >/dev/null\n"
+                "printf '[{\"title\":\"Configured Codex\"}]\\n'\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+
+            with mock.patch.dict(os.environ, {CODEX_EXECUTABLE_ENV: str(executable)}):
+                self.assertEqual(codex_cli_client("Suggest sources"), '[{"title":"Configured Codex"}]\n')
 
 
 class ResearchCliTests(unittest.TestCase):
