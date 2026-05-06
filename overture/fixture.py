@@ -9,7 +9,7 @@ import re
 from typing import Any, Callable, Mapping
 
 from .graph import GraphRecord, research_result_to_graph_records
-from .graph_store import SqliteGraphStore
+from .graph_store import DEFAULT_GRAPH_DB_PATH, SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record
 from .research import CuratedSourceResearchAdapter, ResearchError, ResearchItem, ResearchResult
 from .synthesis import GraphContext, SynthesisBrief, synthesize_graph_context
@@ -63,6 +63,7 @@ def run_overture_fixture(
     output_dir: Path | str = Path(".overture") / "fixtures" / "overture-mvp",
     *,
     idea: str = DEFAULT_FIXTURE_IDEA,
+    graph_store_base_path: Path | str | None = None,
     intake_factory: Callable[[str, Path], tuple[IntakeRecord, Path]] | None = None,
 ) -> dict[str, Path]:
     """Run the deterministic Overture MVP fixture and persist every stage."""
@@ -88,10 +89,11 @@ def run_overture_fixture(
 
     try:
         graph_records = research_result_to_graph_records(research_result)
-        store = SqliteGraphStore()
+        store = SqliteGraphStore(_graph_store_db_path(graph_store_base_path))
+        prior_context = store.load_context()
         for record in graph_records:
             store.upsert_record(record)
-        graph_context = _graph_context_from_fixture(intake_record, research_result, graph_records)
+        graph_context = _graph_context_from_fixture(intake_record, research_result, graph_records, prior_context)
         graph_path = _write_json(
             base_dir / "graph" / "graph-records.json",
             {
@@ -296,8 +298,10 @@ def _graph_context_from_fixture(
     intake: IntakeRecord,
     research: ResearchResult,
     graph_records: tuple[GraphRecord, ...],
+    prior_context: GraphContext | None = None,
 ) -> GraphContext:
     timestamp = intake.created_at
+    prior_nodes = _prior_nodes(prior_context)
     source_nodes = [
         {
             "id": record.key,
@@ -374,6 +378,7 @@ def _graph_context_from_fixture(
             "updated_at": timestamp,
             "provenance": _provenance("user_input", [], [intake.id], "Raw fixture idea entered the Overture pipeline."),
         },
+        *prior_nodes,
         {
             "id": idea_id,
             "type": "Idea",
@@ -465,6 +470,43 @@ def _graph_context_from_fixture(
     ]
 
     return GraphContext(nodes=tuple(nodes), edges=tuple(edges), claims=(), evidence=())
+
+
+def _graph_store_db_path(base_path: Path | str | None) -> Path:
+    if base_path is None:
+        return DEFAULT_GRAPH_DB_PATH
+    return Path(base_path) / "graph.sqlite"
+
+
+def _prior_nodes(prior_context: GraphContext | None) -> list[Mapping[str, Any]]:
+    if prior_context is None:
+        return []
+
+    prior_nodes: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for node in prior_context.nodes:
+        node_id = str(node.get("id") or "").strip()
+        if not node_id or node_id in seen:
+            continue
+        seen.add(node_id)
+        prior_nodes.append(
+            {
+                "id": f"prior:{node_id}",
+                "type": _prior_node_type(node),
+                "label": str(node.get("label") or node.get("title") or node_id),
+                "summary": str(node.get("summary") or node.get("text") or node.get("content") or node_id),
+                "status": "active",
+                "created_at": str(node.get("created_at") or ""),
+                "updated_at": str(node.get("created_at") or ""),
+                "provenance": _provenance("prior_context", [node_id], ["sqlite-graph-store"], "Prior graph node loaded from an earlier fixture run."),
+            }
+        )
+    return prior_nodes
+
+
+def _prior_node_type(node: Mapping[str, Any]) -> str:
+    node_type = str(node.get("type") or node.get("kind") or "").strip()
+    return node_type or "PriorNode"
 
 
 def _write_json(path: Path, value: Any) -> Path:
