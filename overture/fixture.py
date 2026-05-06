@@ -9,7 +9,7 @@ import re
 from typing import Any, Callable, Mapping
 
 from .graph import GraphRecord, research_result_to_graph_records
-from .graph_store import SqliteGraphStore
+from .graph_store import DEFAULT_GRAPH_DB_PATH, SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record
 from .research import CuratedSourceResearchAdapter, ResearchError, ResearchItem, ResearchResult
 from .synthesis import GraphContext, SynthesisBrief, synthesize_graph_context
@@ -63,6 +63,7 @@ def run_overture_fixture(
     output_dir: Path | str = Path(".overture") / "fixtures" / "overture-mvp",
     *,
     idea: str = DEFAULT_FIXTURE_IDEA,
+    graph_store_base_path: Path | str | None = None,
     intake_factory: Callable[[str, Path], tuple[IntakeRecord, Path]] | None = None,
 ) -> dict[str, Path]:
     """Run the deterministic Overture MVP fixture and persist every stage."""
@@ -88,7 +89,7 @@ def run_overture_fixture(
 
     try:
         graph_records = research_result_to_graph_records(research_result)
-        store = SqliteGraphStore()
+        store = SqliteGraphStore(_graph_store_db_path(graph_store_base_path))
         prior_context = store.load_context()
         for record in graph_records:
             store.upsert_record(record)
@@ -468,6 +469,12 @@ def _graph_context_from_fixture(
     ]
 
     return GraphContext(nodes=tuple(nodes), edges=tuple(edges), claims=(), evidence=())
+
+
+def _graph_store_db_path(base_path: Path | str | None) -> Path:
+    if base_path is None:
+        return DEFAULT_GRAPH_DB_PATH
+    return Path(base_path) / "graph.sqlite"
 
 
 def _write_json(path: Path, value: Any) -> Path:
