@@ -79,14 +79,13 @@ class MetricsE2ETests(unittest.TestCase):
             payload = json.loads(json_stdout.getvalue())
             self.assertEqual(
                 set(payload),
-                {"db_path", "stages", "total_runs", "total_stage_rows"},
+                set(EXPECTED_STAGES) | {"total_runs"},
                 "metrics JSON should contain the expected top-level keys",
             )
             self.assertEqual(payload["total_runs"], 2, "metrics JSON should report two total runs")
-            self.assertEqual(payload["total_stage_rows"], 10, "metrics JSON should report ten stage rows")
             self.assertEqual(
-                set(payload["stages"]),
-                set(EXPECTED_STAGES),
+                sum(payload[stage_name]["count"] for stage_name in EXPECTED_STAGES),
+                10,
                 "metrics JSON should contain all five stage summaries",
             )
 
