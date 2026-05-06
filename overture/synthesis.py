@@ -6,6 +6,9 @@ from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
 
+PRIOR_CONTEXT_LIMIT = 20
+CONCEPT_NODE_TYPES = {"Idea", "Need", "Component", "Capability", "Constraint", "Risk", "TicketCandidate"}
+
 BRIEF_SECTION_ORDER = (
     "Problem",
     "User need",
@@ -49,6 +52,7 @@ class ConnectedConcept:
     label: str
     summary: str
     relationships: tuple[str, ...] = ()
+    from_prior: bool = False
 
 
 @dataclass(frozen=True)
@@ -86,7 +90,11 @@ class SynthesisBrief:
         return asdict(self)
 
 
-def synthesize_graph_context(context: GraphContext | Mapping[str, Any]) -> SynthesisBrief:
+def synthesize_graph_context(
+    context: GraphContext | Mapping[str, Any],
+    *,
+    prior_context: GraphContext | Mapping[str, Any] | None = None,
+) -> SynthesisBrief:
     """Convert graph context into a structured product/engineering brief.
 
     The synthesizer is intentionally deterministic: it organizes the graph
@@ -94,29 +102,32 @@ def synthesize_graph_context(context: GraphContext | Mapping[str, Any]) -> Synth
     """
 
     normalized = _normalize_context(context)
+    prior = _normalize_context(prior_context) if prior_context is not None else None
     nodes = normalized.nodes
     edges = normalized.edges
     explicit_claims = normalized.claims
     explicit_evidence = normalized.evidence
+    prior_nodes = prior.nodes if prior else ()
+    prior_edges = prior.edges if prior else ()
 
-    nodes_by_id = {_node_id(node): node for node in nodes if _node_id(node)}
+    nodes_by_id = _nodes_by_id((*nodes, *prior_nodes) if prior else nodes)
+    all_edges = (*edges, *prior_edges) if prior else edges
     all_claims = (*_nodes_of_type(nodes, "Claim"), *explicit_claims)
     all_evidence = (*_nodes_of_type(nodes, "Evidence"), *explicit_evidence)
+    if prior:
+        all_claims = _dedupe_by_id((*all_claims, *_nodes_of_type(prior_nodes, "Claim"), *prior.claims))
+        all_evidence = _dedupe_by_id((*all_evidence, *_nodes_of_type(prior_nodes, "Evidence"), *prior.evidence))
     ticket_nodes = _nodes_of_type(nodes, "TicketCandidate")
 
     problem_node = _first_of_type(nodes, ("Idea", "UserInput")) or _first_node(nodes)
     need_node = _first_of_type(nodes, ("Need",))
     capability_node = _first_of_type(nodes, ("Component", "Capability", "Idea")) or problem_node
 
-    evidence_refs = tuple(_evidence_reference(item, edges, nodes_by_id) for item in all_evidence)
-    evidence_backed_claims, assumptions = _split_claims(all_claims, edges, nodes_by_id)
+    evidence_refs = tuple(_evidence_reference(item, all_edges, nodes_by_id) for item in all_evidence)
+    evidence_backed_claims, assumptions = _split_claims(all_claims, all_edges, nodes_by_id)
     tickets = tuple(_candidate_ticket(node) for node in ticket_nodes) or (_fallback_ticket(problem_node, need_node),)
 
-    connected_concepts = tuple(
-        _connected_concept(node, edges)
-        for node in nodes
-        if _node_type(node) in {"Idea", "Need", "Component", "Capability", "Constraint", "Risk", "TicketCandidate"}
-    )
+    connected_concepts = _connected_concepts(nodes, edges, prior)
 
     risks = tuple(_risk_text(node) for node in _nodes_of_type(nodes, "Risk"))
     if not risks and assumptions:
@@ -161,8 +172,57 @@ def _as_mappings(values: Any) -> tuple[Mapping[str, Any], ...]:
     return tuple(value for value in values if isinstance(value, Mapping))
 
 
+def _nodes_by_id(nodes: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    return {_node_id(node): node for node in nodes if _node_id(node)}
+
+
+def _dedupe_by_id(values: Sequence[Mapping[str, Any]]) -> tuple[Mapping[str, Any], ...]:
+    deduped: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for value in values:
+        value_id = _node_id(value)
+        if value_id and value_id in seen:
+            continue
+        if value_id:
+            seen.add(value_id)
+        deduped.append(value)
+    return tuple(deduped)
+
+
 def _nodes_of_type(nodes: Sequence[Mapping[str, Any]], node_type: str) -> tuple[Mapping[str, Any], ...]:
     return tuple(node for node in nodes if _node_type(node) == node_type)
+
+
+def _connected_concepts(
+    nodes: Sequence[Mapping[str, Any]],
+    edges: Sequence[Mapping[str, Any]],
+    prior: GraphContext | None,
+) -> tuple[ConnectedConcept, ...]:
+    concepts = [_connected_concept(node, edges) for node in nodes if _node_type(node) in CONCEPT_NODE_TYPES]
+    if prior is None:
+        return tuple(concepts)
+
+    seen = {concept.id for concept in concepts if concept.id}
+    prior_count = 0
+    for node in sorted(
+        (node for node in prior.nodes if _node_type(node) in CONCEPT_NODE_TYPES),
+        key=_created_at_sort_key,
+        reverse=True,
+    ):
+        node_id = _node_id(node)
+        if node_id in seen:
+            continue
+        concepts.append(_connected_concept(node, prior.edges, from_prior=True))
+        if node_id:
+            seen.add(node_id)
+        prior_count += 1
+        if prior_count >= PRIOR_CONTEXT_LIMIT:
+            break
+    return tuple(concepts)
+
+
+def _created_at_sort_key(node: Mapping[str, Any]) -> str:
+    return str(node.get("created_at") or _properties(node).get("created_at") or "")
 
 
 def _first_of_type(nodes: Sequence[Mapping[str, Any]], node_types: tuple[str, ...]) -> Mapping[str, Any] | None:
@@ -311,7 +371,7 @@ def _is_assumption(
     return bool(claim_id)
 
 
-def _connected_concept(node: Mapping[str, Any], edges: Sequence[Mapping[str, Any]]) -> ConnectedConcept:
+def _connected_concept(node: Mapping[str, Any], edges: Sequence[Mapping[str, Any]], *, from_prior: bool = False) -> ConnectedConcept:
     node_id = _node_id(node)
     relationships = tuple(
         f"{_edge_type(edge)} -> {_edge_to(edge)}"
@@ -324,6 +384,7 @@ def _connected_concept(node: Mapping[str, Any], edges: Sequence[Mapping[str, Any
         label=_label(node),
         summary=_summary(node),
         relationships=relationships,
+        from_prior=from_prior,
     )
 
 

@@ -38,6 +38,27 @@ def test_ticket_writer_accepts_mapping_synthesis_output() -> None:
     assert validate_linear_issue_payload(draft.title, draft.description) == ()
 
 
+def test_ticket_writer_prefixes_prior_concepts_in_graph_provenance() -> None:
+    brief = synthesize_graph_context(
+        _overture_mvp_graph(),
+        prior_context=GraphContext(
+            nodes=(
+                {
+                    "id": "idea_prior_state",
+                    "type": "Idea",
+                    "summary": "Prior idea to compare against.",
+                    "created_at": "2026-05-04T00:00:00Z",
+                },
+            )
+        ),
+    )
+
+    draft = generate_linear_issue_draft(brief)
+
+    assert "`prior:idea_prior_state`" in draft.description
+    assert validate_linear_issue_payload(draft.title, draft.description) == ()
+
+
 def test_validation_rejects_missing_required_ticket_sections() -> None:
     errors = validate_linear_issue_payload(
         "Add invalid ticket",

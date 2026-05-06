@@ -262,7 +262,12 @@ def _sources(brief: SynthesisBrief) -> str:
 
 
 def _graph_provenance(brief: SynthesisBrief, candidate: CandidateTicket) -> str:
-    node_ids = tuple(dict.fromkeys((*candidate.source_node_ids, *(concept.id for concept in brief.connected_concepts if concept.id))))
+    concept_node_ids = (
+        f"prior:{concept.id}" if concept.from_prior else concept.id
+        for concept in brief.connected_concepts
+        if concept.id
+    )
+    node_ids = tuple(dict.fromkeys((*candidate.source_node_ids, *concept_node_ids)))
     edges = tuple(
         relationship
         for concept in brief.connected_concepts
@@ -350,6 +355,7 @@ def _connected_concept(value: Any) -> ConnectedConcept:
         label=str(item.get("label", "")).strip(),
         summary=str(item.get("summary", "")).strip(),
         relationships=tuple(str(ref) for ref in _sequence(item.get("relationships", ()))),
+        from_prior=bool(item.get("from_prior", False)),
     )
 
 

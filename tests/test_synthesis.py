@@ -1,4 +1,4 @@
-from overture.synthesis import BRIEF_SECTION_ORDER, GraphContext, synthesize_graph_context
+from overture.synthesis import BRIEF_SECTION_ORDER, PRIOR_CONTEXT_LIMIT, GraphContext, synthesize_graph_context
 
 
 def test_synthesizes_overture_mvp_graph_into_structured_brief() -> None:
@@ -196,3 +196,67 @@ def test_synthesis_accepts_mapping_context_and_returns_fallback_ticket() -> None
 
     assert brief.candidate_ticket_breakdown[0].id == "ticketcandidate_synthesize_graph_context"
     assert brief.to_dict()["section_order"] == BRIEF_SECTION_ORDER
+
+
+def test_synthesis_includes_prior_connected_concepts_current_first() -> None:
+    current = GraphContext(
+        nodes=(
+            {
+                "id": "idea_current",
+                "type": "Idea",
+                "summary": "Current idea about querying the graph.",
+                "created_at": "2026-05-05T12:00:00Z",
+            },
+        )
+    )
+    prior = GraphContext(
+        nodes=(
+            {
+                "id": "idea_prior",
+                "type": "Idea",
+                "summary": "Prior idea about graph storage.",
+                "created_at": "2026-05-04T12:00:00Z",
+            },
+        ),
+        claims=(
+            {
+                "id": "claim_prior",
+                "statement": "Prior graph storage was validated.",
+                "confidence": "high",
+                "source_refs": ["prior-fixture"],
+            },
+        ),
+        evidence=({"id": "evidence_prior", "summary": "Prior fixture output exists."},),
+    )
+
+    brief = synthesize_graph_context(current, prior_context=prior)
+
+    assert [concept.id for concept in brief.connected_concepts] == ["idea_current", "idea_prior"]
+    assert [concept.from_prior for concept in brief.connected_concepts] == [False, True]
+    assert [item.id for item in brief.relevant_evidence.evidence] == ["evidence_prior"]
+    assert [claim.id for claim in brief.relevant_evidence.evidence_backed_claims] == ["claim_prior"]
+
+
+def test_synthesis_dedupes_and_caps_prior_connected_concepts() -> None:
+    current = GraphContext(nodes=({"id": "idea_duplicate", "type": "Idea", "summary": "Current duplicate wins."},))
+    prior = GraphContext(
+        nodes=(
+            {"id": "idea_duplicate", "type": "Idea", "summary": "Prior duplicate.", "created_at": "2026-05-06T00:00:00Z"},
+            *(
+                {
+                    "id": f"idea_prior_{index:02d}",
+                    "type": "Idea",
+                    "summary": f"Prior idea {index}",
+                    "created_at": f"2026-05-{index + 1:02d}T00:00:00Z",
+                }
+                for index in range(30)
+            ),
+        )
+    )
+
+    brief = synthesize_graph_context(current, prior_context=prior)
+
+    prior_concepts = [concept for concept in brief.connected_concepts if concept.from_prior]
+    assert len(prior_concepts) == PRIOR_CONTEXT_LIMIT
+    assert len({concept.id for concept in brief.connected_concepts}) == len(brief.connected_concepts)
+    assert brief.connected_concepts[0].id == "idea_duplicate"

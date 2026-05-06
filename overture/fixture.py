@@ -93,7 +93,9 @@ def run_overture_fixture(
         prior_context = store.load_context()
         for record in graph_records:
             store.upsert_record(record)
-        graph_context = _graph_context_from_fixture(intake_record, research_result, graph_records, prior_context)
+        graph_context = _graph_context_from_fixture(intake_record, research_result, graph_records)
+        for record in _graph_context_to_records(graph_context):
+            store.upsert_record(record)
         graph_path = _write_json(
             base_dir / "graph" / "graph-records.json",
             {
@@ -107,7 +109,7 @@ def run_overture_fixture(
         _raise_stage("graph", exc)
 
     try:
-        synthesis = synthesize_graph_context(graph_context)
+        synthesis = synthesize_graph_context(graph_context, prior_context=prior_context)
         synthesis_path = _write_json(base_dir / "synthesis" / "synthesis-brief.json", synthesis)
         artifacts["synthesis"] = synthesis_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
@@ -134,7 +136,7 @@ def render_ticket_draft(synthesis: SynthesisBrief, graph_context: GraphContext) 
     backed_claims = synthesis.relevant_evidence.evidence_backed_claims
     assumptions = synthesis.relevant_evidence.assumptions
     graph_relationships = _relationship_lines(graph_context)
-    source_node_ids = _source_node_ids(graph_context)
+    source_node_ids = _source_node_ids(graph_context, synthesis)
 
     evidence_lines = [
         f"- `{item.id}`: {item.summary} Reference: {', '.join(item.source_refs) or 'internal graph evidence'}."
@@ -298,10 +300,8 @@ def _graph_context_from_fixture(
     intake: IntakeRecord,
     research: ResearchResult,
     graph_records: tuple[GraphRecord, ...],
-    prior_context: GraphContext | None = None,
 ) -> GraphContext:
     timestamp = intake.created_at
-    prior_nodes = _prior_nodes(prior_context)
     source_nodes = [
         {
             "id": record.key,
@@ -358,11 +358,11 @@ def _graph_context_from_fixture(
     ]
 
     user_input_id = f"userinput_{intake.id}"
-    idea_id = "idea_overture_mvp_fixture"
-    need_id = "need_demonstrate_overture_pipeline"
-    component_id = "component_overture_fixture_command"
-    risk_id = "risk_fixture_drift"
-    ticket_id = "ticketcandidate_add_overture_e2e_fixture"
+    idea_id = f"idea_{intake.id}"
+    need_id = f"need_{intake.id}"
+    component_id = f"component_{intake.id}"
+    risk_id = f"risk_{intake.id}"
+    ticket_id = f"ticketcandidate_{intake.id}"
 
     nodes: list[Mapping[str, Any]] = [
         {
@@ -378,7 +378,6 @@ def _graph_context_from_fixture(
             "updated_at": timestamp,
             "provenance": _provenance("user_input", [], [intake.id], "Raw fixture idea entered the Overture pipeline."),
         },
-        *prior_nodes,
         {
             "id": idea_id,
             "type": "Idea",
@@ -478,41 +477,41 @@ def _graph_store_db_path(base_path: Path | str | None) -> Path:
     return Path(base_path) / "graph.sqlite"
 
 
-def _prior_nodes(prior_context: GraphContext | None) -> list[Mapping[str, Any]]:
-    if prior_context is None:
-        return []
-
-    prior_nodes: list[Mapping[str, Any]] = []
-    seen: set[str] = set()
-    for node in prior_context.nodes:
-        node_id = str(node.get("id") or "").strip()
-        if not node_id or node_id in seen:
-            continue
-        seen.add(node_id)
-        prior_nodes.append(
-            {
-                "id": f"prior:{node_id}",
-                "type": _prior_node_type(node),
-                "label": str(node.get("label") or node.get("title") or node_id),
-                "summary": str(node.get("summary") or node.get("text") or node.get("content") or node_id),
-                "status": "active",
-                "created_at": str(node.get("created_at") or ""),
-                "updated_at": str(node.get("created_at") or ""),
-                "provenance": _provenance("prior_context", [node_id], ["sqlite-graph-store"], "Prior graph node loaded from an earlier fixture run."),
-            }
-        )
-    return prior_nodes
-
-
-def _prior_node_type(node: Mapping[str, Any]) -> str:
-    node_type = str(node.get("type") or node.get("kind") or "").strip()
-    return node_type or "PriorNode"
-
-
 def _write_json(path: Path, value: Any) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(_plain(value), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
+
+
+def _graph_context_to_records(graph_context: GraphContext) -> tuple[GraphRecord, ...]:
+    records: list[GraphRecord] = []
+    for node in graph_context.nodes:
+        node_id = str(node.get("id") or "")
+        node_type = str(node.get("type") or node.get("kind") or "")
+        if not node_id or not node_type:
+            continue
+        records.append(
+            GraphRecord(
+                kind=node_type,
+                key=node_id,
+                properties={str(key): value for key, value in node.items() if key != "id"},
+            )
+        )
+    for edge in graph_context.edges:
+        from_id = str(edge.get("from") or "")
+        to_id = str(edge.get("to") or "")
+        edge_type = str(edge.get("type") or edge.get("kind") or "")
+        if not from_id or not to_id or not edge_type:
+            continue
+        edge_id = str(edge.get("id") or f"{from_id}:{edge_type}:{to_id}")
+        records.append(
+            GraphRecord(
+                kind=edge_type,
+                key=edge_id,
+                properties={str(key): value for key, value in edge.items() if key != "id"},
+            )
+        )
+    return tuple(records)
 
 
 def _plain(value: Any) -> Any:
@@ -562,8 +561,10 @@ def _relationship_lines(graph_context: GraphContext) -> list[str]:
     ]
 
 
-def _source_node_ids(graph_context: GraphContext) -> list[str]:
-    return [str(node["id"]) for node in graph_context.nodes if node.get("id")]
+def _source_node_ids(graph_context: GraphContext, synthesis: SynthesisBrief) -> list[str]:
+    current_ids = [str(node["id"]) for node in graph_context.nodes if node.get("id")]
+    prior_ids = [f"prior:{concept.id}" for concept in synthesis.connected_concepts if concept.id and concept.from_prior]
+    return list(dict.fromkeys((*current_ids, *prior_ids)))
 
 
 def _confidence_text(value: str | float | None) -> str:
