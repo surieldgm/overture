@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 from overture.intake import load_intake_record
 from overture.ui_host import (
     INTAKE_TEXT_MAX_CHARS,
+    RESEARCH_COMPLETE_ROUTE,
     RESEARCH_APPROVAL_ROUTE,
     SESSION_COOKIE_NAME,
     OvertureUiApp,
@@ -53,6 +54,82 @@ class IntakePageTests(unittest.TestCase):
             )
             self.assertEqual(approval.status, "200 OK")
             self.assertIn(record.id, approval.body)
+            self.assertIn("Symphony-ready ticket evidence contract", approval.body)
+            self.assertIn("Designer-led intake research workflow", approval.body)
+            self.assertIn("Approve", approval.body)
+            self.assertIn("Reject", approval.body)
+
+    def test_research_submit_persists_approved_subset_and_advances(self) -> None:
+        idea = "Build designer-led research approval for Overture"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            intake = _request(app, "POST", "/intake", {"idea": idea})
+            approval = _request(app, "GET", RESEARCH_APPROVAL_ROUTE, cookie=intake.headers["Set-Cookie"])
+
+            response = _request(
+                app,
+                "POST",
+                RESEARCH_APPROVAL_ROUTE,
+                {
+                    "decision-0": "approve:https://example.test/symphony-ticket-evidence",
+                    "decision-1": "reject:https://example.test/designer-intake-research",
+                },
+                cookie=approval.headers["Set-Cookie"],
+            )
+
+            self.assertEqual(response.status, "303 See Other")
+            self.assertEqual(response.headers["Location"], RESEARCH_COMPLETE_ROUTE)
+            session = _session_from_set_cookie(response.headers["Set-Cookie"])
+            intake_id = session["intake_id"]
+            payload = json.loads((Path(tmpdir) / "research" / f"{intake_id}.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["intake_id"], intake_id)
+            self.assertEqual(len(payload["items"]), 1)
+            self.assertEqual(payload["items"][0]["source"]["title"], "Symphony-ready ticket evidence contract")
+            self.assertIn("research_result", session)
+
+    def test_research_submit_with_zero_approvals_stays_on_page_with_inline_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            intake = _request(app, "POST", "/intake", {"idea": "Review all sources before approval"})
+            approval = _request(app, "GET", RESEARCH_APPROVAL_ROUTE, cookie=intake.headers["Set-Cookie"])
+
+            response = _request(
+                app,
+                "POST",
+                RESEARCH_APPROVAL_ROUTE,
+                {
+                    "decision-0": "reject:https://example.test/symphony-ticket-evidence",
+                    "decision-1": "reject:https://example.test/designer-intake-research",
+                },
+                cookie=approval.headers["Set-Cookie"],
+            )
+
+            self.assertEqual(response.status, "400 Bad Request")
+            self.assertIn("Approve at least one source before continuing.", response.body)
+            self.assertNotIn("Location", response.headers)
+            self.assertEqual(list((Path(tmpdir) / "research").glob("*.json")), [])
+
+    def test_research_revisit_shows_previously_approved_selection_for_same_intake(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            intake = _request(app, "POST", "/intake", {"idea": "Persist source approval state"})
+            approval = _request(app, "GET", RESEARCH_APPROVAL_ROUTE, cookie=intake.headers["Set-Cookie"])
+            submit = _request(
+                app,
+                "POST",
+                RESEARCH_APPROVAL_ROUTE,
+                {
+                    "decision-0": "reject:https://example.test/symphony-ticket-evidence",
+                    "decision-1": "approve:https://example.test/designer-intake-research",
+                },
+                cookie=approval.headers["Set-Cookie"],
+            )
+
+            revisit = _request(app, "GET", RESEARCH_APPROVAL_ROUTE, cookie=submit.headers["Set-Cookie"])
+
+            self.assertEqual(revisit.status, "200 OK")
+            self.assertIn('value="reject:https://example.test/symphony-ticket-evidence" checked', revisit.body)
+            self.assertIn('value="approve:https://example.test/designer-intake-research" checked', revisit.body)
 
     def test_empty_submit_shows_inline_validation_without_creating_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -98,7 +175,7 @@ def _request(
     *,
     cookie: str | None = None,
 ) -> Response:
-    encoded = urlencode(fields or {}).encode("utf-8")
+    encoded = urlencode(fields or {}, doseq=True).encode("utf-8")
     captured: dict[str, object] = {}
 
     def start_response(status: str, headers: list[tuple[str, str]]) -> None:
