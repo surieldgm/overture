@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime, timezone
+import hashlib
+import hmac
 import json
+import os
 from pathlib import Path
 from threading import Lock
 from typing import Any, Iterable, Mapping
@@ -20,8 +24,9 @@ from .synthesis import GraphContext
 class SharedGraphBackend:
     """Serialize graph writes while serving reads from a SQLite-backed store."""
 
-    def __init__(self, store: SqliteGraphStore) -> None:
+    def __init__(self, store: SqliteGraphStore, *, linear_webhook_secret: str | None = None) -> None:
         self.store = store
+        self.linear_webhook_secret = linear_webhook_secret
         self._write_lock = Lock()
 
     def upsert_records(self, records: Iterable[GraphRecord]) -> int:
@@ -47,6 +52,14 @@ class SharedGraphBackend:
     def table_counts(self) -> dict[str, int]:
         with self._write_lock:
             return self.store.table_counts()
+
+    def record_linear_webhook_event(self, event: Mapping[str, Any], *, event_id: str) -> bool:
+        normalized = _linear_issue_event_from_payload(event, event_id=event_id)
+        with self._write_lock:
+            return self.store.record_linear_webhook_event(**normalized)
+
+    def list_linear_webhook_events(self) -> tuple[dict[str, Any], ...]:
+        return self.store.list_linear_webhook_events()
 
 
 class GraphHttpClient:
@@ -116,8 +129,13 @@ def create_graph_http_server(
     *,
     host: str = "127.0.0.1",
     port: int = 8766,
+    linear_webhook_secret: str | None = None,
 ) -> ThreadingHTTPServer:
-    backend = SharedGraphBackend(SqliteGraphStore(db_path))
+    secret = linear_webhook_secret if linear_webhook_secret is not None else os.environ.get("OVERTURE_LINEAR_WEBHOOK_SECRET")
+    backend = SharedGraphBackend(
+        SqliteGraphStore(db_path),
+        linear_webhook_secret=secret,
+    )
 
     class Handler(GraphHTTPRequestHandler):
         graph_backend = backend
@@ -165,6 +183,9 @@ class GraphHTTPRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/evidence":
                 self._send_json({"evidence": self.graph_backend.list_nodes(kind="Evidence", limit=_optional_limit(params))})
                 return
+            if parsed.path == "/linear/webhook/events":
+                self._send_json({"events": self.graph_backend.list_linear_webhook_events()})
+                return
         except Exception as exc:  # pragma: no cover - defensive HTTP boundary
             self._send_error(500, str(exc))
             return
@@ -173,6 +194,9 @@ class GraphHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/linear/webhook":
+                self._handle_linear_webhook()
+                return
             payload = self._read_json()
             records = _records_for_post(parsed.path, payload)
             accepted = self.graph_backend.upsert_records(records)
@@ -186,13 +210,33 @@ class GraphHTTPRequestHandler(BaseHTTPRequestHandler):
         return
 
     def _read_json(self) -> Mapping[str, Any]:
-        length = int(self.headers.get("Content-Length", "0") or 0)
-        if length < 1:
-            return {}
-        decoded = json.loads(self.rfile.read(length).decode("utf-8"))
+        decoded = json.loads(self._read_body().decode("utf-8"))
         if not isinstance(decoded, Mapping):
             raise ValueError("request body must be a JSON object")
         return decoded
+
+    def _read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length < 1:
+            return b""
+        return self.rfile.read(length)
+
+    def _handle_linear_webhook(self) -> None:
+        raw_body = self._read_body()
+        secret = self.graph_backend.linear_webhook_secret
+        signature = self.headers.get("Linear-Signature")
+        if not secret or not signature or not _valid_linear_signature(raw_body, secret, signature):
+            self._send_error(401, "invalid Linear webhook signature")
+            return
+        decoded = json.loads(raw_body.decode("utf-8"))
+        if not isinstance(decoded, Mapping):
+            raise ValueError("request body must be a JSON object")
+        linear_event = self.headers.get("Linear-Event")
+        if linear_event and linear_event != "Issue":
+            raise ValueError("Linear webhook receiver only accepts Issue events")
+        event_id = self.headers.get("Linear-Delivery") or str(decoded.get("id") or "")
+        inserted = self.graph_backend.record_linear_webhook_event(decoded, event_id=event_id)
+        self._send_json({"accepted": 1 if inserted else 0, "duplicate": not inserted}, status=201)
 
     def _send_json(self, payload: Mapping[str, Any], *, status: int = 200) -> None:
         encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -221,6 +265,67 @@ def _records_for_post(path: str, payload: Mapping[str, Any]) -> tuple[GraphRecor
     if path == "/edges":
         return (_edge_record(payload),)
     raise ValueError(f"unsupported write path: {path}")
+
+
+def _valid_linear_signature(raw_body: bytes, secret: str, signature: str) -> bool:
+    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    provided = signature.removeprefix("sha256=")
+    return hmac.compare_digest(expected, provided)
+
+
+def _linear_issue_event_from_payload(payload: Mapping[str, Any], *, event_id: str) -> dict[str, Any]:
+    event_type = str(payload.get("type") or payload.get("webhookType") or "")
+    if event_type and event_type != "Issue":
+        raise ValueError("Linear webhook receiver only accepts Issue events")
+
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        raise ValueError("Linear issue webhook requires data")
+
+    issue_id = str(data.get("id") or "")
+    if not issue_id:
+        raise ValueError("Linear issue webhook requires data.id")
+
+    new_status = _state_name(data.get("state")) or str(data.get("state") or "")
+    if not new_status:
+        raise ValueError("Linear issue webhook requires data.state.name")
+
+    updated_from = payload.get("updatedFrom")
+    previous_status = _state_name(updated_from.get("state")) if isinstance(updated_from, Mapping) else None
+
+    actor = payload.get("actor")
+    actor_payload = dict(actor) if isinstance(actor, Mapping) else {}
+    event_timestamp = _event_timestamp(payload)
+    return {
+        "event_id": event_id or f"{issue_id}:{event_timestamp}:{new_status}",
+        "event_timestamp": event_timestamp,
+        "issue_id": issue_id,
+        "previous_status": previous_status,
+        "new_status": new_status,
+        "actor": actor_payload,
+        "raw_event": dict(payload),
+    }
+
+
+def _state_name(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        name = value.get("name")
+        return str(name) if name else None
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _event_timestamp(payload: Mapping[str, Any]) -> str:
+    created_at = payload.get("createdAt")
+    if created_at:
+        return str(created_at)
+    webhook_timestamp = payload.get("webhookTimestamp")
+    if isinstance(webhook_timestamp, (int, float)):
+        return datetime.fromtimestamp(webhook_timestamp / 1000, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    if webhook_timestamp:
+        return str(webhook_timestamp)
+    raise ValueError("Linear issue webhook requires createdAt or webhookTimestamp")
 
 
 def _node_record(payload: Mapping[str, Any], *, default_kind: str) -> GraphRecord:
