@@ -13,7 +13,9 @@ from typing import Callable, Iterable, Mapping
 from urllib.parse import parse_qs
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
-from .intake import IntakeRecord, create_intake_record
+from .intake import IntakeRecord, create_intake_record, load_intake_record
+from .research import ResearchResult
+from .research_llm import LLMSuggestedSourceAdapter, fake_llm_client, write_research_result
 
 INTAKE_TEXT_MAX_CHARS = 5000
 DEFAULT_UI_HOST = "127.0.0.1"
@@ -75,6 +77,13 @@ class IntakeSubmissionResult:
     session: dict[str, str]
 
 
+@dataclass(frozen=True)
+class ResearchApprovalResult:
+    result: ResearchResult
+    session: dict[str, str]
+    path: Path
+
+
 class SessionStore:
     """In-memory server-side session state keyed by an opaque cookie id."""
 
@@ -107,9 +116,15 @@ class QuietRequestHandler(WSGIRequestHandler):
 
 
 class OvertureUiApp:
-    def __init__(self, store_dir: Path | str = DEFAULT_STORE_DIR) -> None:
+    def __init__(
+        self,
+        store_dir: Path | str = DEFAULT_STORE_DIR,
+        *,
+        llm_client: Callable[[str], str] = fake_llm_client,
+    ) -> None:
         self.store_dir = Path(store_dir)
         self.session_store = SessionStore()
+        self.llm_client = llm_client
 
     def __call__(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         method = str(environ.get("REQUEST_METHOD", "GET")).upper()
@@ -138,6 +153,8 @@ class OvertureUiApp:
                 start_response,
                 render_research_approval_page(session_from_environ(environ)),
             )
+        if path == RESEARCH_APPROVAL_ROUTE and method == "POST":
+            return self._handle_research_approval_post(environ, start_response)
         if path == "/examples/intake_examples" and method == "GET":
             return self._render(start_response, render_examples_library())
         if path in ROUTES_BY_PATH and method == "GET":
@@ -171,6 +188,42 @@ class OvertureUiApp:
         return self._redirect(
             start_response,
             RESEARCH_APPROVAL_ROUTE,
+            extra_headers=[("Set-Cookie", _session_cookie(result.session))],
+        )
+
+    def _handle_research_approval_post(
+        self,
+        environ: dict[str, object],
+        start_response: StartResponse,
+    ) -> Iterable[bytes]:
+        session = session_from_environ(environ)
+        intake_id = session.get("intake_id")
+        if not intake_id:
+            return self._render(
+                start_response,
+                render_research_approval_page(session, error="Submit an intake before approving research."),
+                status="400 Bad Request",
+            )
+
+        try:
+            result = approve_research(intake_id, self.store_dir, session, llm_client=self.llm_client)
+        except FileNotFoundError:
+            return self._render(
+                start_response,
+                render_research_approval_page(session, error="The intake record for this session was not found."),
+                status="404 Not Found",
+            )
+
+        if not result.result.ok:
+            return self._render(
+                start_response,
+                render_research_approval_page(session, error="Research approval did not produce usable sources."),
+                status="500 Internal Server Error",
+            )
+
+        return self._redirect(
+            start_response,
+            "/synthesis",
             extra_headers=[("Set-Cookie", _session_cookie(result.session))],
         )
 
@@ -216,9 +269,10 @@ def build_ui_server(
     port: int = DEFAULT_UI_PORT,
     *,
     store_dir: Path | str = DEFAULT_STORE_DIR,
+    llm_client: Callable[[str], str] = fake_llm_client,
 ) -> LoopbackOnlyWSGIServer:
     _ensure_loopback_bind_host(host)
-    app = OvertureUiApp(store_dir=store_dir)
+    app = OvertureUiApp(store_dir=store_dir, llm_client=llm_client)
     return make_server(
         host,
         port,
@@ -250,6 +304,27 @@ def submit_intake(raw_text: str, store_dir: Path | str, session: dict[str, str] 
     next_session = dict(session or {})
     next_session["intake_id"] = record.id
     return IntakeSubmissionResult(record=record, session=next_session)
+
+
+def approve_research(
+    intake_id: str,
+    store_dir: Path | str,
+    session: dict[str, str] | None = None,
+    *,
+    llm_client: Callable[[str], str] = fake_llm_client,
+) -> ResearchApprovalResult:
+    base_dir = Path(store_dir)
+    intake_path = base_dir / "intake" / f"{intake_id}.json"
+    intake = load_intake_record(intake_path)
+    adapter = LLMSuggestedSourceAdapter(llm_client=llm_client, approver=lambda source: True)
+    research = adapter.research(intake)
+    research_path = write_research_result(base_dir / "research" / f"{intake.id}.json", research)
+
+    next_session = dict(session or {})
+    next_session["intake_id"] = intake.id
+    next_session["research_id"] = intake.id
+    next_session["next_route"] = "/synthesis"
+    return ResearchApprovalResult(result=research, session=next_session, path=research_path)
 
 
 def validate_intake_text(raw_text: str) -> str | None:
@@ -325,12 +400,14 @@ def render_intake_page(
     )
 
 
-def render_research_approval_page(session: dict[str, str]) -> str:
+def render_research_approval_page(session: dict[str, str], *, error: str | None = None) -> str:
     intake_id = session.get("intake_id")
     if intake_id:
         message = f"Intake ready: <code>{html.escape(intake_id)}</code>"
     else:
         message = 'No intake is stored in this session. <a href="/intake">Return to intake</a>.'
+    error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
+    disabled = "" if intake_id else " disabled"
     return render_layout(
         title="Research approval",
         active_path="/research",
@@ -338,6 +415,10 @@ def render_research_approval_page(session: dict[str, str]) -> str:
         <section class="workspace">
           <h2>Research approval</h2>
           <p>{message}</p>
+          <form method="post" action="{RESEARCH_APPROVAL_ROUTE}">
+            <button type="submit"{disabled}>Approve research and continue</button>
+          </form>
+          {error_markup}
         </section>
         """,
     )
