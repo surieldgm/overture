@@ -195,6 +195,65 @@ class SqliteGraphStore:
                 "edges": int(connection.execute("SELECT count(*) FROM edges").fetchone()[0]),
             }
 
+    def record_linear_webhook_event(
+        self,
+        *,
+        event_id: str,
+        event_timestamp: str,
+        issue_id: str,
+        previous_status: str | None,
+        new_status: str,
+        actor: dict[str, Any],
+        raw_event: dict[str, Any],
+    ) -> bool:
+        """Persist a normalized Linear issue webhook event.
+
+        Returns True when a new row was inserted and False when the event was a
+        duplicate delivery of an already captured lifecycle transition.
+        """
+
+        received_at = _utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO linear_webhook_events (
+                    event_id,
+                    event_timestamp,
+                    issue_id,
+                    previous_status,
+                    new_status,
+                    actor,
+                    raw_event,
+                    received_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    event_timestamp,
+                    issue_id,
+                    previous_status,
+                    new_status,
+                    _json(actor),
+                    _json(raw_event),
+                    received_at,
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def list_linear_webhook_events(self) -> tuple[dict[str, Any], ...]:
+        """Return captured Linear webhook events in receive order."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_id, event_timestamp, issue_id, previous_status, new_status, actor, raw_event, received_at
+                FROM linear_webhook_events
+                ORDER BY received_at ASC, issue_id ASC
+                """
+            ).fetchall()
+        return tuple(_linear_webhook_event_mapping(row) for row in rows)
+
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.db_path)
@@ -223,6 +282,19 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             PRIMARY KEY (from_id, to_id, kind)
         );
+
+        CREATE TABLE IF NOT EXISTS linear_webhook_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL,
+            event_timestamp TEXT NOT NULL,
+            issue_id TEXT NOT NULL,
+            previous_status TEXT,
+            new_status TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            raw_event TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            UNIQUE(issue_id, event_timestamp, new_status)
+        );
         """
     )
 
@@ -250,6 +322,19 @@ def _edge_mapping(row: sqlite3.Row) -> dict[str, Any]:
         "properties": properties,
         "created_at": row["created_at"],
         **properties,
+    }
+
+
+def _linear_webhook_event_mapping(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "event_id": row["event_id"],
+        "timestamp": row["event_timestamp"],
+        "issue_id": row["issue_id"],
+        "previous_status": row["previous_status"],
+        "new_status": row["new_status"],
+        "actor": _loads(row["actor"]),
+        "raw_event": _loads(row["raw_event"]),
+        "received_at": row["received_at"],
     }
 
 
