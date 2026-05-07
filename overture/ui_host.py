@@ -13,6 +13,7 @@ from typing import Callable, Iterable, Mapping
 from urllib.parse import parse_qs
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
+from .export import parse_ticket_markdown
 from .graph import research_result_to_graph_records
 from .graph_store import SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record, load_intake_record
@@ -24,6 +25,7 @@ from .research_llm import (
     write_research_result,
 )
 from .synthesis import GraphContext, SynthesisBrief, synthesize_graph_context
+from .ticket_writer import generate_linear_issue_draft
 
 INTAKE_TEXT_MAX_CHARS = 5000
 DEFAULT_UI_HOST = "127.0.0.1"
@@ -37,6 +39,8 @@ SYNTHESIS_ROUTE = "/synthesis"
 TICKET_REVIEW_ROUTE = "/ticket"
 SESSION_CANDIDATES_KEY = "research_candidates"
 SESSION_APPROVALS_KEY = "research_approvals"
+SESSION_SYNTHESIS_BRIEF_KEY = "synthesis_brief"
+SESSION_TICKET_MARKDOWN_KEY = "ticket_markdown"
 
 StartResponse = Callable[[str, list[tuple[str, str]]], None]
 
@@ -94,6 +98,13 @@ class IntakeSubmissionResult:
 class ResearchReviewResult:
     session: dict[str, str]
     candidates: tuple[CuratedSource, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class TicketReviewResult:
+    session: dict[str, str]
+    markdown: str = ""
     error: str | None = None
 
 
@@ -181,6 +192,10 @@ class OvertureUiApp:
             return self._handle_synthesis_get(environ, start_response)
         if path == SYNTHESIS_ROUTE and method == "POST":
             return self._handle_synthesis_post(environ, start_response)
+        if path == TICKET_REVIEW_ROUTE and method == "GET":
+            return self._handle_ticket_get(environ, start_response)
+        if path == TICKET_REVIEW_ROUTE and method == "POST":
+            return self._handle_ticket_post(environ, start_response)
         if path == "/examples/intake_examples" and method == "GET":
             return self._render(start_response, render_examples_library())
         if path in ROUTES_BY_PATH and method == "GET":
@@ -276,6 +291,31 @@ class OvertureUiApp:
         return self._redirect(
             start_response,
             TICKET_REVIEW_ROUTE,
+            extra_headers=[("Set-Cookie", _session_cookie(result.session))],
+        )
+
+    def _handle_ticket_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        result = prepare_ticket_review(session_from_environ(environ))
+        return self._render(
+            start_response,
+            render_ticket_review_page(result.session, markdown=result.markdown, error=result.error),
+            extra_headers=[("Set-Cookie", _session_cookie(result.session))],
+        )
+
+    def _handle_ticket_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        fields = _form_fields(environ)
+        markdown = fields.get("ticket_markdown", [""])[0]
+        result = submit_ticket_review(session_from_environ(environ), markdown)
+        if result.error:
+            return self._render(
+                start_response,
+                render_ticket_review_page(result.session, markdown=result.markdown, error=result.error),
+                status="400 Bad Request",
+                extra_headers=[("Set-Cookie", _session_cookie(result.session))],
+            )
+        return self._redirect(
+            start_response,
+            "/export",
             extra_headers=[("Set-Cookie", _session_cookie(result.session))],
         )
 
@@ -461,7 +501,10 @@ def prepare_synthesis_review(
 
     cache_path = _synthesis_cache_path(store_dir, intake_id)
     if cache_path.exists():
-        return SynthesisReviewResult(dict(session), _read_json(cache_path), cached=True)
+        brief = _read_json(cache_path)
+        next_session = dict(session)
+        next_session[SESSION_SYNTHESIS_BRIEF_KEY] = json.dumps(brief, sort_keys=True, separators=(",", ":"))
+        return SynthesisReviewResult(next_session, brief, cached=True)
 
     try:
         intake = load_intake_record(Path(store_dir) / "intake" / f"{intake_id}.json")
@@ -486,6 +529,7 @@ def prepare_synthesis_review(
     next_session = dict(session)
     next_session["synthesis_id"] = intake_id
     next_session["next_route"] = TICKET_REVIEW_ROUTE
+    next_session[SESSION_SYNTHESIS_BRIEF_KEY] = json.dumps(brief, sort_keys=True, separators=(",", ":"))
     return SynthesisReviewResult(next_session, brief, cached=False)
 
 
@@ -497,6 +541,41 @@ def advance_synthesis_review(session: dict[str, str], store_dir: Path | str) -> 
     next_session["synthesis_id"] = next_session.get("intake_id", "")
     next_session["next_route"] = TICKET_REVIEW_ROUTE
     return SynthesisReviewResult(next_session, result.brief, cached=result.cached)
+
+
+def prepare_ticket_review(session: dict[str, str]) -> TicketReviewResult:
+    next_session = dict(session)
+    existing = next_session.get(SESSION_TICKET_MARKDOWN_KEY)
+    if existing:
+        return TicketReviewResult(session=next_session, markdown=existing)
+
+    brief_json = next_session.get(SESSION_SYNTHESIS_BRIEF_KEY) or next_session.get("synthesis")
+    if not brief_json:
+        return TicketReviewResult(
+            session=next_session,
+            error="No synthesis brief is stored in this session. Return to synthesis before reviewing a ticket.",
+        )
+    try:
+        brief = json.loads(brief_json)
+        draft = generate_linear_issue_draft(brief)
+    except (TypeError, ValueError, IndexError, json.JSONDecodeError) as exc:
+        return TicketReviewResult(session=next_session, error=f"Could not generate ticket draft: {exc}")
+
+    next_session[SESSION_TICKET_MARKDOWN_KEY] = draft.description
+    return TicketReviewResult(session=next_session, markdown=draft.description)
+
+
+def submit_ticket_review(session: dict[str, str], markdown: str) -> TicketReviewResult:
+    next_session = dict(session)
+    next_session[SESSION_TICKET_MARKDOWN_KEY] = markdown
+    try:
+        parsed = parse_ticket_markdown(markdown)
+    except ValueError as exc:
+        return TicketReviewResult(session=next_session, markdown=markdown, error=str(exc))
+
+    next_session["ticket_title"] = parsed.title
+    next_session["next_route"] = "/export"
+    return TicketReviewResult(session=next_session, markdown=markdown)
 
 
 def validate_intake_text(raw_text: str) -> str | None:
@@ -759,6 +838,36 @@ def render_synthesis_review_page(
         </section>
         """
     return render_layout(title="Synthesis", active_path=SYNTHESIS_ROUTE, content=content)
+
+
+def render_ticket_review_page(session: dict[str, str], *, markdown: str = "", error: str | None = None) -> str:
+    escaped_markdown = html.escape(markdown)
+    error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
+    session_note = (
+        '<p class="session-note">Draft is stored in this browser session until export.</p>'
+        if session.get(SESSION_TICKET_MARKDOWN_KEY)
+        else ""
+    )
+    return render_layout(
+        title="Ticket",
+        active_path=TICKET_REVIEW_ROUTE,
+        content=f"""
+        <section class="workspace">
+          <h2>Ticket</h2>
+          <p>{html.escape(ROUTES_BY_PATH[TICKET_REVIEW_ROUTE].placeholder)}</p>
+          <form method="post" action="{TICKET_REVIEW_ROUTE}" novalidate>
+            <label for="ticket_markdown">Ticket Markdown</label>
+            <textarea id="ticket_markdown" name="ticket_markdown" autofocus>{escaped_markdown}</textarea>
+            <div class="form-footer">
+              <span>{len(markdown)} characters</span>
+              <button type="submit">Validate and continue</button>
+            </div>
+            {error_markup}
+            {session_note}
+          </form>
+        </section>
+        """,
+    )
 
 
 def render_placeholder_page(route: WizardRoute, *, session_id: str, visit_count: int) -> str:

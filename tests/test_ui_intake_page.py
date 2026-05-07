@@ -12,6 +12,8 @@ from overture.ui_host import (
     RESEARCH_COMPLETE_ROUTE,
     RESEARCH_APPROVAL_ROUTE,
     SESSION_COOKIE_NAME,
+    SESSION_SYNTHESIS_BRIEF_KEY,
+    SESSION_TICKET_MARKDOWN_KEY,
     OvertureUiApp,
     session_from_environ,
 )
@@ -159,6 +161,82 @@ class IntakePageTests(unittest.TestCase):
 
         self.assertEqual(session_from_environ(environ), {"intake_id": "idea_123"})
 
+    def test_ticket_page_prefills_generated_draft_from_synthesis_brief(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response = _request(
+                OvertureUiApp(store_dir=tmpdir),
+                "GET",
+                "/ticket",
+                cookie=_session_cookie({SESSION_SYNTHESIS_BRIEF_KEY: json.dumps(_synthesis_brief())}),
+            )
+
+        self.assertEqual(response.status, "200 OK")
+        self.assertIn('<textarea id="ticket_markdown" name="ticket_markdown"', response.body)
+        self.assertIn("# Add ticket review surface", response.body)
+        self.assertIn("## Acceptance criteria", response.body)
+        session = _session_from_set_cookie(response.headers["Set-Cookie"])
+        self.assertIn(SESSION_TICKET_MARKDOWN_KEY, session)
+
+    def test_ticket_valid_edit_advances_to_export_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            page = _request(
+                app,
+                "GET",
+                "/ticket",
+                cookie=_session_cookie({SESSION_SYNTHESIS_BRIEF_KEY: json.dumps(_synthesis_brief())}),
+            )
+            draft = _session_from_set_cookie(page.headers["Set-Cookie"])[SESSION_TICKET_MARKDOWN_KEY]
+            edited = draft.replace("Ticket review page shows generated draft.", "Ticket review page shows edited draft.")
+
+            response = _request(app, "POST", "/ticket", {"ticket_markdown": edited}, cookie=page.headers["Set-Cookie"])
+
+        self.assertEqual(response.status, "303 See Other")
+        self.assertEqual(response.headers["Location"], "/export")
+        session = _session_from_set_cookie(response.headers["Set-Cookie"])
+        self.assertEqual(session[SESSION_TICKET_MARKDOWN_KEY], edited)
+        self.assertEqual(session["ticket_title"], "Add ticket review surface")
+        self.assertEqual(session["next_route"], "/export")
+
+    def test_ticket_invalid_edit_blocks_advance_with_inline_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            page = _request(
+                app,
+                "GET",
+                "/ticket",
+                cookie=_session_cookie({SESSION_SYNTHESIS_BRIEF_KEY: json.dumps(_synthesis_brief())}),
+            )
+            draft = _session_from_set_cookie(page.headers["Set-Cookie"])[SESSION_TICKET_MARKDOWN_KEY]
+            broken = draft.replace("## Acceptance criteria", "## Acceptance notes")
+
+            response = _request(app, "POST", "/ticket", {"ticket_markdown": broken}, cookie=page.headers["Set-Cookie"])
+
+        self.assertEqual(response.status, "400 Bad Request")
+        self.assertNotIn("Location", response.headers)
+        self.assertIn("required sections must appear in canonical order", response.body)
+        self.assertIn('role="alert"', response.body)
+        self.assertIn("## Acceptance notes", response.body)
+
+    def test_ticket_edits_persist_across_refreshes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            page = _request(
+                app,
+                "GET",
+                "/ticket",
+                cookie=_session_cookie({SESSION_SYNTHESIS_BRIEF_KEY: json.dumps(_synthesis_brief())}),
+            )
+            draft = _session_from_set_cookie(page.headers["Set-Cookie"])[SESSION_TICKET_MARKDOWN_KEY]
+            broken = draft.replace("## Validation plan", "## Validation notes")
+            invalid = _request(app, "POST", "/ticket", {"ticket_markdown": broken}, cookie=page.headers["Set-Cookie"])
+
+            refreshed = _request(app, "GET", "/ticket", cookie=invalid.headers["Set-Cookie"])
+
+        self.assertEqual(refreshed.status, "200 OK")
+        self.assertIn("## Validation notes", refreshed.body)
+        self.assertNotIn("## Validation plan", refreshed.body)
+
 
 class Response:
     def __init__(self, status: str, headers: list[tuple[str, str]], body: str) -> None:
@@ -200,6 +278,59 @@ def _session_from_set_cookie(header: str) -> dict[str, str]:
     jar = cookies.SimpleCookie()
     jar.load(header)
     return json.loads(jar[SESSION_COOKIE_NAME].value)
+
+
+def _session_cookie(session: dict[str, str]) -> str:
+    jar = cookies.SimpleCookie()
+    jar[SESSION_COOKIE_NAME] = json.dumps(session, sort_keys=True, separators=(",", ":"))
+    return jar.output(header="").strip()
+
+
+def _synthesis_brief() -> dict[str, object]:
+    return {
+        "problem": "Designers need to review generated ticket Markdown before export.",
+        "user_need": "Designers need a fast correction loop inside the wizard.",
+        "relevant_evidence": {
+            "evidence": [
+                {
+                    "id": "evidence_ticket_page",
+                    "summary": "Ticket review page shows generated draft.",
+                    "source_refs": ["node:capability_ticket_draft"],
+                }
+            ],
+            "evidence_backed_claims": [
+                {
+                    "id": "claim_inline_editing",
+                    "statement": "Inline editing prevents context switching.",
+                    "confidence": "high",
+                    "source_refs": ["node:need_inline_ticket_editing"],
+                }
+            ],
+            "assumptions": [],
+        },
+        "connected_concepts": [
+            {
+                "id": "component_ui_ticket_page",
+                "type": "Component",
+                "label": "Ticket page",
+                "summary": "Editable ticket review page.",
+                "relationships": ["component_ui_ticket_page -> uses -> capability_ticket_validation"],
+            }
+        ],
+        "proposed_capability": "Render and validate editable ticket Markdown.",
+        "risks_uncertainty": ["Validation errors must be visible inline."],
+        "open_questions": [],
+        "candidate_ticket_breakdown": [
+            {
+                "id": "ticketcandidate_ticket_review_surface",
+                "title": "Add ticket review surface",
+                "scope": "Add a textarea-backed ticket review page that validates edits before export.",
+                "validation_plan": ["Run `python -m unittest tests.test_ui_intake_page`."],
+                "source_node_ids": ["component_ui_ticket_page"],
+                "readiness": "ready",
+            }
+        ],
+    }
 
 
 if __name__ == "__main__":

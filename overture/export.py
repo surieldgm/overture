@@ -33,7 +33,12 @@ class ParsedTicket:
 
 def parse_ticket_file(path: Path | str) -> ParsedTicket:
     ticket_path = Path(path)
-    markdown = ticket_path.read_text(encoding="utf-8")
+    return parse_ticket_markdown(ticket_path.read_text(encoding="utf-8"))
+
+
+def parse_ticket_markdown(markdown: str) -> ParsedTicket:
+    """Parse and validate ticket Markdown using the export contract."""
+
     metadata, body = parse_ticket_frontmatter(markdown)
 
     lines = body.splitlines()
