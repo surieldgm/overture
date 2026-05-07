@@ -29,6 +29,9 @@ class StubLinearClient:
         title: str,
         description: str,
         project_id: str | None = None,
+        priority: int | None = None,
+        sprint_label: str | None = None,
+        milestone: str | None = None,
     ) -> CreatedIssue:
         issue_number = len(self.created_issues) + 1
         url = f"https://linear.app/eria/issue/ERI-{issue_number}/exported"
@@ -39,6 +42,9 @@ class StubLinearClient:
                 "title": title,
                 "description": description,
                 "project_id": project_id,
+                "priority": priority,
+                "sprint_label": sprint_label,
+                "milestone": milestone,
                 "url": url,
             }
         )
@@ -137,6 +143,65 @@ class ExportCliTests(unittest.TestCase):
         self.assertEqual(StubLinearClient.created_issues[0]["project_id"], "project-id")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][2], "issue-id-1")
+
+    def test_export_applies_frontmatter_metadata_to_linear_call(self) -> None:
+        cli._linear_client_factory = StubLinearClient
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ticket = self._copy_example(Path(tmpdir))
+            ticket.write_text(
+                "---\n"
+                'sprint_label = "m2-s1"\n'
+                "priority = 2\n"
+                'milestone = "Designer adoption"\n'
+                "---\n\n"
+                + ticket.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            result = self._run_cli(
+                ["export", str(ticket), "--team-id", "team-id", "--project-id", "project-id"],
+                cwd=Path(tmpdir),
+                env={"LINEAR_API_KEY": "key"},
+            )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(len(StubLinearClient.created_issues), 1)
+        self.assertEqual(StubLinearClient.created_issues[0]["sprint_label"], "m2-s1")
+        self.assertEqual(StubLinearClient.created_issues[0]["priority"], 2)
+        self.assertEqual(StubLinearClient.created_issues[0]["milestone"], "Designer adoption")
+        self.assertNotIn("sprint_label", str(StubLinearClient.created_issues[0]["description"]))
+
+    def test_frontmatterless_export_keeps_metadata_absent(self) -> None:
+        cli._linear_client_factory = StubLinearClient
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ticket = self._copy_example(Path(tmpdir))
+
+            result = self._run_cli(
+                ["export", str(ticket), "--team-id", "team-id"],
+                cwd=Path(tmpdir),
+                env={"LINEAR_API_KEY": "key"},
+            )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIsNone(StubLinearClient.created_issues[0]["sprint_label"])
+        self.assertIsNone(StubLinearClient.created_issues[0]["priority"])
+        self.assertIsNone(StubLinearClient.created_issues[0]["milestone"])
+
+    def test_invalid_frontmatter_exits_before_linear_call(self) -> None:
+        cli._linear_client_factory = StubLinearClient
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ticket = self._copy_example(Path(tmpdir))
+            ticket.write_text("---\nunknown = \"value\"\n---\n\n" + ticket.read_text(encoding="utf-8"), encoding="utf-8")
+
+            result = self._run_cli(
+                ["export", str(ticket), "--team-id", "team-id", "--project-id", "project-id"],
+                cwd=Path(tmpdir),
+                env={"LINEAR_API_KEY": "key"},
+            )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("invalid frontmatter: unknown keys: unknown", result.stderr)
+        self.assertEqual(StubLinearClient.created_issues, [])
 
     def test_unmodified_rerun_exits_0_without_new_linear_call(self) -> None:
         cli._linear_client_factory = StubLinearClient

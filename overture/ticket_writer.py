@@ -86,6 +86,7 @@ def generate_linear_issue_draft(
 
     description = "\n\n".join(
         (
+            *_frontmatter_lines(candidate),
             f"# {title}",
             "## Context\n\n" + _context(brief),
             "## Problem\n\n" + _problem(brief),
@@ -368,4 +369,35 @@ def _candidate_ticket(value: Any) -> CandidateTicket:
         validation_plan=tuple(str(step) for step in _sequence(item.get("validation_plan", ()))),
         source_node_ids=tuple(str(node_id) for node_id in _sequence(item.get("source_node_ids", ()))),
         readiness=str(item.get("readiness") or "").strip() or None,
+        sprint_label=str(item.get("sprint_label") or "").strip() or None,
+        priority=_priority_metadata(item.get("priority")),
+        milestone=str(item.get("milestone") or "").strip() or None,
     )
+
+
+def _frontmatter_lines(candidate: CandidateTicket) -> tuple[str, ...]:
+    lines = ["---"]
+    if candidate.sprint_label:
+        lines.append(f'sprint_label = "{_toml_string(candidate.sprint_label)}"')
+    if candidate.priority is not None:
+        lines.append(f"priority = {candidate.priority}")
+    if candidate.milestone:
+        lines.append(f'milestone = "{_toml_string(candidate.milestone)}"')
+    if len(lines) == 1:
+        return ()
+    lines.append("---")
+    return ("\n".join(lines),)
+
+
+def _toml_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _priority_metadata(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None

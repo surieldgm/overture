@@ -85,6 +85,43 @@ class LinearClientTests(unittest.TestCase):
 
         self.assertEqual(captured_payloads[0]["variables"]["input"]["projectId"], "project-id")
 
+    def test_create_issue_resolves_and_posts_metadata_ids(self) -> None:
+        captured_payloads = []
+
+        def opener(request):
+            payload = json.loads(request.data.decode("utf-8"))
+            captured_payloads.append(payload)
+            query = payload["query"]
+            if "IssueLabels" in query:
+                return StubResponse({"data": {"issueLabels": {"nodes": [{"id": "label-id", "name": "m2-s1"}]}}})
+            if "ProjectMilestones" in query:
+                return StubResponse({"data": {"projectMilestones": {"nodes": [{"id": "milestone-id", "name": "M2"}]}}})
+            return StubResponse(
+                {
+                    "data": {
+                        "issueCreate": {
+                            "success": True,
+                            "issue": {"id": "issue-id", "identifier": "ERI-1", "url": "https://linear.app/issue/ERI-1"},
+                        }
+                    }
+                }
+            )
+
+        LinearClient(api_key="x", opener=opener).create_issue(
+            team_id="team-id",
+            title="Title",
+            description="Description",
+            project_id="project-id",
+            priority=2,
+            sprint_label="m2-s1",
+            milestone="M2",
+        )
+
+        issue_input = captured_payloads[-1]["variables"]["input"]
+        self.assertEqual(issue_input["priority"], 2)
+        self.assertEqual(issue_input["labelIds"], ["label-id"])
+        self.assertEqual(issue_input["projectMilestoneId"], "milestone-id")
+
     def test_create_issue_returns_created_issue_on_success(self) -> None:
         def opener(_request):
             return StubResponse(

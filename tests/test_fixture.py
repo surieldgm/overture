@@ -56,6 +56,9 @@ class FixtureTests(unittest.TestCase):
 
             ticket = ticket_path.read_text(encoding="utf-8")
             validate_ticket_draft(ticket)
+            self.assertTrue(ticket.startswith("---\n"))
+            self.assertIn('sprint_label = "mvp-fixture"', ticket)
+            self.assertIn('milestone = "Overture MVP"', ticket)
             self.assertIn("# Add Overture end-to-end fixture", ticket)
             self.assertIn("## Graph provenance", ticket)
             self.assertIn("- Nodes:", ticket)

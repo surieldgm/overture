@@ -63,6 +63,9 @@ class CandidateTicket:
     validation_plan: tuple[str, ...] = ()
     source_node_ids: tuple[str, ...] = ()
     readiness: str | None = None
+    sprint_label: str | None = None
+    priority: int | None = None
+    milestone: str | None = None
 
 
 @dataclass(frozen=True)
@@ -407,6 +410,9 @@ def _candidate_ticket(node: Mapping[str, Any]) -> CandidateTicket:
         validation_plan=validation_plan,
         source_node_ids=_source_node_ids(node),
         readiness=str(node.get("readiness") or properties.get("readiness") or "").strip() or None,
+        sprint_label=_optional_text_metadata(node, properties, "sprint_label"),
+        priority=_optional_priority_metadata(node, properties),
+        milestone=_optional_text_metadata(node, properties, "milestone"),
     )
 
 
@@ -422,6 +428,25 @@ def _fallback_ticket(problem_node: Mapping[str, Any] | None, need_node: Mapping[
         source_node_ids=source_ids,
         readiness="draft",
     )
+
+
+def _optional_text_metadata(node: Mapping[str, Any], properties: Mapping[str, Any], field: str) -> str | None:
+    value = node.get(field, properties.get(field))
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_priority_metadata(node: Mapping[str, Any], properties: Mapping[str, Any]) -> int | None:
+    value = node.get("priority", properties.get("priority"))
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
 
 
 def _problem_text(problem_node: Mapping[str, Any] | None, risks: Sequence[str]) -> str:
