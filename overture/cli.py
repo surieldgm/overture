@@ -19,12 +19,11 @@ from pathlib import Path
 from typing import Sequence
 
 from .backlog_seeder import seed_confirmed_friction_intakes
-from .export import parse_ticket_file
-from .export_store import ExportLedger, compute_hash
+from .export_runner import run_ticket_export
 from .fixture import PIPELINE_STAGES, PipelineStageError, run_overture_fixture
 from .friction_log import FRICTION_CATEGORIES, FrictionLog
 from .intake import create_intake_record, load_intake_record
-from .linear_client import LinearAPIError, LinearClient
+from .linear_client import LinearClient
 from .metrics_store import DEFAULT_METRICS_DB_PATH, MetricsStore
 from .milestone_verifier import render_human_report, verify_milestone_config
 from .retro_generator import DEFAULT_RETRO_OUTPUT_PATH, generate_retro_document
@@ -613,73 +612,22 @@ def _ui(args: argparse.Namespace) -> int:
 
 
 def _export_ticket(args: argparse.Namespace) -> int:
-    ticket_path = args.ticket_path.expanduser().resolve(strict=False)
-    if not ticket_path.exists():
-        print(f"ticket file not found: {ticket_path}", file=sys.stderr)
-        return 2
-
-    try:
-        ticket_text = ticket_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        print(f"could not read ticket file {ticket_path}: {exc}", file=sys.stderr)
-        return 2
-
-    ticket_hash = compute_hash(ticket_text)
-    ticket_path_key = str(ticket_path)
-    ledger = ExportLedger(args.ledger_db or _default_export_store_path())
-    record = None if args.dry_run else ledger.find(ticket_path_key)
-    if record is not None and not args.force_recreate:
-        if record.ticket_hash == ticket_hash:
-            print(f"already exported: {record.linear_url}")
-            return 0
-        print(f"ticket changed since last export: {record.linear_url}", file=sys.stderr)
-        return 3
-
-    try:
-        parsed = parse_ticket_file(ticket_path)
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    if args.dry_run:
-        print(f"would create: title={parsed.title}")
-        if parsed.metadata.sprint_label:
-            print(f"metadata sprint_label={parsed.metadata.sprint_label}")
-        if parsed.metadata.priority is not None:
-            print(f"metadata priority={parsed.metadata.priority}")
-        if parsed.metadata.milestone:
-            print(f"metadata milestone={parsed.metadata.milestone}")
-        print(parsed.description, end="" if parsed.description.endswith("\n") else "\n")
+    result = run_ticket_export(
+        args.ticket_path,
+        team_id=args.team_id,
+        project_id=args.project_id,
+        dry_run=args.dry_run,
+        force_recreate=args.force_recreate,
+        ledger_db=args.ledger_db or _default_export_store_path(),
+        linear_client_factory=_build_linear_client,
+    )
+    stream = sys.stderr if result.status in {"changed", "error"} else sys.stdout
+    print(result.message, end="" if result.message.endswith("\n") else "\n", file=stream)
+    if result.status in {"dry_run", "exported", "already_exported"}:
         return 0
-
-    if not args.team_id:
-        print("missing required Linear team id: pass --team-id or set LINEAR_TEAM_ID", file=sys.stderr)
-        return 2
-    if parsed.metadata.milestone and not args.project_id:
-        print("missing required Linear project id for frontmatter milestone: pass --project-id or set LINEAR_PROJECT_ID", file=sys.stderr)
-        return 2
-
-    try:
-        client = _build_linear_client()
-        issue = client.create_issue(
-            team_id=args.team_id,
-            title=parsed.title,
-            description=parsed.description,
-            project_id=args.project_id,
-            priority=parsed.metadata.priority,
-            sprint_label=parsed.metadata.sprint_label,
-            milestone=parsed.metadata.milestone,
-        )
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
-    except LinearAPIError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    ledger.record(ticket_path_key, ticket_hash, issue.id, issue.url)
-    print(issue.url)
-    return 0
+    if result.status == "changed":
+        return 3
+    return 2 if result.message.startswith(("ticket file not found:", "could not read ticket file", "missing required", "LINEAR_API_KEY")) else 1
 
 
 def _metrics(args: argparse.Namespace) -> int:
