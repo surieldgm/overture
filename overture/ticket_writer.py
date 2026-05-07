@@ -36,8 +36,10 @@ PRECISE_IMPERATIVE_VERBS = {
     "remove",
     "migrate",
     "expose",
+    "review",
     "validate",
     "document",
+    "draft",
 }
 
 IMPERATIVE_TITLE_REWRITES = {

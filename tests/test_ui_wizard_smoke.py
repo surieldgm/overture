@@ -95,9 +95,15 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
 
                 ticket_page = _get(base_url, TICKET_REVIEW_ROUTE, headers={"Cookie": synthesis_response.headers["Set-Cookie"]})
                 self.assertEqual(ticket_page.status, 200)
-                self.assertIn("Ticket draft validates against the Symphony-ready schema", ticket_page.body)
+                self.assertIn('<textarea id="ticket_markdown" name="ticket_markdown"', ticket_page.body)
 
-                ticket_response = _post(base_url, TICKET_REVIEW_ROUTE, {}, headers={"Cookie": ticket_page.headers["Set-Cookie"]})
+                ticket_session = _session_from_set_cookie(ticket_page.headers["Set-Cookie"])
+                ticket_response = _post(
+                    base_url,
+                    TICKET_REVIEW_ROUTE,
+                    {"ticket_markdown": ticket_session["ticket_markdown"]},
+                    headers={"Cookie": ticket_page.headers["Set-Cookie"]},
+                )
                 self.assertEqual(ticket_response.status, 303)
                 self.assertEqual(ticket_response.headers["Location"], EXPORT_ROUTE)
 
@@ -211,13 +217,18 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
                 self.assertIn("Continue to ticket review", synthesis_page.body)
 
                 advance_response = _post(base_url, SYNTHESIS_ROUTE, {}, headers={"Cookie": synthesis_page.headers["Set-Cookie"]})
+                ticket_page = _get(base_url, TICKET_REVIEW_ROUTE, headers={"Cookie": advance_response.headers["Set-Cookie"]})
 
             self.assertEqual(advance_response.status, 303)
             self.assertEqual(advance_response.headers["Location"], TICKET_REVIEW_ROUTE)
             advanced_session = _session_from_set_cookie(advance_response.headers["Set-Cookie"])
             self.assertEqual(advanced_session["next_route"], TICKET_REVIEW_ROUTE)
             self.assertEqual(advanced_session["synthesis_id"], advanced_session["intake_id"])
+            self.assertIn("synthesis_brief", advanced_session)
             self.assertTrue((store_dir / "synthesis" / f"{advanced_session['intake_id']}.json").exists())
+            self.assertEqual(ticket_page.status, 200)
+            self.assertIn('<textarea id="ticket_markdown" name="ticket_markdown"', ticket_page.body)
+            self.assertIn("# Add ticket for Help designers validate synthesis before ticket drafting", ticket_page.body)
 
     def test_synthesis_page_distinguishes_prior_connected_concepts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

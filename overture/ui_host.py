@@ -13,11 +13,11 @@ from typing import Callable, Iterable, Mapping
 from urllib.parse import parse_qs
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
+from .export import parse_ticket_markdown
+from .export_store import ExportLedger, compute_hash
 from .graph import research_result_to_graph_records
 from .graph_store import SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record, load_intake_record
-from .export import parse_ticket_file
-from .export_store import ExportLedger, compute_hash
 from .linear_client import LinearAPIError, LinearClient
 from .research import CuratedSource, ResearchClaim, ResearchError, ResearchItem, ResearchResult, SourceReference, _normalize_source
 from .research_llm import (
@@ -42,6 +42,8 @@ TICKET_REVIEW_ROUTE = "/ticket"
 EXPORT_ROUTE = "/export"
 SESSION_CANDIDATES_KEY = "research_candidates"
 SESSION_APPROVALS_KEY = "research_approvals"
+SESSION_SYNTHESIS_BRIEF_KEY = "synthesis_brief"
+SESSION_TICKET_MARKDOWN_KEY = "ticket_markdown"
 
 StartResponse = Callable[[str, list[tuple[str, str]]], None]
 
@@ -103,29 +105,27 @@ class ResearchReviewResult:
 
 
 @dataclass(frozen=True)
-class SynthesisReviewResult:
-    session: dict[str, str]
-    brief: Mapping[str, object] | None = None
-    error: str | None = None
-    cached: bool = False
-
-
-@dataclass(frozen=True)
 class TicketReviewResult:
     session: dict[str, str]
-    ticket_path: Path | None = None
-    title: str | None = None
-    description: str | None = None
+    markdown: str = ""
     error: str | None = None
-    cached: bool = False
 
 
 @dataclass(frozen=True)
 class ExportResult:
     session: dict[str, str]
+    markdown: str = ""
     ticket_path: Path | None = None
     linear_url: str | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class SynthesisReviewResult:
+    session: dict[str, str]
+    brief: Mapping[str, object] | None = None
+    error: str | None = None
+    cached: bool = False
 
 
 class SessionStore:
@@ -316,16 +316,18 @@ class OvertureUiApp:
         result = prepare_ticket_review(session_from_environ(environ), self.store_dir)
         return self._render(
             start_response,
-            render_ticket_review_page(result.session, ticket_path=result.ticket_path, title=result.title, description=result.description, error=result.error, cached=result.cached),
+            render_ticket_review_page(result.session, markdown=result.markdown, error=result.error),
             extra_headers=[("Set-Cookie", _session_cookie(result.session))],
         )
 
     def _handle_ticket_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
-        result = advance_ticket_review(session_from_environ(environ), self.store_dir)
+        fields = _form_fields(environ)
+        markdown = fields.get("ticket_markdown", [""])[0]
+        result = submit_ticket_review(session_from_environ(environ), markdown, self.store_dir)
         if result.error:
             return self._render(
                 start_response,
-                render_ticket_review_page(result.session, ticket_path=result.ticket_path, title=result.title, description=result.description, error=result.error, cached=result.cached),
+                render_ticket_review_page(result.session, markdown=result.markdown, error=result.error),
                 status="400 Bad Request",
                 extra_headers=[("Set-Cookie", _session_cookie(result.session))],
             )
@@ -339,7 +341,7 @@ class OvertureUiApp:
         result = prepare_export(session_from_environ(environ), self.store_dir)
         return self._render(
             start_response,
-            render_export_page(result.session, ticket_path=result.ticket_path, linear_url=result.linear_url, error=result.error),
+            render_export_page(result.session, markdown=result.markdown, ticket_path=result.ticket_path, linear_url=result.linear_url, error=result.error),
             extra_headers=[("Set-Cookie", _session_cookie(result.session))],
         )
 
@@ -347,7 +349,7 @@ class OvertureUiApp:
         result = submit_export(session_from_environ(environ), self.store_dir, linear_client_factory=self.linear_client_factory)
         return self._render(
             start_response,
-            render_export_page(result.session, ticket_path=result.ticket_path, linear_url=result.linear_url, error=result.error),
+            render_export_page(result.session, markdown=result.markdown, ticket_path=result.ticket_path, linear_url=result.linear_url, error=result.error),
             status="400 Bad Request" if result.error else "200 OK",
             extra_headers=[("Set-Cookie", _session_cookie(result.session))],
         )
@@ -548,7 +550,10 @@ def prepare_synthesis_review(
 
     cache_path = _synthesis_cache_path(store_dir, intake_id)
     if cache_path.exists():
-        return SynthesisReviewResult(dict(session), _read_json(cache_path), cached=True)
+        brief = _read_json(cache_path)
+        next_session = dict(session)
+        next_session[SESSION_SYNTHESIS_BRIEF_KEY] = json.dumps(brief, sort_keys=True, separators=(",", ":"))
+        return SynthesisReviewResult(next_session, brief, cached=True)
 
     try:
         intake = load_intake_record(Path(store_dir) / "intake" / f"{intake_id}.json")
@@ -573,6 +578,7 @@ def prepare_synthesis_review(
     next_session = dict(session)
     next_session["synthesis_id"] = intake_id
     next_session["next_route"] = TICKET_REVIEW_ROUTE
+    next_session[SESSION_SYNTHESIS_BRIEF_KEY] = json.dumps(brief, sort_keys=True, separators=(",", ":"))
     return SynthesisReviewResult(next_session, brief, cached=False)
 
 
@@ -586,72 +592,55 @@ def advance_synthesis_review(session: dict[str, str], store_dir: Path | str) -> 
     return SynthesisReviewResult(next_session, result.brief, cached=result.cached)
 
 
-def prepare_ticket_review(session: dict[str, str], store_dir: Path | str) -> TicketReviewResult:
-    intake_id = session.get("intake_id", "")
-    if not intake_id:
-        return TicketReviewResult(
-            session=dict(session),
-            error="No intake is stored in this session. Return to intake before reviewing the ticket.",
-        )
-
-    ticket_path = _ticket_path(store_dir, intake_id)
-    if ticket_path.exists():
-        try:
-            parsed = parse_ticket_file(ticket_path)
-        except ValueError as exc:
-            return TicketReviewResult(dict(session), ticket_path=ticket_path, error=str(exc))
-        return TicketReviewResult(
-            dict(session),
-            ticket_path=ticket_path,
-            title=parsed.title,
-            description=parsed.description,
-            cached=True,
-        )
-
-    synthesis_path = _synthesis_cache_path(store_dir, intake_id)
-    if not synthesis_path.exists():
-        return TicketReviewResult(dict(session), error=f"Synthesis brief not found for {intake_id}.")
-
-    try:
-        draft = generate_linear_issue_draft(_read_json(synthesis_path))
-    except (IndexError, TypeError, ValueError) as exc:
-        return TicketReviewResult(dict(session), error=str(exc))
-
-    ticket_path.parent.mkdir(parents=True, exist_ok=True)
-    ticket_path.write_text(draft.description + ("" if draft.description.endswith("\n") else "\n"), encoding="utf-8")
+def prepare_ticket_review(session: dict[str, str], store_dir: Path | str | None = None) -> TicketReviewResult:
     next_session = dict(session)
-    next_session["ticket_id"] = intake_id
-    next_session["ticket_path"] = str(ticket_path)
-    next_session["next_route"] = EXPORT_ROUTE
-    return TicketReviewResult(
-        next_session,
-        ticket_path=ticket_path,
-        title=draft.title,
-        description=parse_ticket_file(ticket_path).description,
-        cached=False,
-    )
+    existing = next_session.get(SESSION_TICKET_MARKDOWN_KEY)
+    if existing:
+        _persist_ticket_markdown(next_session, store_dir, existing)
+        return TicketReviewResult(session=next_session, markdown=existing)
+
+    brief_json = next_session.get(SESSION_SYNTHESIS_BRIEF_KEY) or next_session.get("synthesis")
+    if not brief_json:
+        return TicketReviewResult(
+            session=next_session,
+            error="No synthesis brief is stored in this session. Return to synthesis before reviewing a ticket.",
+        )
+    try:
+        brief = json.loads(brief_json)
+        draft = generate_linear_issue_draft(brief)
+    except (TypeError, ValueError, IndexError, json.JSONDecodeError) as exc:
+        return TicketReviewResult(session=next_session, error=f"Could not generate ticket draft: {exc}")
+
+    next_session[SESSION_TICKET_MARKDOWN_KEY] = draft.description
+    _persist_ticket_markdown(next_session, store_dir, draft.description)
+    return TicketReviewResult(session=next_session, markdown=draft.description)
 
 
-def advance_ticket_review(session: dict[str, str], store_dir: Path | str) -> TicketReviewResult:
-    result = prepare_ticket_review(session, store_dir)
-    if result.error:
-        return result
-    next_session = dict(result.session)
-    next_session["ticket_id"] = next_session.get("intake_id", "")
-    if result.ticket_path is not None:
-        next_session["ticket_path"] = str(result.ticket_path)
+def submit_ticket_review(session: dict[str, str], markdown: str, store_dir: Path | str | None = None) -> TicketReviewResult:
+    next_session = dict(session)
+    next_session[SESSION_TICKET_MARKDOWN_KEY] = markdown
+    try:
+        parsed = parse_ticket_markdown(markdown)
+    except ValueError as exc:
+        return TicketReviewResult(session=next_session, markdown=markdown, error=str(exc))
+
+    next_session["ticket_title"] = parsed.title
     next_session["next_route"] = EXPORT_ROUTE
-    return TicketReviewResult(next_session, result.ticket_path, result.title, result.description, cached=result.cached)
+    _persist_ticket_markdown(next_session, store_dir, markdown)
+    return TicketReviewResult(session=next_session, markdown=markdown)
 
 
 def prepare_export(session: dict[str, str], store_dir: Path | str) -> ExportResult:
     ticket = prepare_ticket_review(session, store_dir)
     if ticket.error:
-        return ExportResult(ticket.session, ticket.ticket_path, error=ticket.error)
-    next_session = dict(ticket.session)
-    if ticket.ticket_path is not None:
-        next_session["ticket_path"] = str(ticket.ticket_path)
-    return ExportResult(next_session, ticket.ticket_path, linear_url=next_session.get("linear_url"))
+        return ExportResult(session=ticket.session, markdown=ticket.markdown, error=ticket.error)
+    ticket_path = _persist_ticket_markdown(ticket.session, store_dir, ticket.markdown)
+    return ExportResult(
+        session=ticket.session,
+        markdown=ticket.markdown,
+        ticket_path=ticket_path,
+        linear_url=ticket.session.get("linear_url"),
+    )
 
 
 def submit_export(
@@ -661,11 +650,13 @@ def submit_export(
     linear_client_factory: Callable[[], object],
 ) -> ExportResult:
     result = prepare_export(session, store_dir)
-    if result.error or result.ticket_path is None:
+    if result.error:
         return result
+    if not result.markdown.strip():
+        return ExportResult(session=dict(result.session), error="No ticket draft is ready for export.")
 
     try:
-        parsed = parse_ticket_file(result.ticket_path)
+        parsed = parse_ticket_markdown(result.markdown)
         client = linear_client_factory()
         issue = client.create_issue(
             team_id="stubbed-ui-team",
@@ -677,14 +668,34 @@ def submit_export(
             milestone=parsed.metadata.milestone,
         )
     except (RuntimeError, LinearAPIError, ValueError, AttributeError) as exc:
-        return ExportResult(dict(result.session), result.ticket_path, error=str(exc))
+        return ExportResult(session=dict(result.session), markdown=result.markdown, ticket_path=result.ticket_path, error=str(exc))
 
-    ticket_text = result.ticket_path.read_text(encoding="utf-8")
-    ExportLedger(Path(store_dir) / "exports.sqlite").record(str(result.ticket_path), compute_hash(ticket_text), issue.id, issue.url)
+    ticket_path = result.ticket_path or _persist_ticket_markdown(result.session, store_dir, result.markdown)
+    if ticket_path is not None:
+        ExportLedger(Path(store_dir) / "exports.sqlite").record(
+            str(ticket_path),
+            compute_hash(result.markdown),
+            issue.id,
+            issue.url,
+        )
     next_session = dict(result.session)
     next_session["linear_url"] = issue.url
     next_session["next_route"] = EXPORT_ROUTE
-    return ExportResult(next_session, result.ticket_path, linear_url=issue.url)
+    return ExportResult(next_session, result.markdown, ticket_path, linear_url=issue.url)
+
+
+def _persist_ticket_markdown(session: dict[str, str], store_dir: Path | str | None, markdown: str) -> Path | None:
+    if store_dir is None or not markdown.strip():
+        return None
+    intake_id = session.get("intake_id") or session.get("synthesis_id")
+    if not intake_id:
+        return None
+    ticket_path = _ticket_path(store_dir, intake_id)
+    ticket_path.parent.mkdir(parents=True, exist_ok=True)
+    ticket_path.write_text(markdown + ("" if markdown.endswith("\n") else "\n"), encoding="utf-8")
+    session["ticket_id"] = intake_id
+    session["ticket_path"] = str(ticket_path)
+    return ticket_path
 
 
 def _default_linear_client_factory() -> LinearClient:
@@ -958,89 +969,77 @@ def render_synthesis_review_page(
     return render_layout(title="Synthesis", active_path=SYNTHESIS_ROUTE, content=content)
 
 
-def render_ticket_review_page(
-    session: dict[str, str],
-    *,
-    ticket_path: Path | None = None,
-    title: str | None = None,
-    description: str | None = None,
-    error: str | None = None,
-    cached: bool = False,
-) -> str:
-    intake_id = session.get("intake_id", "")
+def render_ticket_review_page(session: dict[str, str], *, markdown: str = "", error: str | None = None) -> str:
+    escaped_markdown = html.escape(markdown)
     error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
-    if error or not ticket_path:
-        content = f"""
+    session_note = (
+        '<p class="session-note">Draft is stored in this browser session until export.</p>'
+        if session.get(SESSION_TICKET_MARKDOWN_KEY)
+        else ""
+    )
+    return render_layout(
+        title="Ticket",
+        active_path=TICKET_REVIEW_ROUTE,
+        content=f"""
         <section class="workspace">
           <h2>Ticket</h2>
           <p>{html.escape(ROUTES_BY_PATH[TICKET_REVIEW_ROUTE].placeholder)}</p>
-          <p>Current intake: <code>{html.escape(intake_id)}</code></p>
-          {error_markup}
-        </section>
-        """
-    else:
-        preview = html.escape(description or "")
-        cache_note = "Cached ticket draft" if cached else "New ticket draft"
-        content = f"""
-        <section class="workspace ticket-review">
-          <h2>Ticket</h2>
-          <p class="session-note">{html.escape(cache_note)} for <code>{html.escape(intake_id)}</code>.</p>
-          <p>Draft path: <code>{html.escape(str(ticket_path))}</code></p>
-          {error_markup}
-          <article aria-label="Ticket draft">
-            <h3>{html.escape(title or "")}</h3>
-            <pre class="ticket-preview">{preview}</pre>
-          </article>
-          <form method="post" action="{TICKET_REVIEW_ROUTE}">
+          <form method="post" action="{TICKET_REVIEW_ROUTE}" novalidate>
+            <label for="ticket_markdown">Ticket Markdown</label>
+            <textarea id="ticket_markdown" name="ticket_markdown" autofocus>{escaped_markdown}</textarea>
             <div class="form-footer">
-              <span>Ticket draft validates against the Symphony-ready schema.</span>
-              <button type="submit">Continue to export</button>
+              <span>{len(markdown)} characters</span>
+              <button type="submit">Validate and continue</button>
             </div>
+            {error_markup}
+            {session_note}
           </form>
         </section>
-        """
-    return render_layout(title="Ticket", active_path=TICKET_REVIEW_ROUTE, content=content)
+        """,
+    )
 
 
 def render_export_page(
     session: dict[str, str],
     *,
+    markdown: str = "",
     ticket_path: Path | None = None,
     linear_url: str | None = None,
     error: str | None = None,
 ) -> str:
-    intake_id = session.get("intake_id", "")
     error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
     url_markup = (
         f'<p class="export-result">Exported to <a href="{html.escape(linear_url)}">{html.escape(linear_url)}</a>.</p>'
         if linear_url
         else ""
     )
+    path_markup = f"<p>Ticket path: <code>{html.escape(str(ticket_path))}</code></p>" if ticket_path else ""
     form_markup = (
         f"""
         <form method="post" action="{EXPORT_ROUTE}">
           <div class="form-footer">
-            <span>Linear client comes from the configured export factory.</span>
+            <span>{len(markdown)} ticket characters ready for Linear.</span>
             <button type="submit">Export to Linear</button>
           </div>
         </form>
         """
-        if ticket_path and not linear_url
+        if markdown and not linear_url
         else ""
     )
-    path_markup = f"<p>Ticket path: <code>{html.escape(str(ticket_path))}</code></p>" if ticket_path else ""
-    content = f"""
-    <section class="workspace">
-      <h2>Export</h2>
-      <p>{html.escape(ROUTES_BY_PATH[EXPORT_ROUTE].placeholder)}</p>
-      <p>Current intake: <code>{html.escape(intake_id)}</code></p>
-      {path_markup}
-      {error_markup}
-      {url_markup}
-      {form_markup}
-    </section>
-    """
-    return render_layout(title="Export", active_path=EXPORT_ROUTE, content=content)
+    return render_layout(
+        title="Export",
+        active_path=EXPORT_ROUTE,
+        content=f"""
+        <section class="workspace">
+          <h2>Export</h2>
+          <p>{html.escape(ROUTES_BY_PATH[EXPORT_ROUTE].placeholder)}</p>
+          {path_markup}
+          {error_markup}
+          {url_markup}
+          {form_markup}
+        </section>
+        """,
+    )
 
 
 def render_placeholder_page(route: WizardRoute, *, session_id: str, visit_count: int) -> str:
@@ -1160,8 +1159,6 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
     .concept-badge {{ border-radius: 999px; padding: 2px 8px; background: #e6fffa; color: #0f766e; font-size: 12px; font-weight: 700; }}
     .concept-badge.prior {{ background: #fef3c7; color: #92400e; }}
     details.brief-section summary {{ cursor: pointer; font-size: 18px; font-weight: 700; margin-bottom: 16px; }}
-    .ticket-preview {{ background: #f8fafc; border: 1px solid var(--line); border-radius: 6px; max-height: 420px; overflow: auto; padding: 14px; white-space: pre-wrap; }}
-    .export-result {{ font-weight: 650; }}
     button, a {{ color: var(--accent); font-weight: 650; }}
     button {{ border: 0; border-radius: 6px; background: var(--accent); color: white; padding: 10px 14px; cursor: pointer; font: inherit; }}
     .validation {{ color: var(--danger); margin: 12px 0 0; font-weight: 650; }}
