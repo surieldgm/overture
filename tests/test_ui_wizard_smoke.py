@@ -7,11 +7,16 @@ from http import cookies
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
+from overture.graph import GraphRecord
+from overture.graph_store import SqliteGraphStore
 from overture.intake import load_intake_record
+from overture.synthesis import synthesize_graph_context
 from overture.ui_host import (
     RESEARCH_APPROVAL_ROUTE,
     RESEARCH_COMPLETE_ROUTE,
     SESSION_COOKIE_NAME,
+    SYNTHESIS_ROUTE,
+    TICKET_REVIEW_ROUTE,
     build_ui_server,
 )
 
@@ -88,18 +93,97 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertIn(intake_id, prompts[0])
 
+    def test_synthesis_page_renders_brief_and_advances_to_ticket_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            with _running_server(store_dir=store_dir, llm_client=_stub_llm_client) as base_url:
+                research_cookie = _approved_research_cookie(base_url)
 
-def _running_server(*, store_dir: Path, llm_client) -> "_ServerContext":
-    return _ServerContext(store_dir=store_dir, llm_client=llm_client)
+                synthesis_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": research_cookie})
+                self.assertEqual(synthesis_page.status, 200)
+                expected_order = ["Problem", "User need", "Evidence", "Connected concepts", "Proposed capability", "Candidate ticket"]
+                positions = [synthesis_page.body.index(text) for text in expected_order]
+                self.assertEqual(positions, sorted(positions))
+                self.assertIn("Current run", synthesis_page.body)
+                self.assertIn("Continue to ticket review", synthesis_page.body)
+
+                advance_response = _post(base_url, SYNTHESIS_ROUTE, {}, headers={"Cookie": synthesis_page.headers["Set-Cookie"]})
+                ticket_page = _get(base_url, TICKET_REVIEW_ROUTE, headers={"Cookie": advance_response.headers["Set-Cookie"]})
+
+            self.assertEqual(advance_response.status, 303)
+            self.assertEqual(advance_response.headers["Location"], TICKET_REVIEW_ROUTE)
+            advanced_session = _session_from_set_cookie(advance_response.headers["Set-Cookie"])
+            self.assertEqual(advanced_session["next_route"], TICKET_REVIEW_ROUTE)
+            self.assertEqual(advanced_session["synthesis_id"], advanced_session["intake_id"])
+            self.assertIn("synthesis_brief", advanced_session)
+            self.assertTrue((store_dir / "synthesis" / f"{advanced_session['intake_id']}.json").exists())
+            self.assertEqual(ticket_page.status, 200)
+            self.assertIn('<textarea id="ticket_markdown" name="ticket_markdown"', ticket_page.body)
+            self.assertIn("# Draft ticket for Help designers validate synthesis before ticket drafting", ticket_page.body)
+
+    def test_synthesis_page_distinguishes_prior_connected_concepts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            SqliteGraphStore(store_dir / "graph.sqlite").upsert_record(
+                GraphRecord(
+                    kind="Idea",
+                    key="idea_prior_run",
+                    properties={"label": "Prior run discovery", "summary": "Prior synthesis found reusable context."},
+                )
+            )
+            with _running_server(store_dir=store_dir, llm_client=_stub_llm_client) as base_url:
+                research_cookie = _approved_research_cookie(base_url)
+                synthesis_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": research_cookie})
+
+            self.assertEqual(synthesis_page.status, 200)
+            self.assertIn("Current run", synthesis_page.body)
+            self.assertIn("Prior run", synthesis_page.body)
+            self.assertIn("Prior run discovery", synthesis_page.body)
+            self.assertIn('class="concept-card prior"', synthesis_page.body)
+
+    def test_synthesis_revisit_uses_cached_brief_without_recomputation(self) -> None:
+        calls = 0
+
+        def counting_synthesizer(context, *, prior_context=None):
+            nonlocal calls
+            calls += 1
+            return synthesize_graph_context(context, prior_context=prior_context)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            with _running_server(
+                store_dir=store_dir,
+                llm_client=_stub_llm_client,
+                synthesizer=counting_synthesizer,
+            ) as base_url:
+                research_cookie = _approved_research_cookie(base_url)
+                first_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": research_cookie})
+                self.assertEqual(first_page.status, 200)
+                advance_response = _post(base_url, SYNTHESIS_ROUTE, {}, headers={"Cookie": first_page.headers["Set-Cookie"]})
+                revisit_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": advance_response.headers["Set-Cookie"]})
+
+            self.assertEqual(revisit_page.status, 200)
+            self.assertIn("Cached brief", revisit_page.body)
+            self.assertEqual(calls, 1)
+
+
+def _running_server(*, store_dir: Path, llm_client, synthesizer=synthesize_graph_context) -> "_ServerContext":
+    return _ServerContext(store_dir=store_dir, llm_client=llm_client, synthesizer=synthesizer)
 
 
 class _ServerContext:
-    def __init__(self, *, store_dir: Path, llm_client) -> None:
+    def __init__(self, *, store_dir: Path, llm_client, synthesizer) -> None:
         self.store_dir = store_dir
         self.llm_client = llm_client
+        self.synthesizer = synthesizer
 
     def __enter__(self) -> str:
-        self.server = build_ui_server(port=0, store_dir=self.store_dir, llm_client=self.llm_client)
+        self.server = build_ui_server(
+            port=0,
+            store_dir=self.store_dir,
+            llm_client=self.llm_client,
+            synthesizer=self.synthesizer,
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.server.server_address[:2]
@@ -161,6 +245,36 @@ class _Response:
         self.status = status
         self.headers = headers
         self.body = body
+
+def _stub_llm_client(_prompt: str) -> str:
+    return json.dumps(
+        [
+            {
+                "title": "Designer synthesis workflow",
+                "url": "https://example.test/designer-synthesis",
+                "citation": None,
+                "summary": "Designers need a synthesis review before committing to ticket drafts.",
+                "evidence_claims": [
+                    "Brief review surfaces misalignment before final ticket Markdown.",
+                ],
+                "inference_claims": [
+                    "A read-only synthesis page should sit between research approval and ticket review.",
+                ],
+            }
+        ]
+    )
+
+
+def _approved_research_cookie(base_url: str) -> str:
+    intake_response = _post(base_url, "/intake", {"idea": "Help designers validate synthesis before ticket drafting"})
+    approval_page = _get(base_url, RESEARCH_APPROVAL_ROUTE, headers={"Cookie": intake_response.headers["Set-Cookie"]})
+    research_response = _post(
+        base_url,
+        RESEARCH_APPROVAL_ROUTE,
+        {"decision-0": "approve:https://example.test/designer-synthesis"},
+        headers={"Cookie": approval_page.headers["Set-Cookie"]},
+    )
+    return research_response.headers["Set-Cookie"]
 
 
 if __name__ == "__main__":

@@ -14,14 +14,17 @@ from urllib.parse import parse_qs
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from .export import parse_ticket_markdown
+from .graph import research_result_to_graph_records
+from .graph_store import SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record, load_intake_record
-from .research import CuratedSource, _normalize_source
+from .research import CuratedSource, ResearchClaim, ResearchError, ResearchItem, ResearchResult, SourceReference, _normalize_source
 from .research_llm import (
     LLMSuggestedSourceAdapter,
     fake_llm_client,
     research_result_to_jsonable,
     write_research_result,
 )
+from .synthesis import GraphContext, SynthesisBrief, synthesize_graph_context
 from .ticket_writer import generate_linear_issue_draft
 
 INTAKE_TEXT_MAX_CHARS = 5000
@@ -32,6 +35,8 @@ DEFAULT_STORE_DIR = Path(".overture")
 EXAMPLES_LIBRARY_PATH = Path("examples") / "intake_examples"
 RESEARCH_APPROVAL_ROUTE = "/research/approval"
 RESEARCH_COMPLETE_ROUTE = "/research/complete"
+SYNTHESIS_ROUTE = "/synthesis"
+TICKET_REVIEW_ROUTE = "/ticket"
 SESSION_CANDIDATES_KEY = "research_candidates"
 SESSION_APPROVALS_KEY = "research_approvals"
 SESSION_SYNTHESIS_BRIEF_KEY = "synthesis_brief"
@@ -103,6 +108,14 @@ class TicketReviewResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class SynthesisReviewResult:
+    session: dict[str, str]
+    brief: Mapping[str, object] | None = None
+    error: str | None = None
+    cached: bool = False
+
+
 class SessionStore:
     """In-memory server-side session state keyed by an opaque cookie id."""
 
@@ -140,10 +153,12 @@ class OvertureUiApp:
         store_dir: Path | str = DEFAULT_STORE_DIR,
         *,
         llm_client: Callable[[str], str] = fake_llm_client,
+        synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
     ) -> None:
         self.store_dir = Path(store_dir)
         self.session_store = SessionStore()
         self.llm_client = llm_client
+        self.synthesizer = synthesizer
 
     def __call__(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         method = str(environ.get("REQUEST_METHOD", "GET")).upper()
@@ -173,9 +188,13 @@ class OvertureUiApp:
             return self._handle_research_post(environ, start_response)
         if path == RESEARCH_COMPLETE_ROUTE and method == "GET":
             return self._render(start_response, render_research_complete_page(session_from_environ(environ)))
-        if path == "/ticket" and method == "GET":
+        if path == SYNTHESIS_ROUTE and method == "GET":
+            return self._handle_synthesis_get(environ, start_response)
+        if path == SYNTHESIS_ROUTE and method == "POST":
+            return self._handle_synthesis_post(environ, start_response)
+        if path == TICKET_REVIEW_ROUTE and method == "GET":
             return self._handle_ticket_get(environ, start_response)
-        if path == "/ticket" and method == "POST":
+        if path == TICKET_REVIEW_ROUTE and method == "POST":
             return self._handle_ticket_post(environ, start_response)
         if path == "/examples/intake_examples" and method == "GET":
             return self._render(start_response, render_examples_library())
@@ -248,6 +267,33 @@ class OvertureUiApp:
             extra_headers=[("Set-Cookie", _session_cookie(result.session))],
         )
 
+    def _handle_synthesis_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        result = prepare_synthesis_review(
+            session_from_environ(environ),
+            self.store_dir,
+            synthesizer=self.synthesizer,
+        )
+        return self._render(
+            start_response,
+            render_synthesis_review_page(result.session, brief=result.brief, error=result.error, cached=result.cached),
+            extra_headers=[("Set-Cookie", _session_cookie(result.session))],
+        )
+
+    def _handle_synthesis_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        result = advance_synthesis_review(session_from_environ(environ), self.store_dir)
+        if result.error:
+            return self._render(
+                start_response,
+                render_synthesis_review_page(result.session, brief=result.brief, error=result.error, cached=result.cached),
+                status="400 Bad Request",
+                extra_headers=[("Set-Cookie", _session_cookie(result.session))],
+            )
+        return self._redirect(
+            start_response,
+            TICKET_REVIEW_ROUTE,
+            extra_headers=[("Set-Cookie", _session_cookie(result.session))],
+        )
+
     def _handle_ticket_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         result = prepare_ticket_review(session_from_environ(environ))
         return self._render(
@@ -267,7 +313,11 @@ class OvertureUiApp:
                 status="400 Bad Request",
                 extra_headers=[("Set-Cookie", _session_cookie(result.session))],
             )
-        return self._redirect(start_response, "/export", extra_headers=[("Set-Cookie", _session_cookie(result.session))])
+        return self._redirect(
+            start_response,
+            "/export",
+            extra_headers=[("Set-Cookie", _session_cookie(result.session))],
+        )
 
     def _render(
         self,
@@ -312,9 +362,10 @@ def build_ui_server(
     *,
     store_dir: Path | str = DEFAULT_STORE_DIR,
     llm_client: Callable[[str], str] = fake_llm_client,
+    synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
 ) -> LoopbackOnlyWSGIServer:
     _ensure_loopback_bind_host(host)
-    app = OvertureUiApp(store_dir=store_dir, llm_client=llm_client)
+    app = OvertureUiApp(store_dir=store_dir, llm_client=llm_client, synthesizer=synthesizer)
     return make_server(
         host,
         port,
@@ -330,8 +381,9 @@ def serve_ui_host(
     store_dir: Path | str = DEFAULT_STORE_DIR,
     *,
     llm_client: Callable[[str], str] = fake_llm_client,
+    synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
 ) -> None:
-    server = build_ui_server(host=host, port=port, store_dir=store_dir, llm_client=llm_client)
+    server = build_ui_server(host=host, port=port, store_dir=store_dir, llm_client=llm_client, synthesizer=synthesizer)
     bound_host, bound_port = server.server_address[:2]
     print(f"Overture UI host listening on http://localhost:{bound_port}/intake")
     print(f"Bound to loopback address {bound_host}; press Ctrl+C to stop.")
@@ -432,6 +484,63 @@ def submit_research_approvals(
     next_session["research_id"] = intake.id
     next_session["next_route"] = "/synthesis"
     return ResearchReviewResult(next_session, candidates)
+
+
+def prepare_synthesis_review(
+    session: dict[str, str],
+    store_dir: Path | str,
+    *,
+    synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
+) -> SynthesisReviewResult:
+    intake_id = session.get("intake_id", "")
+    if not intake_id:
+        return SynthesisReviewResult(
+            session=dict(session),
+            error="No intake is stored in this session. Return to intake before reviewing synthesis.",
+        )
+
+    cache_path = _synthesis_cache_path(store_dir, intake_id)
+    if cache_path.exists():
+        brief = _read_json(cache_path)
+        next_session = dict(session)
+        next_session[SESSION_SYNTHESIS_BRIEF_KEY] = json.dumps(brief, sort_keys=True, separators=(",", ":"))
+        return SynthesisReviewResult(next_session, brief, cached=True)
+
+    try:
+        intake = load_intake_record(Path(store_dir) / "intake" / f"{intake_id}.json")
+    except FileNotFoundError:
+        return SynthesisReviewResult(dict(session), error=f"Intake record not found for {intake_id}.")
+
+    research = _research_result_from_session(session)
+    if research is None:
+        research_path = Path(store_dir) / "research" / f"{intake_id}.json"
+        if not research_path.exists():
+            return SynthesisReviewResult(dict(session), error=f"Research result not found for {intake_id}.")
+        research = _research_result_from_json(_read_json(research_path))
+    if not research.items:
+        return SynthesisReviewResult(dict(session), error="No approved research result is available for synthesis.")
+
+    current_context = _synthesis_context_from_intake_research(intake, research)
+    prior_context = SqliteGraphStore(Path(store_dir) / "graph.sqlite").load_context()
+    brief = synthesizer(current_context, prior_context=prior_context).to_dict()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(brief, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    next_session = dict(session)
+    next_session["synthesis_id"] = intake_id
+    next_session["next_route"] = TICKET_REVIEW_ROUTE
+    next_session[SESSION_SYNTHESIS_BRIEF_KEY] = json.dumps(brief, sort_keys=True, separators=(",", ":"))
+    return SynthesisReviewResult(next_session, brief, cached=False)
+
+
+def advance_synthesis_review(session: dict[str, str], store_dir: Path | str) -> SynthesisReviewResult:
+    result = prepare_synthesis_review(session, store_dir)
+    if result.error:
+        return result
+    next_session = dict(result.session)
+    next_session["synthesis_id"] = next_session.get("intake_id", "")
+    next_session["next_route"] = TICKET_REVIEW_ROUTE
+    return SynthesisReviewResult(next_session, result.brief, cached=result.cached)
 
 
 def prepare_ticket_review(session: dict[str, str]) -> TicketReviewResult:
@@ -683,6 +792,54 @@ def render_research_complete_page(session: dict[str, str]) -> str:
     )
 
 
+def render_synthesis_review_page(
+    session: dict[str, str],
+    *,
+    brief: Mapping[str, object] | None = None,
+    error: str | None = None,
+    cached: bool = False,
+) -> str:
+    intake_id = session.get("intake_id", "")
+    error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
+    if brief is None:
+        content = f"""
+        <section class="workspace">
+          <h2>Synthesis</h2>
+          <p>{html.escape(ROUTES_BY_PATH[SYNTHESIS_ROUTE].placeholder)}</p>
+          <p>Current intake: <code>{html.escape(intake_id)}</code></p>
+          {error_markup}
+        </section>
+        """
+    else:
+        ticket_items = _ticket_items(brief.get("candidate_ticket_breakdown"))
+        cache_note = "Cached brief" if cached else "New brief"
+        content = f"""
+        <section class="workspace synthesis-brief">
+          <h2>Synthesis</h2>
+          <p class="session-note">{html.escape(cache_note)} for <code>{html.escape(intake_id)}</code>.</p>
+          {error_markup}
+          <article aria-label="Synthesis brief">
+            {_brief_text_section("Problem", brief.get("problem"))}
+            {_brief_text_section("User need", brief.get("user_need"))}
+            {_evidence_section(brief.get("relevant_evidence"))}
+            {_connected_concepts_section(brief.get("connected_concepts"))}
+            {_brief_text_section("Proposed capability", brief.get("proposed_capability"))}
+            <section class="brief-section">
+              <h3>Candidate ticket</h3>
+              {ticket_items}
+            </section>
+          </article>
+          <form method="post" action="{SYNTHESIS_ROUTE}">
+            <div class="form-footer">
+              <span>Brief is read-only until ticket review.</span>
+              <button type="submit">Continue to ticket review</button>
+            </div>
+          </form>
+        </section>
+        """
+    return render_layout(title="Synthesis", active_path=SYNTHESIS_ROUTE, content=content)
+
+
 def render_ticket_review_page(session: dict[str, str], *, markdown: str = "", error: str | None = None) -> str:
     escaped_markdown = html.escape(markdown)
     error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
@@ -693,12 +850,12 @@ def render_ticket_review_page(session: dict[str, str], *, markdown: str = "", er
     )
     return render_layout(
         title="Ticket",
-        active_path="/ticket",
+        active_path=TICKET_REVIEW_ROUTE,
         content=f"""
         <section class="workspace">
           <h2>Ticket</h2>
-          <p>{html.escape(ROUTES_BY_PATH["/ticket"].placeholder)}</p>
-          <form method="post" action="/ticket" novalidate>
+          <p>{html.escape(ROUTES_BY_PATH[TICKET_REVIEW_ROUTE].placeholder)}</p>
+          <form method="post" action="{TICKET_REVIEW_ROUTE}" novalidate>
             <label for="ticket_markdown">Ticket Markdown</label>
             <textarea id="ticket_markdown" name="ticket_markdown" autofocus>{escaped_markdown}</textarea>
             <div class="form-footer">
@@ -820,6 +977,16 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
     legend {{ color: var(--muted); font-size: 13px; font-weight: 650; margin-bottom: 8px; }}
     fieldset label {{ display: flex; gap: 8px; align-items: center; font-weight: 500; }}
     .empty-state {{ color: var(--muted); }}
+    .brief-section {{ border-top: 1px solid var(--line); padding-top: 18px; margin-top: 18px; }}
+    .brief-section p {{ margin: 0 0 10px; }}
+    .brief-list {{ margin: 0; padding-left: 20px; }}
+    .concept-list, .ticket-list {{ display: grid; gap: 12px; list-style: none; margin: 0; padding: 0; }}
+    .concept-card, .ticket-card {{ border: 1px solid var(--line); border-radius: 6px; padding: 14px; }}
+    .concept-card.prior {{ border-color: #b7791f; background: #fffbeb; }}
+    .concept-meta {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }}
+    .concept-badge {{ border-radius: 999px; padding: 2px 8px; background: #e6fffa; color: #0f766e; font-size: 12px; font-weight: 700; }}
+    .concept-badge.prior {{ background: #fef3c7; color: #92400e; }}
+    details.brief-section summary {{ cursor: pointer; font-size: 18px; font-weight: 700; margin-bottom: 16px; }}
     button, a {{ color: var(--accent); font-weight: 650; }}
     button {{ border: 0; border-radius: 6px; background: var(--accent); color: white; padding: 10px 14px; cursor: pointer; font: inherit; }}
     .validation {{ color: var(--danger); margin: 12px 0 0; font-weight: 650; }}
@@ -917,3 +1084,269 @@ def _ensure_loopback_bind_host(host: str) -> None:
     except ValueError:
         pass
     raise ValueError(f"UI host must bind to localhost or a loopback address, got {host!r}")
+
+
+def _synthesis_cache_path(store_dir: Path | str, intake_id: str) -> Path:
+    return Path(store_dir) / "synthesis" / f"{intake_id}.json"
+
+
+def _read_json(path: Path) -> Mapping[str, object]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, Mapping) else {}
+
+
+def _research_result_from_session(session: Mapping[str, str]) -> ResearchResult | None:
+    payload = _session_json_map(session.get("research_result"))
+    return _research_result_from_json(payload) if payload else None
+
+
+def _research_result_from_json(payload: Mapping[str, object]) -> ResearchResult:
+    items = []
+    for item in payload.get("items", ()):
+        if not isinstance(item, Mapping):
+            continue
+        source_payload = item.get("source", {})
+        source = source_payload if isinstance(source_payload, Mapping) else {}
+        claims = []
+        for claim in item.get("claims", ()):
+            if isinstance(claim, Mapping):
+                claims.append(
+                    ResearchClaim(
+                        text=str(claim.get("text") or ""),
+                        kind="inference" if claim.get("kind") == "inference" else "evidence",
+                        confidence=float(claim.get("confidence") or 0),
+                    )
+                )
+        items.append(
+            ResearchItem(
+                source=SourceReference(
+                    title=str(source.get("title") or ""),
+                    url=_optional_text(source.get("url")),
+                    citation=_optional_text(source.get("citation")),
+                ),
+                summary=str(item.get("summary") or ""),
+                claims=tuple(claim for claim in claims if claim.text),
+                relevance_score=float(item.get("relevance_score") or 0),
+                confidence=float(item.get("confidence") or 0),
+            )
+        )
+    errors = []
+    for error in payload.get("errors", ()):
+        if isinstance(error, Mapping):
+            errors.append(
+                ResearchError(
+                    code=str(error.get("code") or "adapter_failure"),  # type: ignore[arg-type]
+                    message=str(error.get("message") or ""),
+                    source=_optional_text(error.get("source")),
+                )
+            )
+    return ResearchResult(intake_id=_optional_text(payload.get("intake_id")), items=tuple(items), errors=tuple(errors))
+
+
+def _synthesis_context_from_intake_research(intake: IntakeRecord, research: ResearchResult) -> GraphContext:
+    records = research_result_to_graph_records(research)
+    nodes = [
+        {
+            "id": f"userinput_{intake.id}",
+            "type": "UserInput",
+            "label": "Designer intake",
+            "summary": intake.normalized_summary,
+            "raw_text": intake.raw_text,
+            "provenance": {"origin": "user_input", "source_refs": [intake.id], "confidence": "high"},
+        },
+        {
+            "id": f"need_{intake.id}",
+            "type": "Need",
+            "label": "Pre-ticket synthesis review",
+            "summary": _first_inference(research)
+            or "Designers need a read-only synthesis brief before committing to a generated ticket draft.",
+            "provenance": {"origin": "research", "source_node_ids": [f"userinput_{intake.id}"], "confidence": "medium"},
+        },
+        {
+            "id": f"capability_{intake.id}_synthesis_review",
+            "type": "Capability",
+            "label": "Synthesis brief review",
+            "summary": "Render approved research as a structured product and engineering brief before ticket review.",
+            "provenance": {"origin": "synthesis", "source_node_ids": [f"need_{intake.id}"], "confidence": "high"},
+        },
+        {
+            "id": f"ticketcandidate_{intake.id}_ticket_review",
+            "type": "TicketCandidate",
+            "label": "Generate ticket from synthesis brief",
+            "title": f"Draft ticket for {intake.normalized_summary[:72]}",
+            "scope": "Convert the reviewed synthesis brief into a Symphony-ready ticket draft.",
+            "validation_plan": ["Confirm the ticket review route receives the approved synthesis session."],
+            "readiness": "draft",
+            "provenance": {
+                "origin": "synthesis",
+                "source_node_ids": [f"capability_{intake.id}_synthesis_review"],
+                "confidence": "medium",
+            },
+        },
+    ]
+    edges = [
+        {
+            "id": f"need_{intake.id}__derived_from__userinput_{intake.id}",
+            "type": "derived_from",
+            "from": f"need_{intake.id}",
+            "to": f"userinput_{intake.id}",
+        },
+        {
+            "id": f"capability_{intake.id}_synthesis_review__addresses__need_{intake.id}",
+            "type": "addresses",
+            "from": f"capability_{intake.id}_synthesis_review",
+            "to": f"need_{intake.id}",
+        },
+        {
+            "id": f"capability_{intake.id}_synthesis_review__suggests__ticketcandidate_{intake.id}_ticket_review",
+            "type": "suggests",
+            "from": f"capability_{intake.id}_synthesis_review",
+            "to": f"ticketcandidate_{intake.id}_ticket_review",
+        },
+    ]
+    for record in records:
+        if record.kind in {"Source", "ResearchItem", "Claim"}:
+            properties = dict(record.properties)
+            if record.kind == "Claim" and "text" in properties:
+                properties["statement"] = properties["text"]
+            nodes.append({"id": record.key, "type": record.kind, "kind": record.kind, **properties})
+        else:
+            edge = {"id": record.key, "type": record.kind, "kind": record.kind, **record.properties}
+            edges.append(edge)
+    for index, item in enumerate(research.items):
+        evidence_id = f"evidence_{intake.id}_{index}"
+        nodes.append(
+            {
+                "id": evidence_id,
+                "type": "Evidence",
+                "label": item.source.title,
+                "summary": item.summary,
+                "provenance": {"origin": "research", "source_refs": [item.source.reference], "confidence": item.confidence},
+            }
+        )
+        edges.append(
+            {
+                "id": f"{evidence_id}__supports__capability_{intake.id}_synthesis_review",
+                "type": "supports",
+                "from": evidence_id,
+                "to": f"capability_{intake.id}_synthesis_review",
+            }
+        )
+    return GraphContext(nodes=tuple(nodes), edges=tuple(edges))
+
+
+def _first_inference(research: ResearchResult) -> str:
+    for item in research.items:
+        for claim in item.claims:
+            if claim.kind == "inference" and claim.text:
+                return claim.text
+    return ""
+
+
+def _brief_text_section(title: str, value: object) -> str:
+    return f"""
+    <section class="brief-section">
+      <h3>{html.escape(title)}</h3>
+      <p>{html.escape(str(value or "Not provided."))}</p>
+    </section>
+    """
+
+
+def _evidence_section(value: object) -> str:
+    payload = value if isinstance(value, Mapping) else {}
+    evidence = _list_items(payload.get("evidence"), lambda item: _summary_line(item, "summary"))
+    claims = _list_items(payload.get("evidence_backed_claims"), lambda item: _summary_line(item, "statement"))
+    assumptions = _list_items(payload.get("assumptions"), lambda item: _summary_line(item, "statement"))
+    return f"""
+    <section class="brief-section">
+      <h3>Evidence</h3>
+      <h4>References</h4>
+      {evidence}
+      <h4>Claims</h4>
+      {claims}
+      <h4>Assumptions</h4>
+      {assumptions}
+    </section>
+    """
+
+
+def _connected_concepts_section(value: object) -> str:
+    concepts = value if _is_sequence(value) else []
+    items = []
+    for concept in concepts:
+        if not isinstance(concept, Mapping):
+            continue
+        from_prior = bool(concept.get("from_prior"))
+        badge = "Prior run" if from_prior else "Current run"
+        prior_class = " prior" if from_prior else ""
+        items.append(
+            f"""
+            <li class="concept-card{prior_class}">
+              <div class="concept-meta">
+                <span class="concept-badge{prior_class}">{html.escape(badge)}</span>
+                <strong>{html.escape(str(concept.get("label") or concept.get("id") or "Untitled concept"))}</strong>
+                <span>{html.escape(str(concept.get("type") or "Concept"))}</span>
+              </div>
+              <p>{html.escape(str(concept.get("summary") or "No summary provided."))}</p>
+            </li>
+            """
+        )
+    if not items:
+        items.append('<li class="empty-state">No connected concepts were produced.</li>')
+    return f"""
+    <details class="brief-section" open>
+      <summary>Connected concepts</summary>
+      <ul class="concept-list">{''.join(items)}</ul>
+    </details>
+    """
+
+
+def _ticket_items(value: object) -> str:
+    tickets = value if _is_sequence(value) else []
+    items = []
+    for ticket in tickets:
+        if not isinstance(ticket, Mapping):
+            continue
+        validation = _list_items(ticket.get("validation_plan"), lambda item: str(item))
+        items.append(
+            f"""
+            <li class="ticket-card">
+              <h4>{html.escape(str(ticket.get("title") or "Untitled ticket"))}</h4>
+              <p>{html.escape(str(ticket.get("scope") or "No scope provided."))}</p>
+              <h4>Validation plan</h4>
+              {validation}
+            </li>
+            """
+        )
+    if not items:
+        items.append('<li class="empty-state">No candidate ticket was produced.</li>')
+    return f'<ul class="ticket-list">{"".join(items)}</ul>'
+
+
+def _list_items(value: object, formatter: Callable[[object], str]) -> str:
+    values = value if _is_sequence(value) else []
+    items = [f"<li>{html.escape(formatter(item))}</li>" for item in values if formatter(item)]
+    if not items:
+        items = ['<li class="empty-state">None.</li>']
+    return f'<ul class="brief-list">{"".join(items)}</ul>'
+
+
+def _summary_line(item: object, key: str) -> str:
+    if isinstance(item, Mapping):
+        text = str(item.get(key) or item.get("id") or "").strip()
+        refs = item.get("source_refs")
+        if _is_sequence(refs) and refs:
+            return f"{text} ({', '.join(str(ref) for ref in refs)})"
+        return text
+    return str(item)
+
+
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _is_sequence(value: object) -> bool:
+    return isinstance(value, (list, tuple))
