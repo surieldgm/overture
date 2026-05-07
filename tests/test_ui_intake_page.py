@@ -6,6 +6,7 @@ from http import cookies
 from pathlib import Path
 from urllib.parse import urlencode
 
+from overture.auth import auth_cookie
 from overture.intake import load_intake_record
 from overture.ui_host import (
     INTAKE_TEXT_MAX_CHARS,
@@ -20,6 +21,13 @@ from overture.ui_host import (
 
 
 class IntakePageTests(unittest.TestCase):
+    def test_unauthenticated_intake_redirects_to_login(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response = _request(OvertureUiApp(store_dir=tmpdir), "GET", "/intake", authenticated=False)
+
+        self.assertEqual(response.status, "302 Found")
+        self.assertEqual(response.headers["Location"], "/login?next=/intake")
+
     def test_intake_page_renders_form_and_curated_examples_link(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             response = _request(OvertureUiApp(store_dir=tmpdir), "GET", "/intake")
@@ -252,6 +260,7 @@ def _request(
     fields: dict[str, str] | None = None,
     *,
     cookie: str | None = None,
+    authenticated: bool = True,
 ) -> Response:
     encoded = urlencode(fields or {}, doseq=True).encode("utf-8")
     captured: dict[str, object] = {}
@@ -267,7 +276,9 @@ def _request(
         "CONTENT_TYPE": "application/x-www-form-urlencoded",
         "wsgi.input": io.BytesIO(encoded),
     }
-    if cookie:
+    if authenticated:
+        environ["HTTP_COOKIE"] = _with_auth_cookie(cookie)
+    elif cookie:
         environ["HTTP_COOKIE"] = cookie
 
     body = b"".join(app(environ, start_response)).decode("utf-8")
@@ -284,6 +295,11 @@ def _session_cookie(session: dict[str, str]) -> str:
     jar = cookies.SimpleCookie()
     jar[SESSION_COOKIE_NAME] = json.dumps(session, sort_keys=True, separators=(",", ":"))
     return jar.output(header="").strip()
+
+
+def _with_auth_cookie(cookie: str | None, user_id: str = "designer-1") -> str:
+    login_cookie = auth_cookie(user_id, email=f"{user_id}@example.test")
+    return f"{cookie}; {login_cookie}" if cookie else login_cookie
 
 
 def _synthesis_brief() -> dict[str, object]:

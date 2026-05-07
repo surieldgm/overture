@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlencode, urlparse
 
+from overture.auth import AUTH_COOKIE_NAME, auth_cookie
 from overture.linear_client import CreatedIssue
 from overture.ui_host import SESSION_COOKIE_NAME, build_ui_server
 
@@ -140,7 +141,15 @@ def _request(
     parsed = urlparse(base_url)
     connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=2)
     try:
-        connection.request(method, path, body=body, headers=headers or {})
+        request_headers = dict(headers or {})
+        if AUTH_COOKIE_NAME not in request_headers.get("Cookie", ""):
+            auth_header = auth_cookie("designer-1", email="designer-1@example.test")
+            request_headers["Cookie"] = (
+                f'{request_headers["Cookie"]}; {auth_header}'
+                if "Cookie" in request_headers
+                else auth_header
+            )
+        connection.request(method, path, body=body, headers=request_headers)
         response = connection.getresponse()
         payload = response.read().decode("utf-8")
         return _Response(
