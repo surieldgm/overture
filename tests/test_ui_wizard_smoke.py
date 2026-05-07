@@ -5,11 +5,14 @@ import threading
 import unittest
 from http import cookies
 from pathlib import Path
+from unittest import mock
 from urllib.parse import urlencode, urlparse
 
 from overture.graph import GraphRecord
 from overture.graph_store import SqliteGraphStore
 from overture.intake import load_intake_record
+from overture.export import parse_ticket_file
+from overture.linear_client import CreatedIssue
 from overture.synthesis import synthesize_graph_context
 from overture.ui_host import (
     RESEARCH_APPROVAL_ROUTE,
@@ -22,6 +25,122 @@ from overture.ui_host import (
 
 
 class WizardPhaseOneSmokeTests(unittest.TestCase):
+    def test_http_wizard_drives_intake_to_export_with_stubbed_clients(self) -> None:
+        linear_calls: list[dict[str, object]] = []
+
+        class StubLinearClient:
+            def create_issue(
+                self,
+                *,
+                team_id,
+                title,
+                description,
+                project_id=None,
+                priority=None,
+                sprint_label=None,
+                milestone=None,
+            ):
+                linear_calls.append(
+                    {
+                        "team_id": team_id,
+                        "title": title,
+                        "description": description,
+                        "project_id": project_id,
+                        "priority": priority,
+                        "sprint_label": sprint_label,
+                        "milestone": milestone,
+                    }
+                )
+                return CreatedIssue(
+                    id="stubbed-issue-id",
+                    identifier="ERI-123",
+                    url="https://linear.app/eria/issue/ERI-123/full-wizard-smoke",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            with mock.patch.dict(
+                "os.environ",
+                {"LINEAR_API_KEY": "stubbed-key", "LINEAR_TEAM_ID": "stubbed-ui-team"},
+            ):
+                server = _running_server(
+                    store_dir=store_dir,
+                    llm_client=_stub_llm_client,
+                    linear_client_factory=StubLinearClient,
+                )
+                with server as base_url:
+                    intake_response = _post(
+                        base_url,
+                        "/intake",
+                        {"idea": "Validate the complete wizard path through Linear export"},
+                    )
+                    self.assertEqual(intake_response.status, 303)
+                    self.assertEqual(intake_response.headers["Location"], RESEARCH_APPROVAL_ROUTE)
+                    intake_session = _session_from_set_cookie(intake_response.headers["Set-Cookie"])
+                    intake_id = intake_session["intake_id"]
+
+                    approval_page = _get(base_url, RESEARCH_APPROVAL_ROUTE, headers={"Cookie": intake_response.headers["Set-Cookie"]})
+                    self.assertEqual(approval_page.status, 200)
+                    research_response = _post(
+                        base_url,
+                        RESEARCH_APPROVAL_ROUTE,
+                        {"decision-0": "approve:https://example.test/designer-synthesis"},
+                        headers={"Cookie": approval_page.headers["Set-Cookie"]},
+                    )
+                    self.assertEqual(research_response.status, 303)
+                    self.assertEqual(research_response.headers["Location"], RESEARCH_COMPLETE_ROUTE)
+
+                    synthesis_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": research_response.headers["Set-Cookie"]})
+                    self.assertEqual(synthesis_page.status, 200)
+                    self.assertIn("Continue to ticket review", synthesis_page.body)
+
+                    synthesis_response = _post(base_url, SYNTHESIS_ROUTE, {}, headers={"Cookie": synthesis_page.headers["Set-Cookie"]})
+                    self.assertEqual(synthesis_response.status, 303)
+                    self.assertEqual(synthesis_response.headers["Location"], TICKET_REVIEW_ROUTE)
+
+                    ticket_page = _get(base_url, TICKET_REVIEW_ROUTE, headers={"Cookie": synthesis_response.headers["Set-Cookie"]})
+                    self.assertEqual(ticket_page.status, 200)
+                    self.assertIn('<textarea id="ticket_markdown" name="ticket_markdown"', ticket_page.body)
+
+                    ticket_session = _session_from_set_cookie(ticket_page.headers["Set-Cookie"])
+                    ticket_response = _post(
+                        base_url,
+                        TICKET_REVIEW_ROUTE,
+                        {"ticket_markdown": ticket_session["ticket_markdown"]},
+                        headers={"Cookie": ticket_page.headers["Set-Cookie"]},
+                    )
+                    self.assertEqual(ticket_response.status, 303)
+                    self.assertEqual(ticket_response.headers["Location"], "/export")
+
+                    export_page = _get(base_url, "/export", headers={"Cookie": ticket_response.headers["Set-Cookie"]})
+                    self.assertEqual(export_page.status, 200)
+                    self.assertIn('name="action" value="export"', export_page.body)
+
+                    export_response = _post(
+                        base_url,
+                        "/export",
+                        {"action": "export"},
+                        headers={"Cookie": export_page.headers["Set-Cookie"]},
+                    )
+                    self.assertEqual(export_response.status, 200)
+                    self.assertIn("https://linear.app/eria/issue/ERI-123/full-wizard-smoke", export_response.body)
+
+            intake_path = store_dir / "intake" / f"{intake_id}.json"
+            research_path = store_dir / "research" / f"{intake_id}.json"
+            synthesis_path = store_dir / "synthesis" / f"{intake_id}.json"
+            ticket_path = store_dir / "ticket" / f"{intake_id}-export.md"
+
+            self.assertTrue(intake_path.exists(), intake_path)
+            self.assertTrue(research_path.exists(), research_path)
+            self.assertTrue(synthesis_path.exists(), synthesis_path)
+            self.assertTrue(ticket_path.exists(), ticket_path)
+            parsed_ticket = parse_ticket_file(ticket_path)
+
+        self.assertEqual(len(linear_calls), 1)
+        self.assertEqual(linear_calls[0]["team_id"], "stubbed-ui-team")
+        self.assertEqual(linear_calls[0]["title"], parsed_ticket.title)
+        self.assertTrue(str(linear_calls[0]["description"]).startswith("## Context"))
+
     def test_http_wizard_persists_intake_research_and_points_session_to_synthesis(self) -> None:
         prompts: list[str] = []
         idea = "Help designers turn Overture intake into research-backed Symphony tickets"
@@ -119,7 +238,7 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
             self.assertTrue((store_dir / "synthesis" / f"{advanced_session['intake_id']}.json").exists())
             self.assertEqual(ticket_page.status, 200)
             self.assertIn('<textarea id="ticket_markdown" name="ticket_markdown"', ticket_page.body)
-            self.assertIn("# Draft ticket for Help designers validate synthesis before ticket drafting", ticket_page.body)
+            self.assertIn("# Add ticket for Help designers validate synthesis before ticket drafting", ticket_page.body)
 
     def test_synthesis_page_distinguishes_prior_connected_concepts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -167,15 +286,27 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
             self.assertEqual(calls, 1)
 
 
-def _running_server(*, store_dir: Path, llm_client, synthesizer=synthesize_graph_context) -> "_ServerContext":
-    return _ServerContext(store_dir=store_dir, llm_client=llm_client, synthesizer=synthesizer)
+def _running_server(
+    *,
+    store_dir: Path,
+    llm_client,
+    synthesizer=synthesize_graph_context,
+    linear_client_factory=None,
+) -> "_ServerContext":
+    return _ServerContext(
+        store_dir=store_dir,
+        llm_client=llm_client,
+        synthesizer=synthesizer,
+        linear_client_factory=linear_client_factory,
+    )
 
 
 class _ServerContext:
-    def __init__(self, *, store_dir: Path, llm_client, synthesizer) -> None:
+    def __init__(self, *, store_dir: Path, llm_client, synthesizer, linear_client_factory) -> None:
         self.store_dir = store_dir
         self.llm_client = llm_client
         self.synthesizer = synthesizer
+        self.linear_client_factory = linear_client_factory
 
     def __enter__(self) -> str:
         self.server = build_ui_server(
@@ -183,6 +314,7 @@ class _ServerContext:
             store_dir=self.store_dir,
             llm_client=self.llm_client,
             synthesizer=self.synthesizer,
+            linear_client_factory=self.linear_client_factory,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
