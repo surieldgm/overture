@@ -434,6 +434,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Markdown output path. Defaults to .overture/retros/milestone-retro.md.",
     )
 
+    ui = subparsers.add_parser(
+        "ui",
+        help="Start the local-only wizard UI host.",
+    )
+    ui.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Loopback address to bind. Defaults to 127.0.0.1.",
+    )
+    ui.add_argument(
+        "--port",
+        type=_positive_int,
+        default=8765,
+        help="Local port for the UI host. Defaults to 8765.",
+    )
+
     return parser
 
 
@@ -529,6 +545,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "retro":
         return _retro(args)
+
+    if args.command == "ui":
+        from .ui_host import serve_ui_host
+
+        try:
+            serve_ui_host(host=args.host, port=args.port)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        return 0
 
     parser.print_help(sys.stderr)
     return 2
