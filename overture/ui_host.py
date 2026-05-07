@@ -7,6 +7,7 @@ from http import cookies
 import html
 from ipaddress import ip_address
 import json
+import os
 from pathlib import Path
 import secrets
 from typing import Callable, Iterable, Mapping
@@ -17,6 +18,9 @@ from .export import parse_ticket_markdown
 from .graph import research_result_to_graph_records
 from .graph_store import SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record, load_intake_record
+from .export import parse_ticket_file
+from .export_runner import ExportRunResult, run_ticket_export
+from .linear_client import LinearClient
 from .research import CuratedSource, ResearchClaim, ResearchError, ResearchItem, ResearchResult, SourceReference, _normalize_source
 from .research_llm import (
     LLMSuggestedSourceAdapter,
@@ -41,6 +45,9 @@ SESSION_CANDIDATES_KEY = "research_candidates"
 SESSION_APPROVALS_KEY = "research_approvals"
 SESSION_SYNTHESIS_BRIEF_KEY = "synthesis_brief"
 SESSION_TICKET_MARKDOWN_KEY = "ticket_markdown"
+SESSION_TICKET_PATH_KEY = "ticket_path"
+SESSION_TICKET_TITLE_KEY = "ticket_title"
+SESSION_TICKET_BODY_KEY = "ticket_body"
 
 StartResponse = Callable[[str, list[tuple[str, str]]], None]
 
@@ -116,6 +123,16 @@ class SynthesisReviewResult:
     cached: bool = False
 
 
+@dataclass(frozen=True)
+class ExportReviewResult:
+    session: dict[str, str]
+    ticket_path: Path | None = None
+    title: str = ""
+    body_preview: str = ""
+    message: str | None = None
+    result: ExportRunResult | None = None
+
+
 class SessionStore:
     """In-memory server-side session state keyed by an opaque cookie id."""
 
@@ -154,11 +171,13 @@ class OvertureUiApp:
         *,
         llm_client: Callable[[str], str] = fake_llm_client,
         synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
+        linear_client_factory: Callable[[], object] | None = None,
     ) -> None:
         self.store_dir = Path(store_dir)
         self.session_store = SessionStore()
         self.llm_client = llm_client
         self.synthesizer = synthesizer
+        self.linear_client_factory = linear_client_factory or _linear_client_from_env
 
     def __call__(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         method = str(environ.get("REQUEST_METHOD", "GET")).upper()
@@ -196,6 +215,10 @@ class OvertureUiApp:
             return self._handle_ticket_get(environ, start_response)
         if path == TICKET_REVIEW_ROUTE and method == "POST":
             return self._handle_ticket_post(environ, start_response)
+        if path == "/export" and method == "GET":
+            return self._handle_export_get(environ, start_response)
+        if path == "/export" and method == "POST":
+            return self._handle_export_post(environ, start_response)
         if path == "/examples/intake_examples" and method == "GET":
             return self._render(start_response, render_examples_library())
         if path in ROUTES_BY_PATH and method == "GET":
@@ -319,6 +342,78 @@ class OvertureUiApp:
             extra_headers=[("Set-Cookie", _session_cookie(result.session))],
         )
 
+    def _handle_export_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        result = prepare_export_review(session_from_environ(environ), self.store_dir)
+        return self._render(
+            start_response,
+            render_export_page(result),
+            status="200 OK",
+            extra_headers=[("Set-Cookie", _session_cookie(result.session))],
+        )
+
+    def _handle_export_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        fields = _form_fields(environ)
+        action = fields.get("action", [""])[0]
+        session = session_from_environ(environ)
+        if action == "back":
+            return self._redirect(start_response, TICKET_REVIEW_ROUTE, extra_headers=[("Set-Cookie", _session_cookie(session))])
+
+        dry_run = action == "dry-run"
+        if action not in {"dry-run", "export"}:
+            review = prepare_export_review(session, self.store_dir, message="Choose Dry-run or Export before continuing.")
+            return self._render(
+                start_response,
+                render_export_page(review),
+                status="400 Bad Request",
+                extra_headers=[("Set-Cookie", _session_cookie(review.session))],
+            )
+
+        review = prepare_export_review(session, self.store_dir)
+        if review.ticket_path is None:
+            return self._render(
+                start_response,
+                render_export_page(review),
+                status="400 Bad Request",
+                extra_headers=[("Set-Cookie", _session_cookie(review.session))],
+            )
+        if not dry_run and "LINEAR_API_KEY" not in os.environ:
+            review = ExportReviewResult(
+                session=review.session,
+                ticket_path=review.ticket_path,
+                title=review.title,
+                body_preview=review.body_preview,
+                message="LINEAR_API_KEY is required before exporting to Linear. Dry-run remains available.",
+            )
+            return self._render(
+                start_response,
+                render_export_page(review),
+                status="400 Bad Request",
+                extra_headers=[("Set-Cookie", _session_cookie(review.session))],
+            )
+
+        export_result = run_ticket_export(
+            review.ticket_path,
+            team_id=os.environ.get("LINEAR_TEAM_ID"),
+            project_id=os.environ.get("LINEAR_PROJECT_ID"),
+            dry_run=dry_run,
+            ledger_db=self.store_dir / "exports.sqlite",
+            linear_client_factory=self.linear_client_factory,
+        )
+        status = "200 OK" if export_result.status in {"dry_run", "exported", "already_exported"} else "400 Bad Request"
+        review = ExportReviewResult(
+            session=review.session,
+            ticket_path=review.ticket_path,
+            title=review.title,
+            body_preview=review.body_preview,
+            result=export_result,
+        )
+        return self._render(
+            start_response,
+            render_export_page(review),
+            status=status,
+            extra_headers=[("Set-Cookie", _session_cookie(review.session))],
+        )
+
     def _render(
         self,
         start_response: StartResponse,
@@ -363,9 +458,15 @@ def build_ui_server(
     store_dir: Path | str = DEFAULT_STORE_DIR,
     llm_client: Callable[[str], str] = fake_llm_client,
     synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
+    linear_client_factory: Callable[[], object] | None = None,
 ) -> LoopbackOnlyWSGIServer:
     _ensure_loopback_bind_host(host)
-    app = OvertureUiApp(store_dir=store_dir, llm_client=llm_client, synthesizer=synthesizer)
+    app = OvertureUiApp(
+        store_dir=store_dir,
+        llm_client=llm_client,
+        synthesizer=synthesizer,
+        linear_client_factory=linear_client_factory,
+    )
     return make_server(
         host,
         port,
@@ -382,8 +483,16 @@ def serve_ui_host(
     *,
     llm_client: Callable[[str], str] = fake_llm_client,
     synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
+    linear_client_factory: Callable[[], object] | None = None,
 ) -> None:
-    server = build_ui_server(host=host, port=port, store_dir=store_dir, llm_client=llm_client, synthesizer=synthesizer)
+    server = build_ui_server(
+        host=host,
+        port=port,
+        store_dir=store_dir,
+        llm_client=llm_client,
+        synthesizer=synthesizer,
+        linear_client_factory=linear_client_factory,
+    )
     bound_host, bound_port = server.server_address[:2]
     print(f"Overture UI host listening on http://localhost:{bound_port}/intake")
     print(f"Bound to loopback address {bound_host}; press Ctrl+C to stop.")
@@ -578,6 +687,31 @@ def submit_ticket_review(session: dict[str, str], markdown: str) -> TicketReview
     return TicketReviewResult(session=next_session, markdown=markdown)
 
 
+def prepare_export_review(
+    session: dict[str, str],
+    store_dir: Path | str,
+    *,
+    message: str | None = None,
+) -> ExportReviewResult:
+    next_session = dict(session)
+    session_ticket_path = _session_ticket_path(session, store_dir)
+    if session_ticket_path is not None:
+        return _export_review_from_path(next_session, session_ticket_path, message=message)
+
+    ticket_markdown = _session_ticket_markdown(session)
+    if not ticket_markdown:
+        return ExportReviewResult(
+            session=next_session,
+            message=message or "No validated ticket is stored in this session. Return to ticket review before exporting.",
+        )
+
+    session_key = next_session.get("intake_id") or next_session.get("research_id") or "session"
+    ticket_path = Path(store_dir) / "ticket" / f"{_safe_session_key(session_key)}-export.md"
+    ticket_path.parent.mkdir(parents=True, exist_ok=True)
+    ticket_path.write_text(ticket_markdown, encoding="utf-8")
+    return _export_review_from_path(next_session, ticket_path, message=message)
+
+
 def validate_intake_text(raw_text: str) -> str | None:
     if not raw_text.strip():
         return "Enter an idea before continuing."
@@ -602,6 +736,70 @@ def session_from_environ(environ: dict[str, object]) -> dict[str, str]:
     if not isinstance(payload, dict):
         return {}
     return {str(key): str(value) for key, value in payload.items()}
+
+
+def _export_review_from_path(
+    session: dict[str, str],
+    ticket_path: Path,
+    *,
+    message: str | None = None,
+) -> ExportReviewResult:
+    try:
+        parsed = parse_ticket_file(ticket_path)
+    except ValueError as exc:
+        return ExportReviewResult(session=session, ticket_path=ticket_path, message=str(exc))
+
+    preview = parsed.description[:200]
+    if len(parsed.description) > 200:
+        preview += "..."
+    render_message = message
+    if render_message is None and "LINEAR_API_KEY" not in os.environ:
+        render_message = "LINEAR_API_KEY is not set. Dry-run is available, but Export requires setup before it can create an issue."
+    return ExportReviewResult(
+        session=session,
+        ticket_path=ticket_path,
+        title=parsed.title,
+        body_preview=preview,
+        message=render_message,
+    )
+
+
+def _session_ticket_markdown(session: Mapping[str, str]) -> str:
+    markdown = str(session.get(SESSION_TICKET_MARKDOWN_KEY, "")).strip()
+    if markdown:
+        return markdown + ("\n" if not markdown.endswith("\n") else "")
+
+    title = str(session.get(SESSION_TICKET_TITLE_KEY, "")).strip()
+    body = str(session.get(SESSION_TICKET_BODY_KEY, "")).strip()
+    if not title or not body:
+        return ""
+    if body.startswith("## "):
+        description = body
+    else:
+        description = f"## Context\n\n{body}"
+    return f"# {title}\n\n{description}\n"
+
+
+def _session_ticket_path(session: Mapping[str, str], store_dir: Path | str) -> Path | None:
+    raw_path = str(session.get(SESSION_TICKET_PATH_KEY, "")).strip()
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = Path(store_dir) / path
+    return path if path.exists() else None
+
+
+def _safe_session_key(value: str) -> str:
+    safe = "".join(character if character.isalnum() or character in {"-", "_"} else "-" for character in value)
+    return safe.strip("-") or "session"
+
+
+def _linear_client_from_env() -> LinearClient:
+    api_key = os.environ.get("LINEAR_API_KEY")
+    if not api_key:
+        raise RuntimeError("LINEAR_API_KEY is required for real Linear export")
+    return LinearClient(api_key=api_key)
 
 
 def _session_candidates(session: Mapping[str, str], intake_id: str) -> tuple[CuratedSource, ...]:
@@ -870,6 +1068,61 @@ def render_ticket_review_page(session: dict[str, str], *, markdown: str = "", er
     )
 
 
+def render_export_page(review: ExportReviewResult) -> str:
+    error_markup = f'<p class="validation" role="alert">{html.escape(review.message)}</p>' if review.message else ""
+    result_markup = ""
+    if review.result is not None:
+        result_class = "export-result" if review.result.status in {"dry_run", "exported", "already_exported"} else "validation"
+        escaped = html.escape(review.result.message)
+        if review.result.url and review.result.status in {"exported", "already_exported"}:
+            escaped_url = html.escape(review.result.url)
+            result_markup = (
+                f'<div class="{result_class}" role="status">'
+                f"<p>{html.escape(review.result.status.replace('_', ' '))}</p>"
+                f'<p><a href="{escaped_url}">{escaped_url}</a></p>'
+                f"</div>"
+            )
+        else:
+            result_markup = f'<pre class="{result_class}" role="status">{escaped}</pre>'
+
+    if review.ticket_path is None or not review.title:
+        summary_markup = '<p class="empty-state">No export-ready ticket is available.</p>'
+        actions = f'<div class="form-footer"><a href="{TICKET_REVIEW_ROUTE}">Back to ticket review</a></div>'
+    else:
+        summary_markup = f"""
+          <dl class="export-summary">
+            <dt>Title</dt>
+            <dd>{html.escape(review.title)}</dd>
+            <dt>Body preview</dt>
+            <dd>{html.escape(review.body_preview)}</dd>
+          </dl>
+        """
+        actions = """
+          <div class="form-footer">
+            <button type="submit" name="action" value="back" class="secondary">Back</button>
+            <span>Dry-run previews the Linear payload without creating an issue.</span>
+            <button type="submit" name="action" value="dry-run">Dry-run</button>
+            <button type="submit" name="action" value="export">Export</button>
+          </div>
+        """
+
+    return render_layout(
+        title="Export",
+        active_path="/export",
+        content=f"""
+        <section class="workspace">
+          <h2>Export</h2>
+          {error_markup}
+          {summary_markup}
+          <form method="post" action="/export" novalidate>
+            {actions}
+          </form>
+          {result_markup}
+        </section>
+        """,
+    )
+
+
 def render_placeholder_page(route: WizardRoute, *, session_id: str, visit_count: int) -> str:
     return render_layout(
         title=route.title,
@@ -987,8 +1240,13 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
     .concept-badge {{ border-radius: 999px; padding: 2px 8px; background: #e6fffa; color: #0f766e; font-size: 12px; font-weight: 700; }}
     .concept-badge.prior {{ background: #fef3c7; color: #92400e; }}
     details.brief-section summary {{ cursor: pointer; font-size: 18px; font-weight: 700; margin-bottom: 16px; }}
+    .export-summary {{ display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 12px 18px; margin: 22px 0; }}
+    .export-summary dt {{ color: var(--muted); font-weight: 650; }}
+    .export-summary dd {{ margin: 0; overflow-wrap: anywhere; }}
+    .export-result {{ background: #ecfdf5; border: 1px solid #99f6e4; border-radius: 6px; margin-top: 18px; padding: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }}
     button, a {{ color: var(--accent); font-weight: 650; }}
     button {{ border: 0; border-radius: 6px; background: var(--accent); color: white; padding: 10px 14px; cursor: pointer; font: inherit; }}
+    button.secondary {{ background: #edf2f7; color: var(--ink); }}
     .validation {{ color: var(--danger); margin: 12px 0 0; font-weight: 650; }}
     .session, .session-note {{ color: var(--muted); margin-bottom: 0; }}
     code {{ background: #edf2f7; padding: 2px 4px; border-radius: 4px; }}

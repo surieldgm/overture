@@ -25,7 +25,10 @@ class UIHostTests(unittest.TestCase):
                 self.assertIn('aria-label="Breadcrumbs"', response.body)
                 self.assertIn("<section>", response.body)
                 self.assertIn(route.title, response.body)
-                self.assertIn(route.placeholder, response.body)
+                if route.path == "/export":
+                    self.assertIn("No export-ready ticket is available.", response.body)
+                else:
+                    self.assertIn(route.placeholder, response.body)
 
     def test_session_cookie_reuses_server_side_session_on_refresh(self) -> None:
         with _running_server() as base_url:
