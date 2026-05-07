@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlencode, urlparse
 
-from overture.auth import MagicLinkAuth
+from overture.auth import AUTH_COOKIE_NAME, MagicLinkAuth
 from overture.graph_http import SharedGraphBackend
 from overture.graph import GraphRecord
 from overture.graph_store import SqliteGraphStore
@@ -23,9 +23,10 @@ from overture.ui_host import (
     SESSION_COOKIE_NAME,
     SYNTHESIS_ROUTE,
     TICKET_REVIEW_ROUTE,
-    AUTH_VERIFY_ROUTE,
     build_ui_server,
 )
+
+TEST_AUTH = MagicLinkAuth(secret="ui-wizard-smoke-test")
 
 
 class WizardPhaseOneSmokeTests(unittest.TestCase):
@@ -366,7 +367,7 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
                     store_dir=store_dir,
                     llm_client=llm_client,
                     linear_client_factory=StubLinearClient,
-                    auth_backend=auth,
+                    auth_manager=auth,
                     graph_backend=graph_backend,
                 ) as base_url:
                     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -421,7 +422,7 @@ def _running_server(
     llm_client,
     synthesizer=synthesize_graph_context,
     linear_client_factory=None,
-    auth_backend=None,
+    auth_manager=None,
     graph_backend=None,
 ) -> "_ServerContext":
     return _ServerContext(
@@ -429,18 +430,18 @@ def _running_server(
         llm_client=llm_client,
         synthesizer=synthesizer,
         linear_client_factory=linear_client_factory,
-        auth_backend=auth_backend,
+        auth_manager=auth_manager,
         graph_backend=graph_backend,
     )
 
 
 class _ServerContext:
-    def __init__(self, *, store_dir: Path, llm_client, synthesizer, linear_client_factory, auth_backend, graph_backend) -> None:
+    def __init__(self, *, store_dir: Path, llm_client, synthesizer, linear_client_factory, auth_manager, graph_backend) -> None:
         self.store_dir = store_dir
         self.llm_client = llm_client
         self.synthesizer = synthesizer
         self.linear_client_factory = linear_client_factory
-        self.auth_backend = auth_backend
+        self.auth_manager = auth_manager
         self.graph_backend = graph_backend
 
     def __enter__(self) -> str:
@@ -450,7 +451,7 @@ class _ServerContext:
             llm_client=self.llm_client,
             synthesizer=self.synthesizer,
             linear_client_factory=self.linear_client_factory,
-            auth_backend=self.auth_backend,
+            auth_manager=self.auth_manager or TEST_AUTH,
             graph_backend=self.graph_backend,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -491,12 +492,18 @@ def _request(
     parsed = urlparse(base_url)
     connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=2)
     try:
-        connection.request(method, path, body=body, headers=headers or {})
+        request_headers = dict(headers or {})
+        request_headers["Cookie"] = _merge_cookie(
+            request_headers.get("Cookie"),
+            AUTH_COOKIE_NAME,
+            TEST_AUTH.issue_session("designer@example.com"),
+        )
+        connection.request(method, path, body=body, headers=request_headers)
         response = connection.getresponse()
         payload = response.read().decode("utf-8")
         return _Response(
             status=response.status,
-            headers={key: value for key, value in response.getheaders()},
+            headers=response.getheaders(),
             body=payload,
         )
     finally:
@@ -510,65 +517,83 @@ def _session_from_set_cookie(header: str) -> dict[str, str]:
 
 
 def _complete_authenticated_wizard(base_url: str, auth: MagicLinkAuth, user: dict[str, str]) -> dict[str, str]:
-    token = auth.issue_token(user["email"])
-    auth_response = _get(base_url, f"{AUTH_VERIFY_ROUTE}?{urlencode({'token': token})}")
-    assert auth_response.status == 303
-    auth_cookie = auth_response.headers["Set-Cookie"]
-    auth_session = _session_from_set_cookie(auth_cookie)
+    auth_token = auth.issue_session(user["email"])
+    auth_header = _merge_cookie(None, AUTH_COOKIE_NAME, auth_token)
     idea = f"{user['name']} needs a concurrent wizard run with isolated artifacts"
 
-    intake_response = _post(base_url, "/intake", {"idea": idea}, headers={"Cookie": auth_cookie})
+    intake_response = _post(base_url, "/intake", {"idea": idea}, headers={"Cookie": auth_header})
     assert intake_response.status == 303
     intake_session = _session_from_set_cookie(intake_response.headers["Set-Cookie"])
     intake_id = intake_session["intake_id"]
+    intake_cookie = _merge_cookie(intake_response.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth_token)
 
-    approval_page = _get(base_url, RESEARCH_APPROVAL_ROUTE, headers={"Cookie": intake_response.headers["Set-Cookie"]})
+    approval_page = _get(base_url, RESEARCH_APPROVAL_ROUTE, headers={"Cookie": intake_cookie})
     assert approval_page.status == 200
+    approval_cookie = _merge_cookie(approval_page.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth_token)
     research_response = _post(
         base_url,
         RESEARCH_APPROVAL_ROUTE,
         {"decision-0": f"approve:{user['source']}"},
-        headers={"Cookie": approval_page.headers["Set-Cookie"]},
+        headers={"Cookie": approval_cookie},
     )
     assert research_response.status == 303
+    research_cookie = _merge_cookie(research_response.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth_token)
 
-    synthesis_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": research_response.headers["Set-Cookie"]})
+    synthesis_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": research_cookie})
     assert synthesis_page.status == 200
-    synthesis_response = _post(base_url, SYNTHESIS_ROUTE, {}, headers={"Cookie": synthesis_page.headers["Set-Cookie"]})
+    synthesis_cookie = _merge_cookie(synthesis_page.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth_token)
+    synthesis_response = _post(base_url, SYNTHESIS_ROUTE, {}, headers={"Cookie": synthesis_cookie})
     assert synthesis_response.status == 303
+    synthesis_advance_cookie = _merge_cookie(synthesis_response.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth_token)
 
-    ticket_page = _get(base_url, TICKET_REVIEW_ROUTE, headers={"Cookie": synthesis_response.headers["Set-Cookie"]})
+    ticket_page = _get(base_url, TICKET_REVIEW_ROUTE, headers={"Cookie": synthesis_advance_cookie})
     assert ticket_page.status == 200
     ticket_session = _session_from_set_cookie(ticket_page.headers["Set-Cookie"])
+    ticket_cookie = _merge_cookie(ticket_page.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth_token)
     ticket_response = _post(
         base_url,
         TICKET_REVIEW_ROUTE,
         {"ticket_markdown": ticket_session["ticket_markdown"]},
-        headers={"Cookie": ticket_page.headers["Set-Cookie"]},
+        headers={"Cookie": ticket_cookie},
     )
     assert ticket_response.status == 303
+    ticket_review_cookie = _merge_cookie(ticket_response.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth_token)
 
-    export_page = _get(base_url, "/export", headers={"Cookie": ticket_response.headers["Set-Cookie"]})
+    export_page = _get(base_url, "/export", headers={"Cookie": ticket_review_cookie})
     assert export_page.status == 200
+    export_cookie = _merge_cookie(export_page.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth_token)
     export_response = _post(
         base_url,
         "/export",
         {"action": "export"},
-        headers={"Cookie": export_page.headers["Set-Cookie"]},
+        headers={"Cookie": export_cookie},
     )
     assert export_response.status == 200
     return {
-        "author_id": auth_session["author_id"],
-        "author_email": auth_session["author_email"],
+        "author_id": intake_session["author_id"],
+        "author_email": intake_session["author_email"],
         "intake_id": intake_id,
     }
 
 
+def _merge_cookie(cookie_header: str | None, name: str, value: str) -> str:
+    jar = cookies.SimpleCookie()
+    if cookie_header:
+        jar.load(cookie_header)
+    if name not in jar:
+        jar[name] = value
+    return jar.output(header="").strip()
+
+
 class _Response:
-    def __init__(self, *, status: int, headers: dict[str, str], body: str) -> None:
+    def __init__(self, *, status: int, headers: list[tuple[str, str]], body: str) -> None:
         self.status = status
-        self.headers = headers
+        self.all_headers = headers
+        self.headers = dict(headers)
         self.body = body
+
+    def header_values(self, name: str) -> list[str]:
+        return [value for key, value in self.all_headers if key.lower() == name.lower()]
 
 def _stub_llm_client(_prompt: str) -> str:
     return _stub_llm_payload(
