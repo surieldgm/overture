@@ -52,6 +52,21 @@ ticket draft output. The generated ticket draft is written to:
 /tmp/overture-fixture/ticket/symphony-ticket-draft.md
 ```
 
+Capture dogfooding friction against a metrics run:
+
+```sh
+python -m overture friction append --db-path /tmp/overture-metrics.sqlite \
+  --session-id dogfood-day-1 --run-id latest --category slow \
+  --note "Research approval paused long enough to lose context"
+```
+
+Query the friction log by session or run id:
+
+```sh
+python -m overture friction list --db-path /tmp/overture-metrics.sqlite \
+  --session-id dogfood-day-1 --format=json
+```
+
 ## Manual Workflow
 
 Use this workflow when manually exercising the current idea-to-ticket path. The
