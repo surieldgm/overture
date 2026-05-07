@@ -13,6 +13,7 @@ from typing import Callable, Iterable, Mapping
 from urllib.parse import parse_qs
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
+from .export import parse_ticket_markdown
 from .intake import IntakeRecord, create_intake_record, load_intake_record
 from .research import CuratedSource, _normalize_source
 from .research_llm import (
@@ -21,6 +22,7 @@ from .research_llm import (
     research_result_to_jsonable,
     write_research_result,
 )
+from .ticket_writer import generate_linear_issue_draft
 
 INTAKE_TEXT_MAX_CHARS = 5000
 DEFAULT_UI_HOST = "127.0.0.1"
@@ -32,6 +34,8 @@ RESEARCH_APPROVAL_ROUTE = "/research/approval"
 RESEARCH_COMPLETE_ROUTE = "/research/complete"
 SESSION_CANDIDATES_KEY = "research_candidates"
 SESSION_APPROVALS_KEY = "research_approvals"
+SESSION_SYNTHESIS_BRIEF_KEY = "synthesis_brief"
+SESSION_TICKET_MARKDOWN_KEY = "ticket_markdown"
 
 StartResponse = Callable[[str, list[tuple[str, str]]], None]
 
@@ -89,6 +93,13 @@ class IntakeSubmissionResult:
 class ResearchReviewResult:
     session: dict[str, str]
     candidates: tuple[CuratedSource, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class TicketReviewResult:
+    session: dict[str, str]
+    markdown: str = ""
     error: str | None = None
 
 
@@ -162,6 +173,10 @@ class OvertureUiApp:
             return self._handle_research_post(environ, start_response)
         if path == RESEARCH_COMPLETE_ROUTE and method == "GET":
             return self._render(start_response, render_research_complete_page(session_from_environ(environ)))
+        if path == "/ticket" and method == "GET":
+            return self._handle_ticket_get(environ, start_response)
+        if path == "/ticket" and method == "POST":
+            return self._handle_ticket_post(environ, start_response)
         if path == "/examples/intake_examples" and method == "GET":
             return self._render(start_response, render_examples_library())
         if path in ROUTES_BY_PATH and method == "GET":
@@ -232,6 +247,27 @@ class OvertureUiApp:
             RESEARCH_COMPLETE_ROUTE,
             extra_headers=[("Set-Cookie", _session_cookie(result.session))],
         )
+
+    def _handle_ticket_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        result = prepare_ticket_review(session_from_environ(environ))
+        return self._render(
+            start_response,
+            render_ticket_review_page(result.session, markdown=result.markdown, error=result.error),
+            extra_headers=[("Set-Cookie", _session_cookie(result.session))],
+        )
+
+    def _handle_ticket_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        fields = _form_fields(environ)
+        markdown = fields.get("ticket_markdown", [""])[0]
+        result = submit_ticket_review(session_from_environ(environ), markdown)
+        if result.error:
+            return self._render(
+                start_response,
+                render_ticket_review_page(result.session, markdown=result.markdown, error=result.error),
+                status="400 Bad Request",
+                extra_headers=[("Set-Cookie", _session_cookie(result.session))],
+            )
+        return self._redirect(start_response, "/export", extra_headers=[("Set-Cookie", _session_cookie(result.session))])
 
     def _render(
         self,
@@ -396,6 +432,41 @@ def submit_research_approvals(
     next_session["research_id"] = intake.id
     next_session["next_route"] = "/synthesis"
     return ResearchReviewResult(next_session, candidates)
+
+
+def prepare_ticket_review(session: dict[str, str]) -> TicketReviewResult:
+    next_session = dict(session)
+    existing = next_session.get(SESSION_TICKET_MARKDOWN_KEY)
+    if existing:
+        return TicketReviewResult(session=next_session, markdown=existing)
+
+    brief_json = next_session.get(SESSION_SYNTHESIS_BRIEF_KEY) or next_session.get("synthesis")
+    if not brief_json:
+        return TicketReviewResult(
+            session=next_session,
+            error="No synthesis brief is stored in this session. Return to synthesis before reviewing a ticket.",
+        )
+    try:
+        brief = json.loads(brief_json)
+        draft = generate_linear_issue_draft(brief)
+    except (TypeError, ValueError, IndexError, json.JSONDecodeError) as exc:
+        return TicketReviewResult(session=next_session, error=f"Could not generate ticket draft: {exc}")
+
+    next_session[SESSION_TICKET_MARKDOWN_KEY] = draft.description
+    return TicketReviewResult(session=next_session, markdown=draft.description)
+
+
+def submit_ticket_review(session: dict[str, str], markdown: str) -> TicketReviewResult:
+    next_session = dict(session)
+    next_session[SESSION_TICKET_MARKDOWN_KEY] = markdown
+    try:
+        parsed = parse_ticket_markdown(markdown)
+    except ValueError as exc:
+        return TicketReviewResult(session=next_session, markdown=markdown, error=str(exc))
+
+    next_session["ticket_title"] = parsed.title
+    next_session["next_route"] = "/export"
+    return TicketReviewResult(session=next_session, markdown=markdown)
 
 
 def validate_intake_text(raw_text: str) -> str | None:
@@ -607,6 +678,36 @@ def render_research_complete_page(session: dict[str, str]) -> str:
         <section class="workspace">
           <h2>Research saved</h2>
           <p>Saved {item_count} approved source{"s" if item_count != 1 else ""} for <code>{html.escape(intake_id)}</code>.</p>
+        </section>
+        """,
+    )
+
+
+def render_ticket_review_page(session: dict[str, str], *, markdown: str = "", error: str | None = None) -> str:
+    escaped_markdown = html.escape(markdown)
+    error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
+    session_note = (
+        '<p class="session-note">Draft is stored in this browser session until export.</p>'
+        if session.get(SESSION_TICKET_MARKDOWN_KEY)
+        else ""
+    )
+    return render_layout(
+        title="Ticket",
+        active_path="/ticket",
+        content=f"""
+        <section class="workspace">
+          <h2>Ticket</h2>
+          <p>{html.escape(ROUTES_BY_PATH["/ticket"].placeholder)}</p>
+          <form method="post" action="/ticket" novalidate>
+            <label for="ticket_markdown">Ticket Markdown</label>
+            <textarea id="ticket_markdown" name="ticket_markdown" autofocus>{escaped_markdown}</textarea>
+            <div class="form-footer">
+              <span>{len(markdown)} characters</span>
+              <button type="submit">Validate and continue</button>
+            </div>
+            {error_markup}
+            {session_note}
+          </form>
         </section>
         """,
     )
