@@ -29,19 +29,24 @@ class SharedGraphBackend:
             return self.store.upsert_records(records)
 
     def load_context(self, limit: int = 100) -> GraphContext:
-        return self.store.load_context(limit)
+        with self._write_lock:
+            return self.store.load_context(limit)
 
     def list_nodes(self, *, kind: str | None = None, limit: int | None = None) -> tuple[dict[str, Any], ...]:
-        return self.store.list_nodes(kind=kind, limit=limit)
+        with self._write_lock:
+            return self.store.list_nodes(kind=kind, limit=limit)
 
     def list_edges(self, *, kind: str | None = None, limit: int | None = None) -> tuple[dict[str, Any], ...]:
-        return self.store.list_edges(kind=kind, limit=limit)
+        with self._write_lock:
+            return self.store.list_edges(kind=kind, limit=limit)
 
     def iter_records(self) -> tuple[GraphRecord, ...]:
-        return self.store.iter_records()
+        with self._write_lock:
+            return self.store.iter_records()
 
     def table_counts(self) -> dict[str, int]:
-        return self.store.table_counts()
+        with self._write_lock:
+            return self.store.table_counts()
 
 
 class GraphHttpClient:

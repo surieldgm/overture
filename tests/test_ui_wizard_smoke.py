@@ -3,11 +3,14 @@ import json
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from http import cookies
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlencode, urlparse
 
+from overture.auth import MagicLinkAuth
+from overture.graph_http import SharedGraphBackend
 from overture.graph import GraphRecord
 from overture.graph_store import SqliteGraphStore
 from overture.intake import load_intake_record
@@ -20,6 +23,7 @@ from overture.ui_host import (
     SESSION_COOKIE_NAME,
     SYNTHESIS_ROUTE,
     TICKET_REVIEW_ROUTE,
+    AUTH_VERIFY_ROUTE,
     build_ui_server,
 )
 
@@ -285,6 +289,131 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
             self.assertIn("Cached brief", revisit_page.body)
             self.assertEqual(calls, 1)
 
+    def test_concurrent_authenticated_users_complete_wizard_against_shared_backend(self) -> None:
+        """Smoke the full two-user wizard path against the shared backend.
+
+        This boots the shared graph backend in-process and injects it into the
+        socket-backed UI server. The same scenario can be run as an
+        HTTP-loopback backend variant by replacing the injected backend with a
+        `GraphHttpClient` pointed at `create_graph_http_server(..., port=0)`;
+        that variant exercises transport behavior while keeping external
+        services stubbed.
+        """
+
+        auth = MagicLinkAuth()
+        linear_calls: list[dict[str, object]] = []
+        linear_lock = threading.Lock()
+
+        class StubLinearClient:
+            def create_issue(
+                self,
+                *,
+                team_id,
+                title,
+                description,
+                project_id=None,
+                priority=None,
+                sprint_label=None,
+                milestone=None,
+            ):
+                with linear_lock:
+                    index = len(linear_calls) + 1
+                    linear_calls.append(
+                        {
+                            "team_id": team_id,
+                            "title": title,
+                            "description": description,
+                            "project_id": project_id,
+                            "priority": priority,
+                            "sprint_label": sprint_label,
+                            "milestone": milestone,
+                        }
+                    )
+                return CreatedIssue(
+                    id=f"stubbed-issue-{index}",
+                    identifier=f"ERI-{index}",
+                    url=f"https://linear.app/eria/issue/ERI-{index}/multi-user-smoke",
+                )
+
+        def llm_client(prompt: str) -> str:
+            if "Avery" in prompt:
+                return _stub_llm_payload(
+                    title="Avery research workflow",
+                    url="https://example.test/avery-research",
+                    summary="Avery needs isolated research evidence for a concurrent wizard run.",
+                )
+            if "Blake" in prompt:
+                return _stub_llm_payload(
+                    title="Blake synthesis workflow",
+                    url="https://example.test/blake-synthesis",
+                    summary="Blake needs isolated synthesis evidence for a concurrent wizard run.",
+                )
+            raise AssertionError(f"unexpected prompt: {prompt}")
+
+        users = (
+            {"email": "avery@example.test", "name": "Avery", "source": "https://example.test/avery-research"},
+            {"email": "blake@example.test", "name": "Blake", "source": "https://example.test/blake-synthesis"},
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            graph_backend = SharedGraphBackend(SqliteGraphStore(store_dir / "graph.sqlite"))
+            with mock.patch.dict(
+                "os.environ",
+                {"LINEAR_API_KEY": "stubbed-key", "LINEAR_TEAM_ID": "stubbed-ui-team"},
+            ):
+                with _running_server(
+                    store_dir=store_dir,
+                    llm_client=llm_client,
+                    linear_client_factory=StubLinearClient,
+                    auth_backend=auth,
+                    graph_backend=graph_backend,
+                ) as base_url:
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        results = tuple(executor.map(lambda user: _complete_authenticated_wizard(base_url, auth, user), users))
+
+            by_email = {result["author_email"]: result for result in results}
+            self.assertEqual(set(by_email), {user["email"] for user in users})
+            self.assertEqual(len({result["intake_id"] for result in results}), 2)
+
+            for user in users:
+                result = by_email[user["email"]]
+                author_id = str(result["author_id"])
+                intake_id = str(result["intake_id"])
+                intake = load_intake_record(store_dir / "intake" / f"{intake_id}.json")
+                research = json.loads((store_dir / "research" / f"{intake_id}.json").read_text(encoding="utf-8"))
+                synthesis = json.loads((store_dir / "synthesis" / f"{intake_id}.json").read_text(encoding="utf-8"))
+                ticket = (store_dir / "ticket" / f"{intake_id}-export.md").read_text(encoding="utf-8")
+
+                self.assertEqual(intake.author_id, author_id)
+                self.assertEqual(intake.author_email, user["email"])
+                self.assertEqual(research["author_id"], author_id)
+                self.assertEqual(research["author_email"], user["email"])
+                self.assertEqual(synthesis["author_id"], author_id)
+                self.assertEqual(synthesis["author_email"], user["email"])
+                self.assertIn(f"<!-- author_id: {author_id} -->", ticket)
+                self.assertIn(f"<!-- author_email: {user['email']} -->", ticket)
+                self.assertIn(user["name"], intake.raw_text)
+                self.assertNotIn("Blake" if user["name"] == "Avery" else "Avery", intake.raw_text)
+
+            nodes = graph_backend.list_nodes()
+            edges = graph_backend.list_edges()
+            counts = graph_backend.table_counts()
+            self.assertEqual(counts, {"nodes": len(nodes), "edges": len(edges)})
+            self.assertEqual(counts["nodes"], 18)
+            self.assertEqual(counts["edges"], 14)
+            authors_by_email = {user["email"]: by_email[user["email"]]["author_id"] for user in users}
+            for user in users:
+                author_nodes = [node for node in nodes if node.get("author_email") == user["email"]]
+                author_edges = [edge for edge in edges if edge.get("author_email") == user["email"]]
+                self.assertEqual(len(author_nodes), 9)
+                self.assertEqual(len(author_edges), 7)
+                self.assertTrue(all(node.get("author_id") == authors_by_email[user["email"]] for node in author_nodes))
+                self.assertTrue(all(edge.get("author_id") == authors_by_email[user["email"]] for edge in author_edges))
+
+        self.assertEqual(len(linear_calls), 2)
+        self.assertEqual({call["team_id"] for call in linear_calls}, {"stubbed-ui-team"})
+
 
 def _running_server(
     *,
@@ -292,21 +421,27 @@ def _running_server(
     llm_client,
     synthesizer=synthesize_graph_context,
     linear_client_factory=None,
+    auth_backend=None,
+    graph_backend=None,
 ) -> "_ServerContext":
     return _ServerContext(
         store_dir=store_dir,
         llm_client=llm_client,
         synthesizer=synthesizer,
         linear_client_factory=linear_client_factory,
+        auth_backend=auth_backend,
+        graph_backend=graph_backend,
     )
 
 
 class _ServerContext:
-    def __init__(self, *, store_dir: Path, llm_client, synthesizer, linear_client_factory) -> None:
+    def __init__(self, *, store_dir: Path, llm_client, synthesizer, linear_client_factory, auth_backend, graph_backend) -> None:
         self.store_dir = store_dir
         self.llm_client = llm_client
         self.synthesizer = synthesizer
         self.linear_client_factory = linear_client_factory
+        self.auth_backend = auth_backend
+        self.graph_backend = graph_backend
 
     def __enter__(self) -> str:
         self.server = build_ui_server(
@@ -315,6 +450,8 @@ class _ServerContext:
             llm_client=self.llm_client,
             synthesizer=self.synthesizer,
             linear_client_factory=self.linear_client_factory,
+            auth_backend=self.auth_backend,
+            graph_backend=self.graph_backend,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -372,6 +509,61 @@ def _session_from_set_cookie(header: str) -> dict[str, str]:
     return json.loads(jar[SESSION_COOKIE_NAME].value)
 
 
+def _complete_authenticated_wizard(base_url: str, auth: MagicLinkAuth, user: dict[str, str]) -> dict[str, str]:
+    token = auth.issue_token(user["email"])
+    auth_response = _get(base_url, f"{AUTH_VERIFY_ROUTE}?{urlencode({'token': token})}")
+    assert auth_response.status == 303
+    auth_cookie = auth_response.headers["Set-Cookie"]
+    auth_session = _session_from_set_cookie(auth_cookie)
+    idea = f"{user['name']} needs a concurrent wizard run with isolated artifacts"
+
+    intake_response = _post(base_url, "/intake", {"idea": idea}, headers={"Cookie": auth_cookie})
+    assert intake_response.status == 303
+    intake_session = _session_from_set_cookie(intake_response.headers["Set-Cookie"])
+    intake_id = intake_session["intake_id"]
+
+    approval_page = _get(base_url, RESEARCH_APPROVAL_ROUTE, headers={"Cookie": intake_response.headers["Set-Cookie"]})
+    assert approval_page.status == 200
+    research_response = _post(
+        base_url,
+        RESEARCH_APPROVAL_ROUTE,
+        {"decision-0": f"approve:{user['source']}"},
+        headers={"Cookie": approval_page.headers["Set-Cookie"]},
+    )
+    assert research_response.status == 303
+
+    synthesis_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": research_response.headers["Set-Cookie"]})
+    assert synthesis_page.status == 200
+    synthesis_response = _post(base_url, SYNTHESIS_ROUTE, {}, headers={"Cookie": synthesis_page.headers["Set-Cookie"]})
+    assert synthesis_response.status == 303
+
+    ticket_page = _get(base_url, TICKET_REVIEW_ROUTE, headers={"Cookie": synthesis_response.headers["Set-Cookie"]})
+    assert ticket_page.status == 200
+    ticket_session = _session_from_set_cookie(ticket_page.headers["Set-Cookie"])
+    ticket_response = _post(
+        base_url,
+        TICKET_REVIEW_ROUTE,
+        {"ticket_markdown": ticket_session["ticket_markdown"]},
+        headers={"Cookie": ticket_page.headers["Set-Cookie"]},
+    )
+    assert ticket_response.status == 303
+
+    export_page = _get(base_url, "/export", headers={"Cookie": ticket_response.headers["Set-Cookie"]})
+    assert export_page.status == 200
+    export_response = _post(
+        base_url,
+        "/export",
+        {"action": "export"},
+        headers={"Cookie": export_page.headers["Set-Cookie"]},
+    )
+    assert export_response.status == 200
+    return {
+        "author_id": auth_session["author_id"],
+        "author_email": auth_session["author_email"],
+        "intake_id": intake_id,
+    }
+
+
 class _Response:
     def __init__(self, *, status: int, headers: dict[str, str], body: str) -> None:
         self.status = status
@@ -379,13 +571,21 @@ class _Response:
         self.body = body
 
 def _stub_llm_client(_prompt: str) -> str:
+    return _stub_llm_payload(
+        title="Designer synthesis workflow",
+        url="https://example.test/designer-synthesis",
+        summary="Designers need a synthesis review before committing to ticket drafts.",
+    )
+
+
+def _stub_llm_payload(*, title: str, url: str, summary: str) -> str:
     return json.dumps(
         [
             {
-                "title": "Designer synthesis workflow",
-                "url": "https://example.test/designer-synthesis",
+                "title": title,
+                "url": url,
                 "citation": None,
-                "summary": "Designers need a synthesis review before committing to ticket drafts.",
+                "summary": summary,
                 "evidence_claims": [
                     "Brief review surfaces misalignment before final ticket Markdown.",
                 ],

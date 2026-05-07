@@ -10,12 +10,14 @@ import json
 import os
 from pathlib import Path
 import secrets
+from socketserver import ThreadingMixIn
 from typing import Callable, Iterable, Mapping
 from urllib.parse import parse_qs
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
+from .auth import MagicLinkAuth
 from .export import parse_ticket_markdown
-from .graph import research_result_to_graph_records
+from .graph import GraphRecord, research_result_to_graph_records
 from .graph_store import SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record, load_intake_record
 from .export import parse_ticket_file
@@ -26,7 +28,6 @@ from .research_llm import (
     LLMSuggestedSourceAdapter,
     fake_llm_client,
     research_result_to_jsonable,
-    write_research_result,
 )
 from .synthesis import GraphContext, SynthesisBrief, synthesize_graph_context
 from .ticket_writer import generate_linear_issue_draft
@@ -41,6 +42,7 @@ RESEARCH_APPROVAL_ROUTE = "/research/approval"
 RESEARCH_COMPLETE_ROUTE = "/research/complete"
 SYNTHESIS_ROUTE = "/synthesis"
 TICKET_REVIEW_ROUTE = "/ticket"
+AUTH_VERIFY_ROUTE = "/auth/verify"
 SESSION_CANDIDATES_KEY = "research_candidates"
 SESSION_APPROVALS_KEY = "research_approvals"
 SESSION_SYNTHESIS_BRIEF_KEY = "synthesis_brief"
@@ -48,6 +50,8 @@ SESSION_TICKET_MARKDOWN_KEY = "ticket_markdown"
 SESSION_TICKET_PATH_KEY = "ticket_path"
 SESSION_TICKET_TITLE_KEY = "ticket_title"
 SESSION_TICKET_BODY_KEY = "ticket_body"
+SESSION_AUTHOR_ID_KEY = "author_id"
+SESSION_AUTHOR_EMAIL_KEY = "author_email"
 
 StartResponse = Callable[[str, list[tuple[str, str]]], None]
 
@@ -149,8 +153,10 @@ class SessionStore:
         return new_session_id, session, True
 
 
-class LoopbackOnlyWSGIServer(WSGIServer):
+class LoopbackOnlyWSGIServer(ThreadingMixIn, WSGIServer):
     """WSGI server that accepts only loopback clients."""
+
+    daemon_threads = True
 
     def verify_request(self, request: object, client_address: tuple[str, int]) -> bool:
         try:
@@ -172,12 +178,16 @@ class OvertureUiApp:
         llm_client: Callable[[str], str] = fake_llm_client,
         synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
         linear_client_factory: Callable[[], object] | None = None,
+        auth_backend: MagicLinkAuth | None = None,
+        graph_backend: object | None = None,
     ) -> None:
         self.store_dir = Path(store_dir)
         self.session_store = SessionStore()
         self.llm_client = llm_client
         self.synthesizer = synthesizer
         self.linear_client_factory = linear_client_factory or _linear_client_from_env
+        self.auth_backend = auth_backend or MagicLinkAuth()
+        self.graph_backend = graph_backend
 
     def __call__(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         method = str(environ.get("REQUEST_METHOD", "GET")).upper()
@@ -187,6 +197,8 @@ class OvertureUiApp:
 
         if path in {"", "/"}:
             return self._redirect(start_response, "/intake", status="302 Found")
+        if path == AUTH_VERIFY_ROUTE and method == "GET":
+            return self._handle_auth_verify(environ, start_response)
         if path == "/intake" and method == "GET":
             session_id, server_session, is_new = self._server_session(environ)
             body = render_intake_page(
@@ -255,6 +267,22 @@ class OvertureUiApp:
             extra_headers=[("Set-Cookie", _session_cookie(result.session))],
         )
 
+    def _handle_auth_verify(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        token = parse_qs(str(environ.get("QUERY_STRING", ""))).get("token", [""])[0]
+        user = self.auth_backend.verify_token(token)
+        if user is None:
+            return self._render(start_response, render_auth_error_page(), status="400 Bad Request")
+
+        session = session_from_environ(environ)
+        session[SESSION_AUTHOR_ID_KEY] = user.user_id
+        session[SESSION_AUTHOR_EMAIL_KEY] = user.email
+        session["next_route"] = "/intake"
+        return self._redirect(
+            start_response,
+            "/intake",
+            extra_headers=[("Set-Cookie", _session_cookie(session))],
+        )
+
     def _handle_research_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         result = prepare_research_review(session_from_environ(environ), self.store_dir, self.llm_client)
         return self._render(
@@ -295,6 +323,7 @@ class OvertureUiApp:
             session_from_environ(environ),
             self.store_dir,
             synthesizer=self.synthesizer,
+            graph_backend=self.graph_backend,
         )
         return self._render(
             start_response,
@@ -459,6 +488,8 @@ def build_ui_server(
     llm_client: Callable[[str], str] = fake_llm_client,
     synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
     linear_client_factory: Callable[[], object] | None = None,
+    auth_backend: MagicLinkAuth | None = None,
+    graph_backend: object | None = None,
 ) -> LoopbackOnlyWSGIServer:
     _ensure_loopback_bind_host(host)
     app = OvertureUiApp(
@@ -466,6 +497,8 @@ def build_ui_server(
         llm_client=llm_client,
         synthesizer=synthesizer,
         linear_client_factory=linear_client_factory,
+        auth_backend=auth_backend,
+        graph_backend=graph_backend,
     )
     return make_server(
         host,
@@ -484,6 +517,8 @@ def serve_ui_host(
     llm_client: Callable[[str], str] = fake_llm_client,
     synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
     linear_client_factory: Callable[[], object] | None = None,
+    auth_backend: MagicLinkAuth | None = None,
+    graph_backend: object | None = None,
 ) -> None:
     server = build_ui_server(
         host=host,
@@ -492,6 +527,8 @@ def serve_ui_host(
         llm_client=llm_client,
         synthesizer=synthesizer,
         linear_client_factory=linear_client_factory,
+        auth_backend=auth_backend,
+        graph_backend=graph_backend,
     )
     bound_host, bound_port = server.server_address[:2]
     print(f"Overture UI host listening on http://localhost:{bound_port}/intake")
@@ -509,6 +546,8 @@ def submit_intake(raw_text: str, store_dir: Path | str, session: dict[str, str] 
         raw_text,
         Path(store_dir) / "intake",
         source_type="ui",
+        author_id=session.get(SESSION_AUTHOR_ID_KEY) if session else None,
+        author_email=session.get(SESSION_AUTHOR_EMAIL_KEY) if session else None,
     )
     next_session = dict(session or {})
     next_session["intake_id"] = record.id
@@ -588,8 +627,11 @@ def submit_research_approvals(
         message = result.errors[0].message if result.errors else "Approve at least one source before continuing."
         return ResearchReviewResult(next_session, candidates, message)
 
-    write_research_result(Path(store_dir) / "research" / f"{intake.id}.json", result)
-    next_session["research_result"] = json.dumps(research_result_to_jsonable(result), sort_keys=True, separators=(",", ":"))
+    research_payload = _with_author_identity(research_result_to_jsonable(result), next_session)
+    research_path = Path(store_dir) / "research" / f"{intake.id}.json"
+    research_path.parent.mkdir(parents=True, exist_ok=True)
+    research_path.write_text(json.dumps(research_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    next_session["research_result"] = json.dumps(research_payload, sort_keys=True, separators=(",", ":"))
     next_session["research_id"] = intake.id
     next_session["next_route"] = "/synthesis"
     return ResearchReviewResult(next_session, candidates)
@@ -600,6 +642,7 @@ def prepare_synthesis_review(
     store_dir: Path | str,
     *,
     synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
+    graph_backend: object | None = None,
 ) -> SynthesisReviewResult:
     intake_id = session.get("intake_id", "")
     if not intake_id:
@@ -630,8 +673,10 @@ def prepare_synthesis_review(
         return SynthesisReviewResult(dict(session), error="No approved research result is available for synthesis.")
 
     current_context = _synthesis_context_from_intake_research(intake, research)
-    prior_context = SqliteGraphStore(Path(store_dir) / "graph.sqlite").load_context()
-    brief = synthesizer(current_context, prior_context=prior_context).to_dict()
+    prior_context = graph_backend.load_context() if graph_backend is not None else SqliteGraphStore(Path(store_dir) / "graph.sqlite").load_context()
+    brief = _with_author_identity(synthesizer(current_context, prior_context=prior_context).to_dict(), session)
+    if graph_backend is not None:
+        graph_backend.upsert_records(_graph_records_from_context(current_context, session))
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(brief, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -670,7 +715,7 @@ def prepare_ticket_review(session: dict[str, str]) -> TicketReviewResult:
     except (TypeError, ValueError, IndexError, json.JSONDecodeError) as exc:
         return TicketReviewResult(session=next_session, error=f"Could not generate ticket draft: {exc}")
 
-    next_session[SESSION_TICKET_MARKDOWN_KEY] = draft.description
+    next_session[SESSION_TICKET_MARKDOWN_KEY] = _ticket_markdown_with_author(draft.description, next_session)
     return TicketReviewResult(session=next_session, markdown=draft.description)
 
 
@@ -1172,6 +1217,19 @@ def render_not_found(path: str) -> str:
     )
 
 
+def render_auth_error_page() -> str:
+    return render_layout(
+        title="Authentication failed",
+        active_path=None,
+        content="""
+        <section class="workspace">
+          <h2>Authentication failed</h2>
+          <p class="validation" role="alert">The magic-link token is invalid or expired.</p>
+        </section>
+        """,
+    )
+
+
 def render_layout(*, title: str, active_path: str | None, content: str, shell_class: str = "shell single") -> str:
     nav = "\n".join(
         f'<a href="{html.escape(route.path)}"{_aria_current(route.path, active_path)}>{html.escape(route.label)}</a>'
@@ -1399,6 +1457,60 @@ def _research_result_from_json(payload: Mapping[str, object]) -> ResearchResult:
                 )
             )
     return ResearchResult(intake_id=_optional_text(payload.get("intake_id")), items=tuple(items), errors=tuple(errors))
+
+
+def _author_identity(session: Mapping[str, str]) -> dict[str, str]:
+    author_id = str(session.get(SESSION_AUTHOR_ID_KEY) or "").strip()
+    author_email = str(session.get(SESSION_AUTHOR_EMAIL_KEY) or "").strip()
+    identity: dict[str, str] = {}
+    if author_id:
+        identity["author_id"] = author_id
+    if author_email:
+        identity["author_email"] = author_email
+    return identity
+
+
+def _with_author_identity(payload: Mapping[str, object], session: Mapping[str, str]) -> dict[str, object]:
+    next_payload = dict(payload)
+    identity = _author_identity(session)
+    if identity:
+        next_payload.update(identity)
+    return next_payload
+
+
+def _ticket_markdown_with_author(markdown: str, session: Mapping[str, str]) -> str:
+    identity = _author_identity(session)
+    if not identity:
+        return markdown
+    author_lines = "\n".join(f"<!-- {key}: {value} -->" for key, value in sorted(identity.items()))
+    if "\n## " in markdown:
+        return markdown.replace("\n## ", f"\n{author_lines}\n\n## ", 1)
+    return f"{markdown.rstrip()}\n\n{author_lines}\n"
+
+
+def _graph_records_from_context(context: GraphContext, session: Mapping[str, str]) -> tuple[GraphRecord, ...]:
+    identity = _author_identity(session)
+    records: list[GraphRecord] = []
+    for node in context.nodes:
+        node_id = str(node.get("id") or "").strip()
+        node_kind = str(node.get("type") or node.get("kind") or "").strip()
+        if not node_id or not node_kind:
+            continue
+        properties = {str(key): value for key, value in node.items() if key not in {"id", "kind", "type"}}
+        properties.update(identity)
+        records.append(GraphRecord(kind=node_kind, key=node_id, properties=properties))  # type: ignore[arg-type]
+    for edge in context.edges:
+        from_id = str(edge.get("from") or "").strip()
+        to_id = str(edge.get("to") or "").strip()
+        edge_kind = str(edge.get("type") or edge.get("kind") or "").strip()
+        if not from_id or not to_id or not edge_kind:
+            continue
+        properties = {str(key): value for key, value in edge.items() if key not in {"id", "kind", "type"}}
+        properties["from"] = from_id
+        properties["to"] = to_id
+        properties.update(identity)
+        records.append(GraphRecord(kind=edge_kind, key=str(edge.get("id") or f"{from_id}:{edge_kind}:{to_id}"), properties=properties))  # type: ignore[arg-type]
+    return tuple(records)
 
 
 def _synthesis_context_from_intake_research(intake: IntakeRecord, research: ResearchResult) -> GraphContext:

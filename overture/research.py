@@ -170,6 +170,8 @@ def _normalize_intake(intake: IntakeRecord | Mapping[str, Any]) -> IntakeRecord 
         created_at=str(intake.get("created_at") or ""),
         source_type=str(intake.get("source_type") or "unknown"),
         normalized_summary=str(intake.get("normalized_summary") or raw_text),
+        author_id=_optional_str(intake.get("author_id")),
+        author_email=_optional_str(intake.get("author_email")),
     )
 
 
