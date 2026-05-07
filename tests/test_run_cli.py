@@ -9,6 +9,7 @@ from unittest import mock
 
 import overture.cli as cli
 from overture.fixture import PipelineStageError, run_overture_fixture, validate_ticket_draft
+from overture.metrics_store import MetricsStore
 
 
 class RunCliTests(unittest.TestCase):
@@ -41,7 +42,13 @@ class RunCliTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(result.stdout.strip(), str(ticket_path))
-        fixture.assert_called_once_with(Path(tmpdir), idea="Raw idea", stop_at_stage=None)
+        fixture.assert_called_once_with(
+            Path(tmpdir),
+            idea="Raw idea",
+            stop_at_stage=None,
+            metrics_db_path=None,
+            quiet_progress=False,
+        )
 
     def test_run_command_stop_at_stage_prints_stage_artifact_and_skips_downstream(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -80,6 +87,28 @@ class RunCliTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0)
             self.assertEqual(result.stdout.strip(), str(ticket_path))
             self.assertTrue(ticket_path.exists())
+
+    def test_run_command_quiet_progress_keeps_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metrics_db_path = Path(tmpdir) / "metrics.sqlite"
+            result = self._run_cli(
+                [
+                    "run",
+                    "Quiet scripted run with metrics",
+                    "--output-dir",
+                    str(Path(tmpdir) / "run"),
+                    "--metrics-db-path",
+                    str(metrics_db_path),
+                    "--quiet-progress",
+                ]
+            )
+
+            rows = list(MetricsStore(metrics_db_path).iter_stages())
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(len(rows), 5)
+        self.assertEqual({row.status for row in rows}, {"success"})
 
     def test_run_command_export_flag_delegates_to_existing_export_component(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

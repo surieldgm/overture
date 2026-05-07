@@ -115,6 +115,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop after the named stage and print that stage's artifact path.",
     )
     run.add_argument(
+        "--metrics-db-path",
+        type=Path,
+        default=None,
+        help="Persist run stage timings to this SQLite metrics DB.",
+    )
+    run.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="Suppress live run stage progress output on stderr.",
+    )
+    run.add_argument(
         "--export",
         action="store_true",
         dest="export_to_linear",
@@ -312,6 +323,8 @@ def _run_single_shot(args: argparse.Namespace) -> int:
             args.output_dir,
             idea=raw_text,
             stop_at_stage=stop_at_stage,
+            metrics_db_path=args.metrics_db_path,
+            quiet_progress=args.quiet_progress,
         )
     except PipelineStageError as exc:
         print(f"run failed at {exc.stage}: {exc.message}", file=sys.stderr)
