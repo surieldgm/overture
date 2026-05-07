@@ -36,6 +36,7 @@ from .research_llm import (
     write_research_result,
 )
 from .setup import render_setup_report, run_setup
+from .ui_host import DEFAULT_STORE_DIR, DEFAULT_UI_HOST, DEFAULT_UI_PORT
 
 
 def _linear_client_factory() -> LinearClient:
@@ -173,6 +174,28 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Workspace root to validate. Defaults to $OVERTURE_HOME or the current directory.",
+    )
+
+    ui = subparsers.add_parser(
+        "ui",
+        help="Start the local-only wizard UI host.",
+    )
+    ui.add_argument(
+        "--host",
+        default=DEFAULT_UI_HOST,
+        help="Loopback address to bind. Defaults to 127.0.0.1.",
+    )
+    ui.add_argument(
+        "--port",
+        type=_positive_int,
+        default=DEFAULT_UI_PORT,
+        help="Local port for the UI host. Defaults to 8765.",
+    )
+    ui.add_argument(
+        "--store-dir",
+        type=Path,
+        default=DEFAULT_STORE_DIR,
+        help="Base Overture store directory. Defaults to .overture.",
     )
 
     research = subparsers.add_parser(
@@ -434,22 +457,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Markdown output path. Defaults to .overture/retros/milestone-retro.md.",
     )
 
-    ui = subparsers.add_parser(
-        "ui",
-        help="Start the local-only wizard UI host.",
-    )
-    ui.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="Loopback address to bind. Defaults to 127.0.0.1.",
-    )
-    ui.add_argument(
-        "--port",
-        type=_positive_int,
-        default=8765,
-        help="Local port for the UI host. Defaults to 8765.",
-    )
-
     return parser
 
 
@@ -500,6 +507,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(render_setup_report(report), end="")
         return 0 if report.ok else 1
 
+    if args.command == "ui":
+        return _ui(args)
+
     if args.command == "research":
         intake_path = args.store_dir / "intake" / f"{args.intake_id}.json"
         try:
@@ -546,16 +556,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "retro":
         return _retro(args)
 
-    if args.command == "ui":
-        from .ui_host import serve_ui_host
-
-        try:
-            serve_ui_host(host=args.host, port=args.port)
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
-        return 0
-
     parser.print_help(sys.stderr)
     return 2
 
@@ -597,6 +597,17 @@ def _run_single_shot(args: argparse.Namespace) -> int:
             print(f"run failed at linear_export: export exited with code {export_code}", file=sys.stderr)
         return export_code
 
+    return 0
+
+
+def _ui(args: argparse.Namespace) -> int:
+    from .ui_host import serve_ui_host
+
+    try:
+        serve_ui_host(host=args.host, port=args.port, store_dir=args.store_dir)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     return 0
 
 
