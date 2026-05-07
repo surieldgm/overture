@@ -15,10 +15,10 @@ from typing import Callable, Iterable, Mapping
 from urllib.parse import parse_qs
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
-from .auth import DesignerSession, MagicLinkAuth, auth_cookie, sender_from_env
+from .auth import AuthenticatedUser, DesignerSession, MagicLinkAuth, auth_cookie, authenticated_user_from_session, sender_from_env
 from .export import parse_ticket_markdown
 from .graph import GraphRecord, research_result_to_graph_records
-from .graph_store import SqliteGraphStore
+from .graph_store import EDGE_KINDS, NODE_KINDS, SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record, load_intake_record
 from .export import parse_ticket_file
 from .export_runner import ExportRunResult, run_ticket_export
@@ -28,6 +28,7 @@ from .research_llm import (
     LLMSuggestedSourceAdapter,
     fake_llm_client,
     research_result_to_jsonable,
+    write_research_result,
 )
 from .synthesis import GraphContext, SynthesisBrief, synthesize_graph_context
 from .ticket_writer import generate_linear_issue_draft
@@ -99,6 +100,14 @@ WIZARD_ROUTES: tuple[WizardRoute, ...] = (
     ),
 )
 ROUTES_BY_PATH: Mapping[str, WizardRoute] = {route.path: route for route in WIZARD_ROUTES}
+AUTHENTICATED_WIZARD_PATHS = {
+    "/intake",
+    RESEARCH_APPROVAL_ROUTE,
+    RESEARCH_COMPLETE_ROUTE,
+    SYNTHESIS_ROUTE,
+    TICKET_REVIEW_ROUTE,
+    "/export",
+}
 
 
 @dataclass(frozen=True)
@@ -140,18 +149,20 @@ class ExportReviewResult:
 
 
 class SessionStore:
-    """In-memory server-side session state keyed by an opaque cookie id."""
+    """In-memory server-side session state keyed by authenticated user and cookie id."""
 
     def __init__(self) -> None:
-        self._sessions: dict[str, dict[str, object]] = {}
+        self._sessions: dict[tuple[str, str], dict[str, object]] = {}
 
-    def get_or_create(self, session_id: str | None) -> tuple[str, dict[str, object], bool]:
-        if session_id and session_id in self._sessions:
-            return session_id, self._sessions[session_id], False
+    def get_or_create(self, session_id: str | None, *, user_id: str) -> tuple[str, dict[str, object], bool]:
+        if session_id:
+            key = (user_id, session_id)
+            if key in self._sessions:
+                return session_id, self._sessions[key], False
 
         new_session_id = secrets.token_urlsafe(24)
-        session = {"visits": 0}
-        self._sessions[new_session_id] = session
+        session = {"visits": 0, "user_id": user_id}
+        self._sessions[(user_id, new_session_id)] = session
         return new_session_id, session, True
 
 
@@ -209,13 +220,15 @@ class OvertureUiApp:
 
         auth_session = self.auth_manager.authenticate(environ)
         if auth_session is None:
-            if path == "/intake" and method == "GET":
-                return self._render(start_response, render_login_page())
+            if path in AUTHENTICATED_WIZARD_PATHS:
+                return self._redirect(start_response, f"{AUTH_LOGIN_ROUTE}?next={path}", status="302 Found")
             return self._unauthorized(start_response)
 
         self._active_auth_session = auth_session
+        user = authenticated_user_from_session(auth_session)
+        environ["overture.authenticated_user"] = user
         try:
-            return self._route_authenticated(method, path, environ, start_response)
+            return self._route_authenticated(method, path, environ, start_response, user)
         finally:
             self._active_auth_session = None
 
@@ -225,11 +238,13 @@ class OvertureUiApp:
         path: str,
         environ: dict[str, object],
         start_response: StartResponse,
+        user: AuthenticatedUser,
     ) -> Iterable[bytes]:
         if path == "/intake" and method == "GET":
-            session_id, server_session, is_new = self._server_session(environ)
+            assert user is not None
+            session_id, server_session, is_new = self._server_session(environ, user)
             body = render_intake_page(
-                session_from_environ(environ),
+                session_from_environ(environ, user=user),
                 session_id=session_id,
                 visit_count=_record_visit(server_session),
                 designer_email=self._active_auth_session.email if self._active_auth_session else None,
@@ -246,7 +261,9 @@ class OvertureUiApp:
         if path == RESEARCH_APPROVAL_ROUTE and method == "POST":
             return self._handle_research_post(environ, start_response)
         if path == RESEARCH_COMPLETE_ROUTE and method == "GET":
-            return self._render(start_response, render_research_complete_page(session_from_environ(environ)))
+            assert user is not None
+            session = session_from_environ(environ, user=user)
+            return self._render(start_response, render_research_complete_page(session))
         if path == SYNTHESIS_ROUTE and method == "GET":
             return self._handle_synthesis_get(environ, start_response)
         if path == SYNTHESIS_ROUTE and method == "POST":
@@ -262,7 +279,8 @@ class OvertureUiApp:
         if path == "/examples/intake_examples" and method == "GET":
             return self._render(start_response, render_examples_library())
         if path in ROUTES_BY_PATH and method == "GET":
-            session_id, server_session, is_new = self._server_session(environ)
+            assert user is not None
+            session_id, server_session, is_new = self._server_session(environ, user)
             body = render_placeholder_page(
                 ROUTES_BY_PATH[path],
                 session_id=session_id,
@@ -308,11 +326,8 @@ class OvertureUiApp:
     def _handle_intake_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         fields = _form_fields(environ)
         raw_text = fields.get("idea", [""])[0]
-        session = session_from_environ(environ)
-        if self._active_auth_session is not None:
-            session["designer_email"] = self._active_auth_session.email
-            session[SESSION_AUTHOR_ID_KEY] = self._active_auth_session.user_id
-            session[SESSION_AUTHOR_EMAIL_KEY] = self._active_auth_session.email
+        user = _require_user(environ)
+        session = session_from_environ(environ, user=user)
         error = validate_intake_text(raw_text)
         if error:
             return self._render(
@@ -321,7 +336,7 @@ class OvertureUiApp:
                 status="400 Bad Request",
             )
 
-        result = submit_intake(raw_text, self.store_dir, session)
+        result = submit_intake(raw_text, self.store_dir, session, user=user)
         return self._redirect(
             start_response,
             RESEARCH_APPROVAL_ROUTE,
@@ -329,7 +344,8 @@ class OvertureUiApp:
         )
 
     def _handle_research_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
-        result = prepare_research_review(session_from_environ(environ), self.store_dir, self.llm_client)
+        user = _require_user(environ)
+        result = prepare_research_review(session_from_environ(environ, user=user), self.store_dir, self.llm_client)
         return self._render(
             start_response,
             render_research_approval_page(result.session, candidates=result.candidates, error=result.error),
@@ -346,9 +362,10 @@ class OvertureUiApp:
             if value.startswith("approve:")
         ]
         result = submit_research_approvals(
-            session=session_from_environ(environ),
+            session=session_from_environ(environ, user=_require_user(environ)),
             store_dir=self.store_dir,
             approved_keys=approved_keys,
+            user=_require_user(environ),
         )
         if result.error:
             return self._render(
@@ -365,10 +382,11 @@ class OvertureUiApp:
 
     def _handle_synthesis_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         result = prepare_synthesis_review(
-            session_from_environ(environ),
+            session_from_environ(environ, user=_require_user(environ)),
             self.store_dir,
             synthesizer=self.synthesizer,
             graph_backend=self.graph_backend,
+            user=_require_user(environ),
         )
         return self._render(
             start_response,
@@ -377,7 +395,7 @@ class OvertureUiApp:
         )
 
     def _handle_synthesis_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
-        result = advance_synthesis_review(session_from_environ(environ), self.store_dir)
+        result = advance_synthesis_review(session_from_environ(environ, user=_require_user(environ)), self.store_dir, user=_require_user(environ))
         if result.error:
             return self._render(
                 start_response,
@@ -392,7 +410,7 @@ class OvertureUiApp:
         )
 
     def _handle_ticket_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
-        result = prepare_ticket_review(session_from_environ(environ))
+        result = prepare_ticket_review(session_from_environ(environ, user=_require_user(environ)), user=_require_user(environ))
         return self._render(
             start_response,
             render_ticket_review_page(result.session, markdown=result.markdown, error=result.error),
@@ -402,7 +420,7 @@ class OvertureUiApp:
     def _handle_ticket_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         fields = _form_fields(environ)
         markdown = fields.get("ticket_markdown", [""])[0]
-        result = submit_ticket_review(session_from_environ(environ), markdown)
+        result = submit_ticket_review(session_from_environ(environ, user=_require_user(environ)), markdown, user=_require_user(environ))
         if result.error:
             return self._render(
                 start_response,
@@ -417,7 +435,7 @@ class OvertureUiApp:
         )
 
     def _handle_export_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
-        result = prepare_export_review(session_from_environ(environ), self.store_dir)
+        result = prepare_export_review(session_from_environ(environ, user=_require_user(environ)), self.store_dir, user=_require_user(environ))
         return self._render(
             start_response,
             render_export_page(result),
@@ -428,13 +446,14 @@ class OvertureUiApp:
     def _handle_export_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         fields = _form_fields(environ)
         action = fields.get("action", [""])[0]
-        session = session_from_environ(environ)
+        user = _require_user(environ)
+        session = session_from_environ(environ, user=user)
         if action == "back":
             return self._redirect(start_response, TICKET_REVIEW_ROUTE, extra_headers=[("Set-Cookie", _session_cookie(session))])
 
         dry_run = action == "dry-run"
         if action not in {"dry-run", "export"}:
-            review = prepare_export_review(session, self.store_dir, message="Choose Dry-run or Export before continuing.")
+            review = prepare_export_review(session, self.store_dir, message="Choose Dry-run or Export before continuing.", user=user)
             return self._render(
                 start_response,
                 render_export_page(review),
@@ -442,7 +461,7 @@ class OvertureUiApp:
                 extra_headers=[("Set-Cookie", _session_cookie(review.session))],
             )
 
-        review = prepare_export_review(session, self.store_dir)
+        review = prepare_export_review(session, self.store_dir, user=user)
         if review.ticket_path is None:
             return self._render(
                 start_response,
@@ -529,8 +548,8 @@ class OvertureUiApp:
         token = self.auth_manager.refresh_session(self._active_auth_session)
         return [("Set-Cookie", auth_cookie(token))]
 
-    def _server_session(self, environ: dict[str, object]) -> tuple[str, dict[str, object], bool]:
-        return self.session_store.get_or_create(_opaque_session_id_from_environ(environ))
+    def _server_session(self, environ: dict[str, object], user: AuthenticatedUser) -> tuple[str, dict[str, object], bool]:
+        return self.session_store.get_or_create(_opaque_session_id_from_environ(environ), user_id=user.user_id)
 
 
 def build_ui_server(
@@ -599,7 +618,13 @@ def serve_ui_host(
         server.server_close()
 
 
-def submit_intake(raw_text: str, store_dir: Path | str, session: dict[str, str] | None = None) -> IntakeSubmissionResult:
+def submit_intake(
+    raw_text: str,
+    store_dir: Path | str,
+    session: dict[str, str] | None = None,
+    *,
+    user: AuthenticatedUser,
+) -> IntakeSubmissionResult:
     record, _path = create_intake_record(
         raw_text,
         Path(store_dir) / "intake",
@@ -607,7 +632,8 @@ def submit_intake(raw_text: str, store_dir: Path | str, session: dict[str, str] 
         author_id=session.get(SESSION_AUTHOR_ID_KEY) if session else None,
         author_email=session.get(SESSION_AUTHOR_EMAIL_KEY) if session else None,
     )
-    next_session = dict(session or {})
+    _tag_json_file(_path, user)
+    next_session = _session_for_user(session or {}, user)
     next_session["intake_id"] = record.id
     return IntakeSubmissionResult(record=record, session=next_session)
 
@@ -657,6 +683,7 @@ def submit_research_approvals(
     session: dict[str, str],
     store_dir: Path | str,
     approved_keys: Iterable[str],
+    user: AuthenticatedUser,
 ) -> ResearchReviewResult:
     intake_id = session.get("intake_id", "")
     candidates = _session_candidates(session, intake_id) if intake_id else ()
@@ -685,11 +712,10 @@ def submit_research_approvals(
         message = result.errors[0].message if result.errors else "Approve at least one source before continuing."
         return ResearchReviewResult(next_session, candidates, message)
 
-    research_payload = _with_author_identity(research_result_to_jsonable(result), next_session)
     research_path = Path(store_dir) / "research" / f"{intake.id}.json"
-    research_path.parent.mkdir(parents=True, exist_ok=True)
-    research_path.write_text(json.dumps(research_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    next_session["research_result"] = json.dumps(research_payload, sort_keys=True, separators=(",", ":"))
+    write_research_result(research_path, result)
+    _tag_json_file(research_path, user)
+    next_session["research_result"] = json.dumps(research_result_to_jsonable(result), sort_keys=True, separators=(",", ":"))
     next_session["research_id"] = intake.id
     next_session["next_route"] = "/synthesis"
     return ResearchReviewResult(next_session, candidates)
@@ -701,6 +727,7 @@ def prepare_synthesis_review(
     *,
     synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
     graph_backend: object | None = None,
+    user: AuthenticatedUser | None = None,
 ) -> SynthesisReviewResult:
     intake_id = session.get("intake_id", "")
     if not intake_id:
@@ -730,13 +757,18 @@ def prepare_synthesis_review(
     if not research.items:
         return SynthesisReviewResult(dict(session), error="No approved research result is available for synthesis.")
 
-    current_context = _synthesis_context_from_intake_research(intake, research)
-    prior_context = graph_backend.load_context() if graph_backend is not None else SqliteGraphStore(Path(store_dir) / "graph.sqlite").load_context()
-    brief = _with_author_identity(synthesizer(current_context, prior_context=prior_context).to_dict(), session)
-    if graph_backend is not None:
-        graph_backend.upsert_records(_graph_records_from_context(current_context, session))
+    current_context = _synthesis_context_from_intake_research(intake, research, user=user)
+    graph_store = SqliteGraphStore(Path(store_dir) / "graph.sqlite")
+    writable_graph = graph_backend if graph_backend is not None else graph_store
+    prior_context = writable_graph.load_context()
+    brief = synthesizer(current_context, prior_context=prior_context).to_dict()
+    if user is not None:
+        brief["author_id"] = user.user_id
+        brief["author_email"] = user.email
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(brief, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if user is not None:
+        writable_graph.upsert_records(_graph_records_from_context(current_context, user))
 
     next_session = dict(session)
     next_session["synthesis_id"] = intake_id
@@ -745,8 +777,13 @@ def prepare_synthesis_review(
     return SynthesisReviewResult(next_session, brief, cached=False)
 
 
-def advance_synthesis_review(session: dict[str, str], store_dir: Path | str) -> SynthesisReviewResult:
-    result = prepare_synthesis_review(session, store_dir)
+def advance_synthesis_review(
+    session: dict[str, str],
+    store_dir: Path | str,
+    *,
+    user: AuthenticatedUser | None = None,
+) -> SynthesisReviewResult:
+    result = prepare_synthesis_review(session, store_dir, user=user)
     if result.error:
         return result
     next_session = dict(result.session)
@@ -755,8 +792,10 @@ def advance_synthesis_review(session: dict[str, str], store_dir: Path | str) -> 
     return SynthesisReviewResult(next_session, result.brief, cached=result.cached)
 
 
-def prepare_ticket_review(session: dict[str, str]) -> TicketReviewResult:
+def prepare_ticket_review(session: dict[str, str], *, user: AuthenticatedUser | None = None) -> TicketReviewResult:
     next_session = dict(session)
+    if user is not None:
+        next_session = _session_for_user(next_session, user)
     existing = next_session.get(SESSION_TICKET_MARKDOWN_KEY)
     if existing:
         return TicketReviewResult(session=next_session, markdown=existing)
@@ -777,8 +816,15 @@ def prepare_ticket_review(session: dict[str, str]) -> TicketReviewResult:
     return TicketReviewResult(session=next_session, markdown=draft.description)
 
 
-def submit_ticket_review(session: dict[str, str], markdown: str) -> TicketReviewResult:
+def submit_ticket_review(
+    session: dict[str, str],
+    markdown: str,
+    *,
+    user: AuthenticatedUser | None = None,
+) -> TicketReviewResult:
     next_session = dict(session)
+    if user is not None:
+        next_session = _session_for_user(next_session, user)
     next_session[SESSION_TICKET_MARKDOWN_KEY] = markdown
     try:
         parsed = parse_ticket_markdown(markdown)
@@ -795,8 +841,11 @@ def prepare_export_review(
     store_dir: Path | str,
     *,
     message: str | None = None,
+    user: AuthenticatedUser | None = None,
 ) -> ExportReviewResult:
     next_session = dict(session)
+    if user is not None:
+        next_session = _session_for_user(next_session, user)
     session_ticket_path = _session_ticket_path(session, store_dir)
     if session_ticket_path is not None:
         return _export_review_from_path(next_session, session_ticket_path, message=message)
@@ -812,6 +861,8 @@ def prepare_export_review(
     ticket_path = Path(store_dir) / "ticket" / f"{_safe_session_key(session_key)}-export.md"
     ticket_path.parent.mkdir(parents=True, exist_ok=True)
     ticket_path.write_text(ticket_markdown, encoding="utf-8")
+    if user is not None:
+        _write_author_sidecar(ticket_path, user)
     return _export_review_from_path(next_session, ticket_path, message=message)
 
 
@@ -823,7 +874,7 @@ def validate_intake_text(raw_text: str) -> str | None:
     return None
 
 
-def session_from_environ(environ: dict[str, object]) -> dict[str, str]:
+def session_from_environ(environ: dict[str, object], *, user: AuthenticatedUser | None = None) -> dict[str, str]:
     header = str(environ.get("HTTP_COOKIE", ""))
     if not header:
         return {}
@@ -838,7 +889,10 @@ def session_from_environ(environ: dict[str, object]) -> dict[str, str]:
         return {}
     if not isinstance(payload, dict):
         return {}
-    return {str(key): str(value) for key, value in payload.items()}
+    session = {str(key): str(value) for key, value in payload.items()}
+    if user is None:
+        return session
+    return _session_for_user(session, user)
 
 
 def _export_review_from_path(
@@ -1465,6 +1519,23 @@ def _session_cookie(session: dict[str, str]) -> str:
     return jar.output(header="").strip()
 
 
+def _require_user(environ: Mapping[str, object]) -> AuthenticatedUser:
+    user = environ.get("overture.authenticated_user")
+    if isinstance(user, AuthenticatedUser):
+        return user
+    raise RuntimeError("authenticated user required after auth gate")
+
+
+def _session_for_user(session: Mapping[str, str], user: AuthenticatedUser) -> dict[str, str]:
+    if session.get("user_id") and session.get("user_id") != user.user_id:
+        return {"user_id": user.user_id, "user_email": user.email}
+    next_session = {str(key): str(value) for key, value in session.items()}
+    next_session["user_id"] = user.user_id
+    next_session["user_email"] = user.email
+    next_session["designer_email"] = user.email
+    return next_session
+
+
 def _opaque_session_cookie(session_id: str) -> str:
     return f"{SESSION_COOKIE_NAME}={session_id}; Path=/; HttpOnly; SameSite=Lax"
 
@@ -1523,6 +1594,25 @@ def _read_json(path: Path) -> Mapping[str, object]:
     return payload if isinstance(payload, Mapping) else {}
 
 
+def _tag_json_file(path: Path, user: AuthenticatedUser) -> None:
+    payload = dict(_read_json(path))
+    payload["author_id"] = user.user_id
+    payload["author_email"] = user.email
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_author_sidecar(path: Path, user: AuthenticatedUser) -> None:
+    payload = {
+        "author_id": user.user_id,
+        "author_email": user.email,
+        "artifact_path": str(path),
+    }
+    path.with_suffix(path.suffix + ".author.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _research_result_from_session(session: Mapping[str, str]) -> ResearchResult | None:
     payload = _session_json_map(session.get("research_result"))
     return _research_result_from_json(payload) if payload else None
@@ -1572,8 +1662,8 @@ def _research_result_from_json(payload: Mapping[str, object]) -> ResearchResult:
 
 
 def _author_identity(session: Mapping[str, str]) -> dict[str, str]:
-    author_id = str(session.get(SESSION_AUTHOR_ID_KEY) or "").strip()
-    author_email = str(session.get(SESSION_AUTHOR_EMAIL_KEY) or "").strip()
+    author_id = str(session.get("author_id") or session.get("user_id") or "").strip()
+    author_email = str(session.get("author_email") or session.get("user_email") or "").strip()
     identity: dict[str, str] = {}
     if author_id:
         identity["author_id"] = author_id
@@ -1600,32 +1690,13 @@ def _ticket_markdown_with_author(markdown: str, session: Mapping[str, str]) -> s
     return f"{markdown.rstrip()}\n\n{author_lines}\n"
 
 
-def _graph_records_from_context(context: GraphContext, session: Mapping[str, str]) -> tuple[GraphRecord, ...]:
-    identity = _author_identity(session)
-    records: list[GraphRecord] = []
-    for node in context.nodes:
-        node_id = str(node.get("id") or "").strip()
-        node_kind = str(node.get("type") or node.get("kind") or "").strip()
-        if not node_id or not node_kind:
-            continue
-        properties = {str(key): value for key, value in node.items() if key not in {"id", "kind", "type"}}
-        properties.update(identity)
-        records.append(GraphRecord(kind=node_kind, key=node_id, properties=properties))  # type: ignore[arg-type]
-    for edge in context.edges:
-        from_id = str(edge.get("from") or "").strip()
-        to_id = str(edge.get("to") or "").strip()
-        edge_kind = str(edge.get("type") or edge.get("kind") or "").strip()
-        if not from_id or not to_id or not edge_kind:
-            continue
-        properties = {str(key): value for key, value in edge.items() if key not in {"id", "kind", "type"}}
-        properties["from"] = from_id
-        properties["to"] = to_id
-        properties.update(identity)
-        records.append(GraphRecord(kind=edge_kind, key=str(edge.get("id") or f"{from_id}:{edge_kind}:{to_id}"), properties=properties))  # type: ignore[arg-type]
-    return tuple(records)
-
-
-def _synthesis_context_from_intake_research(intake: IntakeRecord, research: ResearchResult) -> GraphContext:
+def _synthesis_context_from_intake_research(
+    intake: IntakeRecord,
+    research: ResearchResult,
+    *,
+    user: AuthenticatedUser | None = None,
+) -> GraphContext:
+    author = _author_properties(user)
     records = research_result_to_graph_records(research)
     nodes = [
         {
@@ -1635,6 +1706,7 @@ def _synthesis_context_from_intake_research(intake: IntakeRecord, research: Rese
             "summary": intake.normalized_summary,
             "raw_text": intake.raw_text,
             "provenance": {"origin": "user_input", "source_refs": [intake.id], "confidence": "high"},
+            **author,
         },
         {
             "id": f"need_{intake.id}",
@@ -1643,6 +1715,7 @@ def _synthesis_context_from_intake_research(intake: IntakeRecord, research: Rese
             "summary": _first_inference(research)
             or "Designers need a read-only synthesis brief before committing to a generated ticket draft.",
             "provenance": {"origin": "research", "source_node_ids": [f"userinput_{intake.id}"], "confidence": "medium"},
+            **author,
         },
         {
             "id": f"capability_{intake.id}_synthesis_review",
@@ -1650,6 +1723,7 @@ def _synthesis_context_from_intake_research(intake: IntakeRecord, research: Rese
             "label": "Synthesis brief review",
             "summary": "Render approved research as a structured product and engineering brief before ticket review.",
             "provenance": {"origin": "synthesis", "source_node_ids": [f"need_{intake.id}"], "confidence": "high"},
+            **author,
         },
         {
             "id": f"ticketcandidate_{intake.id}_ticket_review",
@@ -1664,6 +1738,7 @@ def _synthesis_context_from_intake_research(intake: IntakeRecord, research: Rese
                 "source_node_ids": [f"capability_{intake.id}_synthesis_review"],
                 "confidence": "medium",
             },
+            **author,
         },
     ]
     edges = [
@@ -1672,18 +1747,21 @@ def _synthesis_context_from_intake_research(intake: IntakeRecord, research: Rese
             "type": "derived_from",
             "from": f"need_{intake.id}",
             "to": f"userinput_{intake.id}",
+            **author,
         },
         {
             "id": f"capability_{intake.id}_synthesis_review__addresses__need_{intake.id}",
             "type": "addresses",
             "from": f"capability_{intake.id}_synthesis_review",
             "to": f"need_{intake.id}",
+            **author,
         },
         {
             "id": f"capability_{intake.id}_synthesis_review__suggests__ticketcandidate_{intake.id}_ticket_review",
             "type": "suggests",
             "from": f"capability_{intake.id}_synthesis_review",
             "to": f"ticketcandidate_{intake.id}_ticket_review",
+            **author,
         },
     ]
     for record in records:
@@ -1691,9 +1769,9 @@ def _synthesis_context_from_intake_research(intake: IntakeRecord, research: Rese
             properties = dict(record.properties)
             if record.kind == "Claim" and "text" in properties:
                 properties["statement"] = properties["text"]
-            nodes.append({"id": record.key, "type": record.kind, "kind": record.kind, **properties})
+            nodes.append({"id": record.key, "type": record.kind, "kind": record.kind, **properties, **author})
         else:
-            edge = {"id": record.key, "type": record.kind, "kind": record.kind, **record.properties}
+            edge = {"id": record.key, "type": record.kind, "kind": record.kind, **record.properties, **author}
             edges.append(edge)
     for index, item in enumerate(research.items):
         evidence_id = f"evidence_{intake.id}_{index}"
@@ -1704,6 +1782,7 @@ def _synthesis_context_from_intake_research(intake: IntakeRecord, research: Rese
                 "label": item.source.title,
                 "summary": item.summary,
                 "provenance": {"origin": "research", "source_refs": [item.source.reference], "confidence": item.confidence},
+                **author,
             }
         )
         edges.append(
@@ -1712,9 +1791,52 @@ def _synthesis_context_from_intake_research(intake: IntakeRecord, research: Rese
                 "type": "supports",
                 "from": evidence_id,
                 "to": f"capability_{intake.id}_synthesis_review",
+                **author,
             }
         )
     return GraphContext(nodes=tuple(nodes), edges=tuple(edges))
+
+
+def _author_properties(user: AuthenticatedUser | None) -> dict[str, str]:
+    if user is None:
+        return {}
+    return {"author_id": user.user_id, "author_email": user.email}
+
+
+def _graph_records_from_context(context: GraphContext, user: AuthenticatedUser) -> tuple[GraphRecord, ...]:
+    records: list[GraphRecord] = []
+    for node in context.nodes:
+        if not isinstance(node, Mapping):
+            continue
+        node_id = str(node.get("id") or "").strip()
+        kind = str(node.get("kind") or node.get("type") or "").strip()
+        if not node_id or kind not in NODE_KINDS:
+            continue
+        properties = {
+            str(key): value
+            for key, value in node.items()
+            if str(key) not in {"id", "kind", "type"}
+        }
+        properties.update(_author_properties(user))
+        records.append(GraphRecord(kind=kind, key=node_id, properties=properties))  # type: ignore[arg-type]
+    for edge in context.edges:
+        if not isinstance(edge, Mapping):
+            continue
+        from_id = str(edge.get("from") or "").strip()
+        to_id = str(edge.get("to") or "").strip()
+        kind = str(edge.get("kind") or edge.get("type") or "").strip()
+        if not from_id or not to_id or not kind:
+            continue
+        if kind not in EDGE_KINDS:
+            continue
+        properties = {
+            str(key): value
+            for key, value in edge.items()
+            if str(key) not in {"id", "kind", "type"}
+        }
+        properties.update(_author_properties(user))
+        records.append(GraphRecord(kind=kind, key=str(edge.get("id") or f"{from_id}:{kind}:{to_id}"), properties=properties))  # type: ignore[arg-type]
+    return tuple(records)
 
 
 def _first_inference(research: ResearchResult) -> str:

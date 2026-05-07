@@ -22,6 +22,8 @@ class FrictionEntry:
     note: str
     created_at: str
     confirmed: bool = False
+    author_id: str | None = None
+    author_email: str | None = None
 
 
 class FrictionLog:
@@ -41,6 +43,8 @@ class FrictionLog:
         note: str,
         created_at: str | None = None,
         confirmed: bool = False,
+        author_id: str | None = None,
+        author_email: str | None = None,
     ) -> FrictionEntry:
         session_id = _require_text(session_id, "session_id")
         run_id = _require_text(run_id, "run_id")
@@ -52,10 +56,12 @@ class FrictionLog:
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO friction_entries (session_id, run_id, category, note, created_at, confirmed)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO friction_entries (
+                    session_id, run_id, category, note, created_at, confirmed, author_id, author_email
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, run_id, category, note, timestamp, int(confirmed)),
+                (session_id, run_id, category, note, timestamp, int(confirmed), _optional_text(author_id), _optional_text(author_email)),
             )
             entry_id = int(cursor.lastrowid)
 
@@ -67,6 +73,8 @@ class FrictionLog:
             note=note,
             created_at=timestamp,
             confirmed=confirmed,
+            author_id=_optional_text(author_id),
+            author_email=_optional_text(author_email),
         )
 
     def confirm(self, entry_id: int) -> FrictionEntry:
@@ -83,7 +91,7 @@ class FrictionLog:
                 raise ValueError(f"friction entry not found: {entry_id}")
             row = connection.execute(
                 """
-                SELECT id, session_id, run_id, category, note, created_at, confirmed
+                SELECT id, session_id, run_id, category, note, created_at, confirmed, author_id, author_email
                 FROM friction_entries
                 WHERE id = ?
                 """,
@@ -112,7 +120,7 @@ class FrictionLog:
             parameters.append(str(int(confirmed)))
 
         query = """
-            SELECT id, session_id, run_id, category, note, created_at, confirmed
+            SELECT id, session_id, run_id, category, note, created_at, confirmed, author_id, author_email
             FROM friction_entries
         """
         if conditions:
@@ -163,6 +171,8 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             category TEXT NOT NULL,
             note TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            author_id TEXT,
+            author_email TEXT,
             CHECK (category IN ('slow', 'confusing', 'broken', 'surprising'))
         )
         """
@@ -173,6 +183,10 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
     }
     if "confirmed" not in columns:
         connection.execute("ALTER TABLE friction_entries ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
+    if "author_id" not in columns:
+        connection.execute("ALTER TABLE friction_entries ADD COLUMN author_id TEXT")
+    if "author_email" not in columns:
+        connection.execute("ALTER TABLE friction_entries ADD COLUMN author_email TEXT")
     connection.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_friction_entries_session_run
@@ -202,6 +216,8 @@ def _entry_from_row(row: sqlite3.Row) -> FrictionEntry:
         note=row["note"],
         created_at=row["created_at"],
         confirmed=bool(row["confirmed"]),
+        author_id=row["author_id"],
+        author_email=row["author_email"],
     )
 
 
@@ -209,6 +225,13 @@ def _require_text(value: str, field_name: str) -> str:
     if not value or not value.strip():
         raise ValueError(f"{field_name} is required")
     return value.strip()
+
+
+def _optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
 
 
 def _utc_now_iso() -> str:

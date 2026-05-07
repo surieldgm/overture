@@ -27,6 +27,8 @@ class StageMetric:
     duration_ms: int
     status: str
     error_message: str | None
+    author_id: str | None = None
+    author_email: str | None = None
 
 
 class MetricsStore:
@@ -49,16 +51,20 @@ class MetricsStore:
                     completed_at,
                     duration_ms,
                     status,
-                    error_message
+                    error_message,
+                    author_id,
+                    author_email
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, stage_name) DO UPDATE SET
                     intake_id = excluded.intake_id,
                     started_at = excluded.started_at,
                     completed_at = excluded.completed_at,
                     duration_ms = excluded.duration_ms,
                     status = excluded.status,
-                    error_message = excluded.error_message
+                    error_message = excluded.error_message,
+                    author_id = excluded.author_id,
+                    author_email = excluded.author_email
                 """,
                 (
                     metric.run_id,
@@ -69,12 +75,14 @@ class MetricsStore:
                     metric.duration_ms,
                     metric.status,
                     metric.error_message,
+                    metric.author_id,
+                    metric.author_email,
                 ),
             )
 
     def iter_stages(self, limit: int | None = None) -> Iterator[StageMetric]:
         query = """
-            SELECT run_id, intake_id, stage_name, started_at, completed_at, duration_ms, status, error_message
+            SELECT run_id, intake_id, stage_name, started_at, completed_at, duration_ms, status, error_message, author_id, author_email
             FROM stage_metrics
             ORDER BY started_at
         """
@@ -111,7 +119,7 @@ class MetricsStore:
             placeholders = ", ".join("?" for _ in run_ids)
             rows = connection.execute(
                 f"""
-                SELECT run_id, intake_id, stage_name, started_at, completed_at, duration_ms, status, error_message
+                SELECT run_id, intake_id, stage_name, started_at, completed_at, duration_ms, status, error_message, author_id, author_email
                 FROM stage_metrics
                 WHERE run_id IN ({placeholders})
                 ORDER BY started_at
@@ -199,10 +207,20 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             duration_ms INTEGER NOT NULL,
             status TEXT NOT NULL,
             error_message TEXT,
+            author_id TEXT,
+            author_email TEXT,
             PRIMARY KEY (run_id, stage_name)
         )
         """
     )
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(stage_metrics)").fetchall()
+    }
+    if "author_id" not in columns:
+        connection.execute("ALTER TABLE stage_metrics ADD COLUMN author_id TEXT")
+    if "author_email" not in columns:
+        connection.execute("ALTER TABLE stage_metrics ADD COLUMN author_email TEXT")
 
 
 def _metric_from_row(row: sqlite3.Row) -> StageMetric:
@@ -215,6 +233,8 @@ def _metric_from_row(row: sqlite3.Row) -> StageMetric:
         duration_ms=row["duration_ms"],
         status=row["status"],
         error_message=row["error_message"],
+        author_id=row["author_id"],
+        author_email=row["author_email"],
     )
 
 
