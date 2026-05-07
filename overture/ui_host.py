@@ -23,6 +23,7 @@ from .intake import IntakeRecord, create_intake_record, load_intake_record
 from .export import parse_ticket_file
 from .export_runner import ExportRunResult, run_ticket_export
 from .linear_client import LinearClient
+from .peer_onboarding import initialize_peer_onboarding_template, ordered_peer_onboarding_sections
 from .research import CuratedSource, ResearchClaim, ResearchError, ResearchItem, ResearchResult, SourceReference, _normalize_source
 from .research_llm import (
     LLMSuggestedSourceAdapter,
@@ -52,9 +53,11 @@ SESSION_TICKET_TITLE_KEY = "ticket_title"
 SESSION_TICKET_BODY_KEY = "ticket_body"
 SESSION_AUTHOR_ID_KEY = "author_id"
 SESSION_AUTHOR_EMAIL_KEY = "author_email"
+SESSION_PEER_ONBOARDING_TEMPLATE_KEY = "peer_onboarding_template"
 AUTH_LOGIN_ROUTE = "/auth/login"
 AUTH_MAGIC_LINK_ROUTE = "/auth/magic-link"
 AUTH_CONSUME_ROUTE = "/auth/consume"
+PEER_ONBOARDING_ROUTE = "/peer-onboarding"
 
 StartResponse = Callable[[str, list[tuple[str, str]]], None]
 
@@ -98,6 +101,12 @@ WIZARD_ROUTES: tuple[WizardRoute, ...] = (
         title="Export",
         placeholder="Placeholder for local export confirmation.",
     ),
+    WizardRoute(
+        path=PEER_ONBOARDING_ROUTE,
+        label="Peer transfer",
+        title="Peer onboarding",
+        placeholder="Read the designer-to-designer transfer artifact while running the wizard.",
+    ),
 )
 ROUTES_BY_PATH: Mapping[str, WizardRoute] = {route.path: route for route in WIZARD_ROUTES}
 AUTHENTICATED_WIZARD_PATHS = {
@@ -107,6 +116,7 @@ AUTHENTICATED_WIZARD_PATHS = {
     SYNTHESIS_ROUTE,
     TICKET_REVIEW_ROUTE,
     "/export",
+    PEER_ONBOARDING_ROUTE,
 }
 
 
@@ -276,6 +286,18 @@ class OvertureUiApp:
             return self._handle_export_get(environ, start_response)
         if path == "/export" and method == "POST":
             return self._handle_export_post(environ, start_response)
+        if path == PEER_ONBOARDING_ROUTE and method == "GET":
+            session = session_from_environ(environ, user=user)
+            session = _session_for_user(session, user)
+            template = _peer_onboarding_template_from_session(session)
+            if template is None:
+                template = initialize_peer_onboarding_template(user.user_id, user.email)
+                session[SESSION_PEER_ONBOARDING_TEMPLATE_KEY] = json.dumps(template, sort_keys=True, separators=(",", ":"))
+            return self._render(
+                start_response,
+                render_peer_onboarding_page(session, template=template),
+                extra_headers=[("Set-Cookie", _session_cookie(session))],
+            )
         if path == "/examples/intake_examples" and method == "GET":
             return self._render(start_response, render_examples_library())
         if path in ROUTES_BY_PATH and method == "GET":
@@ -947,6 +969,17 @@ def _session_ticket_path(session: Mapping[str, str], store_dir: Path | str) -> P
     return path if path.exists() else None
 
 
+def _peer_onboarding_template_from_session(session: Mapping[str, str]) -> dict[str, object] | None:
+    raw_template = session.get(SESSION_PEER_ONBOARDING_TEMPLATE_KEY)
+    if not raw_template:
+        return None
+    try:
+        payload = json.loads(raw_template)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _safe_session_key(value: str) -> str:
     safe = "".join(character if character.isalnum() or character in {"-", "_"} else "-" for character in value)
     return safe.strip("-") or "session"
@@ -1024,6 +1057,60 @@ def _source_to_jsonable(source: CuratedSource) -> dict[str, object]:
 
 def _source_key(source: CuratedSource) -> str:
     return source.url or source.citation or source.title
+
+
+def _peer_onboarding_section_markup(section: Mapping[str, object]) -> str:
+    fields = section.get("fields", [])
+    field_markup = ""
+    if isinstance(fields, list):
+        field_markup = "\n".join(_peer_onboarding_field_markup(field) for field in fields if isinstance(field, Mapping))
+    if not field_markup:
+        field_markup = '<p class="empty-state">No notes have been added yet.</p>'
+    description = str(section.get("description", ""))
+    description_markup = f"<p>{html.escape(description)}</p>" if description else ""
+    return f"""
+    <section class="brief-section peer-section">
+      <h3>{html.escape(str(section.get("title", "Untitled section")))}</h3>
+      {description_markup}
+      <dl class="peer-fields">
+        {field_markup}
+      </dl>
+    </section>
+    """
+
+
+def _peer_onboarding_field_markup(field: Mapping[str, object]) -> str:
+    label = html.escape(str(field.get("label", field.get("id", "Field"))))
+    value = field.get("value")
+    return f"""
+      <dt>{label}</dt>
+      <dd>{_peer_onboarding_value_markup(value)}</dd>
+    """
+
+
+def _peer_onboarding_value_markup(value: object) -> str:
+    if isinstance(value, str):
+        return html.escape(value) if value.strip() else '<span class="empty-state">Not filled yet.</span>'
+    if isinstance(value, list):
+        if not value:
+            return '<span class="empty-state">Not filled yet.</span>'
+        if all(isinstance(item, Mapping) and "step" in item for item in value):
+            rows = []
+            for item in value:
+                step = html.escape(str(item.get("step", "")))
+                note = str(item.get("note", ""))
+                note_markup = html.escape(note) if note.strip() else '<span class="empty-state">No note yet.</span>'
+                rows.append(f"<li><strong>{step}</strong><p>{note_markup}</p></li>")
+            return f'<ol class="wizard-watchouts">{"".join(rows)}</ol>'
+        items = [f"<li>{html.escape(str(item))}</li>" for item in value if str(item).strip()]
+        return f"<ul>{''.join(items)}</ul>" if items else '<span class="empty-state">Not filled yet.</span>'
+    if isinstance(value, Mapping):
+        items = "".join(
+            f"<li><strong>{html.escape(str(key))}</strong>: {html.escape(str(item))}</li>"
+            for key, item in value.items()
+        )
+        return f"<ul>{items}</ul>" if items else '<span class="empty-state">Not filled yet.</span>'
+    return html.escape(str(value)) if value is not None else '<span class="empty-state">Not filled yet.</span>'
 
 
 def render_login_page(*, email: str = "", error: str | None = None) -> str:
@@ -1346,6 +1433,46 @@ def render_export_page(review: ExportReviewResult) -> str:
     )
 
 
+def render_peer_onboarding_page(session: Mapping[str, str], *, template: Mapping[str, object]) -> str:
+    author = template.get("author", {})
+    author_email = ""
+    if isinstance(author, Mapping):
+        author_email = str(author.get("email", ""))
+    if not author_email:
+        author_email = str(session.get("user_email", ""))
+    schema_version = str(template.get("schema_version", "unknown"))
+    section_markup = "\n".join(_peer_onboarding_section_markup(section) for section in ordered_peer_onboarding_sections(template))
+    if not section_markup:
+        section_markup = '<p class="empty-state">No peer onboarding sections are available.</p>'
+
+    return render_layout(
+        title="Peer onboarding",
+        active_path=PEER_ONBOARDING_ROUTE,
+        content=f"""
+        <section class="workspace peer-onboarding">
+          <h2>Peer onboarding</h2>
+          <p>{html.escape(ROUTES_BY_PATH[PEER_ONBOARDING_ROUTE].placeholder)}</p>
+          <p>Designer-to-designer transfer artifact for the active wizard workflow.</p>
+          <p class="session-note">Schema <code>{html.escape(schema_version)}</code> authored by <code>{html.escape(author_email)}</code>.</p>
+          <article aria-label="Peer onboarding template">
+            {section_markup}
+          </article>
+        </section>
+        <aside class="side-panel" aria-label="Wizard context">
+          <h3>Wizard context</h3>
+          <ol class="wizard-context">
+            <li><a href="/intake">Intake</a></li>
+            <li><a href="{RESEARCH_APPROVAL_ROUTE}">Research approval</a></li>
+            <li><a href="{SYNTHESIS_ROUTE}">Synthesis</a></li>
+            <li><a href="{TICKET_REVIEW_ROUTE}">Ticket</a></li>
+            <li><a href="/export">Export</a></li>
+          </ol>
+        </aside>
+        """,
+        shell_class="shell",
+    )
+
+
 def render_placeholder_page(route: WizardRoute, *, session_id: str, visit_count: int) -> str:
     return render_layout(
         title=route.title,
@@ -1457,6 +1584,12 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
     .brief-section {{ border-top: 1px solid var(--line); padding-top: 18px; margin-top: 18px; }}
     .brief-section p {{ margin: 0 0 10px; }}
     .brief-list {{ margin: 0; padding-left: 20px; }}
+    .peer-fields {{ display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 12px 18px; margin: 16px 0 0; }}
+    .peer-fields dt {{ color: var(--muted); font-weight: 650; }}
+    .peer-fields dd {{ margin: 0; overflow-wrap: anywhere; }}
+    .wizard-context, .wizard-watchouts {{ margin: 0; padding-left: 20px; }}
+    .wizard-watchouts li {{ margin-bottom: 10px; }}
+    .wizard-watchouts p {{ margin: 4px 0 0; }}
     .concept-list, .ticket-list {{ display: grid; gap: 12px; list-style: none; margin: 0; padding: 0; }}
     .concept-card, .ticket-card {{ border: 1px solid var(--line); border-radius: 6px; padding: 14px; }}
     .concept-card.prior {{ border-color: #b7791f; background: #fffbeb; }}
@@ -1479,6 +1612,7 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
       .breadcrumbs {{ padding: 0 12px; }}
       .form-footer {{ align-items: stretch; flex-direction: column; }}
       .source-option {{ grid-template-columns: minmax(0, 1fr); }}
+      .peer-fields {{ grid-template-columns: minmax(0, 1fr); }}
       button {{ width: 100%; }}
     }}
   </style>
