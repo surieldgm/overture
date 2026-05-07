@@ -142,6 +142,36 @@ class GraphHttpTests(unittest.TestCase):
             events = _get_json(server.base_url, "/linear/webhook/events")["events"]
             self.assertEqual(len(events), 1)
 
+    def test_linear_rework_signals_classify_persisted_webhook_events(self) -> None:
+        with _running_server(linear_webhook_secret="secret") as server:
+            _post_linear_webhook(
+                server.base_url,
+                _linear_issue_payload(
+                    delivery_id="delivery-done",
+                    previous_status="Merging",
+                    new_status="Done",
+                    created_at="2026-05-01T18:00:00.000Z",
+                ),
+                secret="secret",
+                delivery_id="delivery-done",
+            )
+            _post_linear_webhook(
+                server.base_url,
+                _linear_issue_payload(
+                    delivery_id="delivery-rework",
+                    previous_status="Done",
+                    new_status="Rework",
+                    created_at="2026-05-03T18:00:00.000Z",
+                ),
+                secret="secret",
+                delivery_id="delivery-rework",
+            )
+
+            signals = _get_json(server.base_url, "/linear/rework-signals")["signals"]
+
+            self.assertEqual({signal["rule_name"] for signal in signals}, {"done_to_non_done_within_7_days", "status_entered_rework"})
+            self.assertEqual({signal["source_event_id"] for signal in signals}, {"delivery-rework"})
+
 
 class _running_server:
     def __init__(self, db_path: Path | None = None, *, linear_webhook_secret: str | None = None) -> None:
@@ -211,16 +241,22 @@ def _get_json(base_url: str, path: str) -> dict[str, object]:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _linear_issue_payload(*, delivery_id: str = "delivery-1") -> dict[str, object]:
+def _linear_issue_payload(
+    *,
+    delivery_id: str = "delivery-1",
+    previous_status: str = "Todo",
+    new_status: str = "In Progress",
+    created_at: str = "2026-05-07T18:00:00.000Z",
+) -> dict[str, object]:
     return {
         "action": "update",
-        "createdAt": "2026-05-07T18:00:00.000Z",
+        "createdAt": created_at,
         "data": {
             "id": "issue-1",
             "identifier": "ERI-65",
-            "state": {"id": "state-in-progress", "name": "In Progress"},
+            "state": {"id": "state-new", "name": new_status},
         },
-        "updatedFrom": {"state": {"id": "state-todo", "name": "Todo"}},
+        "updatedFrom": {"state": {"id": "state-previous", "name": previous_status}},
         "actor": {"id": "user-1", "name": "Designer"},
         "webhookTimestamp": 1778176800000,
         "id": delivery_id,

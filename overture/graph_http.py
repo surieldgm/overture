@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .graph import GraphRecord
 from .graph_store import SqliteGraphStore
+from .rework_classifier import rework_signals_payload
 from .synthesis import GraphContext
 
 
@@ -60,6 +61,9 @@ class SharedGraphBackend:
 
     def list_linear_webhook_events(self) -> tuple[dict[str, Any], ...]:
         return self.store.list_linear_webhook_events()
+
+    def list_linear_rework_signals(self) -> tuple[dict[str, str], ...]:
+        return rework_signals_payload(self.list_linear_webhook_events())
 
 
 class GraphHttpClient:
@@ -105,6 +109,10 @@ class GraphHttpClient:
         response = self._request_json("GET", "/counts")
         counts = response.get("counts", {})
         return {"nodes": int(counts.get("nodes") or 0), "edges": int(counts.get("edges") or 0)} if isinstance(counts, Mapping) else {"nodes": 0, "edges": 0}
+
+    def list_linear_rework_signals(self) -> tuple[dict[str, Any], ...]:
+        response = self._request_json("GET", "/linear/rework-signals")
+        return tuple(_mapping_items(response.get("signals", ())))
 
     def _request_json(self, method: str, path: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
         data = None
@@ -185,6 +193,9 @@ class GraphHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/linear/webhook/events":
                 self._send_json({"events": self.graph_backend.list_linear_webhook_events()})
+                return
+            if parsed.path == "/linear/rework-signals":
+                self._send_json({"signals": self.graph_backend.list_linear_rework_signals()})
                 return
         except Exception as exc:  # pragma: no cover - defensive HTTP boundary
             self._send_error(500, str(exc))
