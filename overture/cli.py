@@ -81,6 +81,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--idea",
         help="Raw idea string to use instead of the built-in Overture MVP fixture idea.",
     )
+    fixture.add_argument(
+        "--metrics-db-path",
+        type=Path,
+        default=None,
+        help="Persist fixture stage timings to this SQLite metrics DB.",
+    )
+    fixture.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="Suppress live fixture stage progress output on stderr.",
+    )
 
     run = subparsers.add_parser(
         "run",
@@ -102,6 +113,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=_stage_choices(),
         default=None,
         help="Stop after the named stage and print that stage's artifact path.",
+    )
+    run.add_argument(
+        "--metrics-db-path",
+        type=Path,
+        default=None,
+        help="Persist run stage timings to this SQLite metrics DB.",
+    )
+    run.add_argument(
+        "--quiet-progress",
+        action="store_true",
+        help="Suppress live run stage progress output on stderr.",
     )
     run.add_argument(
         "--export",
@@ -232,10 +254,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "fixture":
         try:
+            fixture_kwargs = {
+                "metrics_db_path": args.metrics_db_path,
+                "quiet_progress": args.quiet_progress,
+            }
             if args.idea:
-                artifacts = run_overture_fixture(args.output_dir, idea=args.idea)
+                artifacts = run_overture_fixture(
+                    args.output_dir,
+                    idea=args.idea,
+                    **fixture_kwargs,
+                )
             else:
-                artifacts = run_overture_fixture(args.output_dir)
+                artifacts = run_overture_fixture(args.output_dir, **fixture_kwargs)
         except PipelineStageError as exc:
             print(f"fixture failed at {exc.stage}: {exc.message}", file=sys.stderr)
             return 1
@@ -293,6 +323,8 @@ def _run_single_shot(args: argparse.Namespace) -> int:
             args.output_dir,
             idea=raw_text,
             stop_at_stage=stop_at_stage,
+            metrics_db_path=args.metrics_db_path,
+            quiet_progress=args.quiet_progress,
         )
     except PipelineStageError as exc:
         print(f"run failed at {exc.stage}: {exc.message}", file=sys.stderr)

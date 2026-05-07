@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
 import sys
 from time import perf_counter
-from typing import Any, Callable, Mapping, TypeVar
+from typing import Any, Callable, Mapping, TextIO, TypeVar
 from uuid import uuid4
 
 from .graph import GraphRecord, research_result_to_graph_records
@@ -54,6 +54,19 @@ IMPERATIVE_TITLE_VERBS = (
 )
 
 T = TypeVar("T")
+StageObserver = Callable[["StageTransition"], None]
+
+
+@dataclass(frozen=True)
+class StageTransition:
+    run_id: str
+    intake_id: str | None
+    stage_name: str
+    state: str
+    started_at: str
+    completed_at: str | None = None
+    duration_ms: int | None = None
+    error_message: str | None = None
 
 
 class PipelineStageError(RuntimeError):
@@ -75,6 +88,8 @@ def run_overture_fixture(
     idea: str = DEFAULT_FIXTURE_IDEA,
     graph_store_base_path: Path | str | None = None,
     metrics_db_path: Path | str | None = None,
+    quiet_progress: bool = False,
+    progress_stream: TextIO | None = None,
     intake_factory: Callable[[str, Path], tuple[IntakeRecord, Path]] | None = None,
     stop_at_stage: str | None = None,
 ) -> dict[str, Path | str]:
@@ -87,12 +102,17 @@ def run_overture_fixture(
     base_dir.mkdir(parents=True, exist_ok=True)
     run_id = uuid4().hex
     metrics = _open_metrics_store(metrics_db_path)
+    observers = _fixture_stage_observers(
+        metrics,
+        quiet_progress=quiet_progress,
+        progress_stream=progress_stream,
+    )
     intake_id: str | None = None
     artifacts: dict[str, Path | str] = {"run_id": run_id}
 
     try:
         intake_record, intake_path = _record_fixture_stage(
-            metrics,
+            observers,
             run_id,
             "intake",
             intake_id,
@@ -107,7 +127,7 @@ def run_overture_fixture(
 
     try:
         research_result, research_path = _record_fixture_stage(
-            metrics,
+            observers,
             run_id,
             "research",
             intake_id,
@@ -121,7 +141,7 @@ def run_overture_fixture(
 
     try:
         graph_records, prior_context, graph_context, graph_path = _record_fixture_stage(
-            metrics,
+            observers,
             run_id,
             "graph",
             intake_id,
@@ -140,7 +160,7 @@ def run_overture_fixture(
 
     try:
         synthesis, synthesis_path = _record_fixture_stage(
-            metrics,
+            observers,
             run_id,
             "synthesis",
             intake_id,
@@ -154,7 +174,7 @@ def run_overture_fixture(
 
     try:
         ticket_path = _record_fixture_stage(
-            metrics,
+            observers,
             run_id,
             "ticket_draft",
             intake_id,
@@ -170,7 +190,7 @@ def run_overture_fixture(
 
 
 def _record_fixture_stage(
-    metrics: MetricsStore | None,
+    observers: tuple[StageObserver, ...],
     run_id: str,
     stage_name: str,
     intake_id: str | None,
@@ -178,36 +198,109 @@ def _record_fixture_stage(
 ) -> T:
     started_at = _utc_now_iso()
     started_monotonic = perf_counter()
-    status = "success"
+    terminal_state = "completed"
     error_message: str | None = None
+    _emit_stage_transition(
+        observers,
+        StageTransition(
+            run_id=run_id,
+            intake_id=intake_id,
+            stage_name=stage_name,
+            state="started",
+            started_at=started_at,
+        ),
+    )
     try:
         return operation()
     except Exception as exc:
-        status = "failure"
+        terminal_state = "failed"
         error_message = str(exc)
         raise
     finally:
         completed_at = _utc_now_iso()
         duration_ms = max(0, int((perf_counter() - started_monotonic) * 1000))
-        if metrics is not None:
-            try:
-                metrics.record(
-                    StageMetric(
-                        run_id=run_id,
-                        intake_id=intake_id,
-                        stage_name=stage_name,
-                        started_at=started_at,
-                        completed_at=completed_at,
-                        duration_ms=duration_ms,
-                        status=status,
-                        error_message=error_message,
-                    )
+        _emit_stage_transition(
+            observers,
+            StageTransition(
+                run_id=run_id,
+                intake_id=intake_id,
+                stage_name=stage_name,
+                state=terminal_state,
+                started_at=started_at,
+                completed_at=completed_at,
+                duration_ms=duration_ms,
+                error_message=error_message,
+            ),
+        )
+
+
+def _fixture_stage_observers(
+    metrics: MetricsStore | None,
+    *,
+    quiet_progress: bool,
+    progress_stream: TextIO | None,
+) -> tuple[StageObserver, ...]:
+    observers: list[StageObserver] = []
+    if metrics is not None:
+        observers.append(_record_stage_metric(metrics))
+    if not quiet_progress:
+        observers.append(_emit_progress(progress_stream or sys.stderr))
+    return tuple(observers)
+
+
+def _record_stage_metric(metrics: MetricsStore) -> StageObserver:
+    def observe(transition: StageTransition) -> None:
+        if transition.state == "started":
+            return
+        try:
+            metrics.record(
+                StageMetric(
+                    run_id=transition.run_id,
+                    intake_id=transition.intake_id,
+                    stage_name=transition.stage_name,
+                    started_at=transition.started_at,
+                    completed_at=transition.completed_at or transition.started_at,
+                    duration_ms=transition.duration_ms or 0,
+                    status="success" if transition.state == "completed" else "failure",
+                    error_message=transition.error_message,
                 )
-            except Exception as exc:  # pragma: no cover - defensive metrics boundary
-                print(
-                    f"failed to record stage metric for {stage_name}: {exc}",
-                    file=sys.stderr,
-                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive metrics boundary
+            print(
+                f"failed to record stage metric for {transition.stage_name}: {exc}",
+                file=sys.stderr,
+            )
+
+    return observe
+
+
+def _emit_progress(stream: TextIO) -> StageObserver:
+    def observe(transition: StageTransition) -> None:
+        if transition.state == "started":
+            print(f"{transition.stage_name} started", file=stream)
+            return
+        assert transition.duration_ms is not None
+        if transition.state == "completed":
+            print(
+                f"{transition.stage_name} completed {transition.duration_ms}ms",
+                file=stream,
+            )
+            return
+        detail = f": {transition.error_message}" if transition.error_message else ""
+        print(
+            f"{transition.stage_name} failed {transition.duration_ms}ms{detail}",
+            file=stream,
+        )
+
+    return observe
+
+
+def _emit_stage_transition(
+    observers: tuple[StageObserver, ...],
+    transition: StageTransition,
+) -> None:
+    for observer in observers:
+        observer(transition)
 
 
 def _run_research_stage(base_dir: Path, intake_record: IntakeRecord) -> tuple[ResearchResult, Path]:
