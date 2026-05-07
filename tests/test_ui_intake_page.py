@@ -7,8 +7,8 @@ from pathlib import Path
 from urllib.parse import urlencode
 from urllib.parse import urlparse
 
-from overture.intake import load_intake_record
 from overture.auth import AUTH_COOKIE_NAME
+from overture.intake import load_intake_record
 from overture.ui_host import (
     INTAKE_TEXT_MAX_CHARS,
     RESEARCH_COMPLETE_ROUTE,
@@ -22,13 +22,12 @@ from overture.ui_host import (
 
 
 class IntakePageTests(unittest.TestCase):
-    def test_unauthenticated_intake_get_exposes_email_entry_surface(self) -> None:
+    def test_unauthenticated_intake_redirects_to_login(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             response = _request(OvertureUiApp(store_dir=tmpdir), "GET", "/intake", authenticated=False)
 
-        self.assertEqual(response.status, "200 OK")
-        self.assertIn('<input id="email" name="email" type="email"', response.body)
-        self.assertIn("Send magic link", response.body)
+        self.assertEqual(response.status, "302 Found")
+        self.assertEqual(response.headers["Location"], "/auth/login?next=/intake")
 
     def test_unauthenticated_backend_write_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -40,8 +39,8 @@ class IntakePageTests(unittest.TestCase):
                 authenticated=False,
             )
 
-            self.assertEqual(response.status, "401 Unauthorized")
-            self.assertIn("Authentication required", response.body)
+            self.assertEqual(response.status, "302 Found")
+            self.assertEqual(response.headers["Location"], "/auth/login?next=/intake")
             self.assertEqual(list((Path(tmpdir) / "intake").glob("*.json")), [])
 
     def test_magic_link_flow_establishes_refreshed_designer_session(self) -> None:
@@ -78,8 +77,8 @@ class IntakePageTests(unittest.TestCase):
                 authenticated=False,
             )
 
-        self.assertEqual(response.status, "401 Unauthorized")
-        self.assertIn("Authentication required", response.body)
+        self.assertEqual(response.status, "302 Found")
+        self.assertEqual(response.headers["Location"], "/auth/login?next=/intake")
 
     def test_intake_page_renders_form_and_curated_examples_link(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

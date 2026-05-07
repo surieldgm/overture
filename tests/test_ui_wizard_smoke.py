@@ -215,6 +215,34 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertIn(intake_id, prompts[0])
 
+    def test_shared_wizard_cookie_is_scoped_by_authenticated_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            with _running_server(store_dir=store_dir, llm_client=_stub_llm_client) as base_url:
+                first = _post(
+                    base_url,
+                    "/intake",
+                    {"idea": "Designer one session state"},
+                    headers={"Cookie": _auth_header("designer-1")},
+                )
+                second = _post(
+                    base_url,
+                    "/intake",
+                    {"idea": "Designer two session state"},
+                    headers={"Cookie": f'{first.headers["Set-Cookie"]}; {_auth_header("designer-2")}'},
+                )
+
+            first_session = _session_from_set_cookie(first.headers["Set-Cookie"])
+            second_session = _session_from_set_cookie(second.headers["Set-Cookie"])
+            intake_file_count = len(list((store_dir / "intake").glob("*.json")))
+
+        self.assertEqual(first.status, 303)
+        self.assertEqual(second.status, 303)
+        self.assertEqual(first_session["user_id"], "designer-1@example.test")
+        self.assertEqual(second_session["user_id"], "designer-2@example.test")
+        self.assertNotEqual(first_session["intake_id"], second_session["intake_id"])
+        self.assertEqual(intake_file_count, 2)
+
     def test_synthesis_page_renders_brief_and_advances_to_ticket_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store_dir = Path(tmpdir)
@@ -288,6 +316,27 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
             self.assertIn("Cached brief", revisit_page.body)
             self.assertEqual(calls, 1)
 
+    def test_synthesis_persists_graph_records_with_authenticated_author(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            with _running_server(store_dir=store_dir, llm_client=_stub_llm_client) as base_url:
+                research_cookie = _approved_research_cookie(base_url, user_id="designer-2")
+                synthesis_page = _get(
+                    base_url,
+                    SYNTHESIS_ROUTE,
+                    headers={"Cookie": f'{research_cookie}; {_auth_header("designer-2")}'},
+                )
+
+            graph = SqliteGraphStore(store_dir / "graph.sqlite")
+            nodes = graph.list_nodes()
+            edges = graph.list_edges()
+
+        self.assertEqual(synthesis_page.status, 200)
+        self.assertTrue(nodes)
+        self.assertTrue(edges)
+        self.assertTrue(all(node["author_id"] == "designer-2@example.test" for node in nodes))
+        self.assertTrue(all(edge["author_id"] == "designer-2@example.test" for edge in edges))
+
 
 def _running_server(
     *,
@@ -359,11 +408,13 @@ def _request(
     connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=2)
     try:
         request_headers = dict(headers or {})
-        request_headers["Cookie"] = _merge_cookie(
-            request_headers.get("Cookie"),
-            AUTH_COOKIE_NAME,
-            TEST_AUTH.issue_session("designer@example.com"),
-        )
+        if AUTH_COOKIE_NAME not in request_headers.get("Cookie", ""):
+            auth_header = _auth_header("designer-1")
+            request_headers["Cookie"] = (
+                f'{request_headers["Cookie"]}; {auth_header}'
+                if "Cookie" in request_headers
+                else auth_header
+            )
         connection.request(method, path, body=body, headers=request_headers)
         response = connection.getresponse()
         payload = response.read().decode("utf-8")
@@ -420,14 +471,24 @@ def _stub_llm_client(_prompt: str) -> str:
     )
 
 
-def _approved_research_cookie(base_url: str) -> str:
-    intake_response = _post(base_url, "/intake", {"idea": "Help designers validate synthesis before ticket drafting"})
-    approval_page = _get(base_url, RESEARCH_APPROVAL_ROUTE, headers={"Cookie": intake_response.headers["Set-Cookie"]})
+def _auth_header(user_id: str) -> str:
+    return _merge_cookie(None, AUTH_COOKIE_NAME, TEST_AUTH.issue_session(f"{user_id}@example.test"))
+
+
+def _approved_research_cookie(base_url: str, *, user_id: str = "designer-1") -> str:
+    auth_header = _auth_header(user_id)
+    intake_response = _post(
+        base_url,
+        "/intake",
+        {"idea": "Help designers validate synthesis before ticket drafting"},
+        headers={"Cookie": auth_header},
+    )
+    approval_page = _get(base_url, RESEARCH_APPROVAL_ROUTE, headers={"Cookie": f'{intake_response.headers["Set-Cookie"]}; {auth_header}'})
     research_response = _post(
         base_url,
         RESEARCH_APPROVAL_ROUTE,
         {"decision-0": "approve:https://example.test/designer-synthesis"},
-        headers={"Cookie": approval_page.headers["Set-Cookie"]},
+        headers={"Cookie": f'{approval_page.headers["Set-Cookie"]}; {auth_header}'},
     )
     return research_response.headers["Set-Cookie"]
 

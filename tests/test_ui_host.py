@@ -94,13 +94,22 @@ class UIHostTests(unittest.TestCase):
 class SessionStoreTests(unittest.TestCase):
     def test_session_store_reuses_known_session(self) -> None:
         store = SessionStore()
-        session_id, session, is_new = store.get_or_create(None)
-        same_id, same_session, same_is_new = store.get_or_create(session_id)
+        session_id, session, is_new = store.get_or_create(None, user_id="designer-1")
+        same_id, same_session, same_is_new = store.get_or_create(session_id, user_id="designer-1")
 
         self.assertTrue(is_new)
         self.assertFalse(same_is_new)
         self.assertEqual(same_id, session_id)
         self.assertIs(same_session, session)
+
+    def test_session_store_scopes_same_cookie_by_user(self) -> None:
+        store = SessionStore()
+        _session_id, first_session, _is_new = store.get_or_create("shared", user_id="designer-1")
+        same_id, second_session, second_is_new = store.get_or_create("shared", user_id="designer-2")
+
+        self.assertNotEqual(same_id, "shared")
+        self.assertIsNot(first_session, second_session)
+        self.assertTrue(second_is_new)
 
 
 def _running_server() -> "_ServerContext":

@@ -8,7 +8,9 @@ shell by instantiating ``MagicLinkAuth`` and calling ``issue_session(email)``.
 
 Magic links expire after 15 minutes and are single-use. Auth session tokens
 expire after 8 hours and are refreshed on every authenticated wizard response
-while the session is active.
+while the session is active. Wizard state is scoped to the authenticated
+designer identity derived from the session token. If a token carries an issuing
+IP address or user agent, either value changing requires re-authentication.
 """
 
 from __future__ import annotations
@@ -35,6 +37,16 @@ AUTH_COOKIE_NAME = "overture_auth"
 class DesignerSession:
     email: str
     expires_at: int
+
+    @property
+    def user_id(self) -> str:
+        return self.email
+
+
+@dataclass(frozen=True)
+class AuthenticatedUser:
+    user_id: str
+    email: str
 
 
 @dataclass(frozen=True)
@@ -114,13 +126,26 @@ class MagicLinkAuth:
             return None
         return self.issue_session(email)
 
-    def issue_session(self, email: str, *, ttl_seconds: int = SESSION_TOKEN_TTL_SECONDS) -> str:
+    def issue_session(
+        self,
+        email: str,
+        *,
+        ttl_seconds: int = SESSION_TOKEN_TTL_SECONDS,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+    ) -> str:
         expires_at = int(self.now()) + ttl_seconds
+        normalized = _normalize_email(email)
         payload = {
-            "email": _normalize_email(email),
+            "email": normalized,
+            "user_id": normalized,
             "exp": expires_at,
             "nonce": secrets.token_urlsafe(12),
         }
+        if ip_address:
+            payload["ip_address"] = ip_address
+        if user_agent:
+            payload["user_agent"] = user_agent
         body = _b64(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
         signature = _sign(body, self.secret)
         return f"{body}.{signature}"
@@ -129,9 +154,9 @@ class MagicLinkAuth:
         token = _bearer_token(environ) or _cookie_token(environ)
         if not token:
             return None
-        return self.validate_session(token)
+        return self.validate_session(token, environ=environ)
 
-    def validate_session(self, token: str) -> DesignerSession | None:
+    def validate_session(self, token: str, *, environ: Mapping[str, object] | None = None) -> DesignerSession | None:
         try:
             body, signature = token.split(".", 1)
         except ValueError:
@@ -147,7 +172,14 @@ class MagicLinkAuth:
         expires_at = int(payload.get("exp") or 0)
         if expires_at <= int(self.now()):
             return None
-        email = str(payload.get("email") or "").strip().lower()
+        if environ is not None:
+            expected_ip = payload.get("ip_address")
+            if expected_ip and str(environ.get("REMOTE_ADDR", "")) != str(expected_ip):
+                return None
+            expected_user_agent = payload.get("user_agent")
+            if expected_user_agent and str(environ.get("HTTP_USER_AGENT", "")) != str(expected_user_agent):
+                return None
+        email = str(payload.get("email") or payload.get("user_id") or "").strip().lower()
         if "@" not in email:
             return None
         return DesignerSession(email=email, expires_at=expires_at)
@@ -172,6 +204,10 @@ def auth_cookie(token: str) -> str:
     jar[AUTH_COOKIE_NAME]["samesite"] = "Lax"
     jar[AUTH_COOKIE_NAME]["max-age"] = str(SESSION_TOKEN_TTL_SECONDS)
     return jar.output(header="").strip()
+
+
+def authenticated_user_from_session(session: DesignerSession) -> AuthenticatedUser:
+    return AuthenticatedUser(user_id=session.user_id, email=session.email)
 
 
 def _normalize_email(email: str) -> str:
