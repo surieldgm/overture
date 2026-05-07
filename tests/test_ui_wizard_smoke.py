@@ -9,11 +9,12 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlencode, urlparse
 
-from overture.auth import AUTH_COOKIE_NAME, MagicLinkAuth
+from overture.auth import AUTH_COOKIE_NAME, AuthenticatedUser, MagicLinkAuth
 from overture.graph_http import SharedGraphBackend
 from overture.graph import GraphRecord
 from overture.graph_store import SqliteGraphStore
 from overture.intake import load_intake_record
+from overture.observation_log import ObservationLog
 from overture.export import parse_ticket_file
 from overture.linear_client import CreatedIssue
 from overture.synthesis import synthesize_graph_context
@@ -463,6 +464,85 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
         self.assertTrue(edges)
         self.assertTrue(all(node["author_id"] == "designer-2@example.test" for node in nodes))
         self.assertTrue(all(edge["author_id"] == "designer-2@example.test" for edge in edges))
+
+    def test_observation_log_captures_transitions_submissions_and_validation_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            with _running_server(store_dir=store_dir, llm_client=_stub_llm_client) as base_url:
+                intake_response = _post(base_url, "/intake", {"idea": "Observe a founder-absent wizard run"})
+                self.assertEqual(intake_response.status, 303)
+                intake_session = _session_from_set_cookie(intake_response.headers["Set-Cookie"])
+                intake_id = intake_session["intake_id"]
+
+                approval_page = _get(base_url, RESEARCH_APPROVAL_ROUTE, headers={"Cookie": intake_response.headers["Set-Cookie"]})
+                self.assertEqual(approval_page.status, 200)
+                error_response = _post(
+                    base_url,
+                    RESEARCH_APPROVAL_ROUTE,
+                    {"decision-0": "reject:https://example.test/designer-synthesis"},
+                    headers={"Cookie": approval_page.headers["Set-Cookie"]},
+                )
+                self.assertEqual(error_response.status, 400)
+                research_response = _post(
+                    base_url,
+                    RESEARCH_APPROVAL_ROUTE,
+                    {"decision-0": "approve:https://example.test/designer-synthesis"},
+                    headers={"Cookie": error_response.headers["Set-Cookie"]},
+                )
+                self.assertEqual(research_response.status, 303)
+
+                synthesis_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": research_response.headers["Set-Cookie"]})
+                self.assertEqual(synthesis_page.status, 200)
+                synthesis_response = _post(base_url, SYNTHESIS_ROUTE, {}, headers={"Cookie": synthesis_page.headers["Set-Cookie"]})
+                self.assertEqual(synthesis_response.status, 303)
+
+            events = ObservationLog(store_dir / "observation.sqlite").iter_session_events(
+                intake_id,
+                user=AuthenticatedUser(user_id="designer-1@example.test", email="designer-1@example.test"),
+            )
+
+        event_types = [event.event_type for event in events]
+        routes = [event.route for event in events]
+        self.assertIn("form_submission", event_types)
+        self.assertIn("validation_error", event_types)
+        self.assertIn("page_transition", event_types)
+        self.assertIn(RESEARCH_APPROVAL_ROUTE, routes)
+        self.assertIn(SYNTHESIS_ROUTE, routes)
+        self.assertIn(TICKET_REVIEW_ROUTE, routes)
+        validation_event = next(event for event in events if event.event_type == "validation_error")
+        self.assertEqual(validation_event.request["approved_keys"], [])
+        self.assertIn("Approve at least one source", validation_event.error or "")
+        self.assertRegex(events[0].occurred_at, r"\.\d{3}Z$")
+
+    def test_observation_log_route_is_scoped_to_author_and_founder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            with mock.patch.dict("os.environ", {"OVERTURE_FOUNDER_EMAILS": "founder@example.test"}):
+                with _running_server(store_dir=store_dir, llm_client=_stub_llm_client) as base_url:
+                    author_token = TEST_AUTH.issue_session("designer-1@example.test")
+                    author_header = _merge_cookie(None, AUTH_COOKIE_NAME, author_token)
+                    intake_response = _post(
+                        base_url,
+                        "/intake",
+                        {"idea": "Founder can inspect this session after the fact"},
+                        headers={"Cookie": author_header},
+                    )
+                    self.assertEqual(intake_response.status, 303)
+                    intake_id = _session_from_set_cookie(intake_response.headers["Set-Cookie"])["intake_id"]
+
+                    author_cookie = _merge_cookie(intake_response.headers["Set-Cookie"], AUTH_COOKIE_NAME, author_token)
+                    author_view = _get(base_url, f"/sessions/{intake_id}/observation", headers={"Cookie": author_cookie})
+                    self.assertEqual(author_view.status, 200)
+                    self.assertIn("Observation log", author_view.body)
+
+                    founder_header = _merge_cookie(None, AUTH_COOKIE_NAME, TEST_AUTH.issue_session("founder@example.test"))
+                    founder_view = _get(base_url, f"/sessions/{intake_id}/observation", headers={"Cookie": founder_header})
+                    self.assertEqual(founder_view.status, 200)
+                    self.assertIn("form_submission", founder_view.body)
+
+                    other_header = _merge_cookie(None, AUTH_COOKIE_NAME, TEST_AUTH.issue_session("other@example.test"))
+                    other_view = _get(base_url, f"/sessions/{intake_id}/observation", headers={"Cookie": other_header})
+                    self.assertEqual(other_view.status, 403)
 
 
 def _running_server(

@@ -23,6 +23,7 @@ from .intake import IntakeRecord, create_intake_record, load_intake_record
 from .export import parse_ticket_file
 from .export_runner import ExportRunResult, run_ticket_export
 from .linear_client import LinearClient
+from .observation_log import ObservationEvent, ObservationLog, founder_emails_from_env
 from .peer_onboarding import initialize_peer_onboarding_template, ordered_peer_onboarding_sections
 from .research import CuratedSource, ResearchClaim, ResearchError, ResearchItem, ResearchResult, SourceReference, _normalize_source
 from .research_llm import (
@@ -58,6 +59,7 @@ AUTH_LOGIN_ROUTE = "/auth/login"
 AUTH_MAGIC_LINK_ROUTE = "/auth/magic-link"
 AUTH_CONSUME_ROUTE = "/auth/consume"
 PEER_ONBOARDING_ROUTE = "/peer-onboarding"
+OBSERVATION_LOG_ROUTE_PREFIX = "/sessions/"
 
 StartResponse = Callable[[str, list[tuple[str, str]]], None]
 
@@ -230,7 +232,7 @@ class OvertureUiApp:
 
         auth_session = self.auth_manager.authenticate(environ)
         if auth_session is None:
-            if path in AUTHENTICATED_WIZARD_PATHS:
+            if path in AUTHENTICATED_WIZARD_PATHS or _is_observation_log_route(path):
                 return self._redirect(start_response, f"{AUTH_LOGIN_ROUTE}?next={path}", status="302 Found")
             return self._unauthorized(start_response)
 
@@ -273,6 +275,15 @@ class OvertureUiApp:
         if path == RESEARCH_COMPLETE_ROUTE and method == "GET":
             assert user is not None
             session = session_from_environ(environ, user=user)
+            self._record_observation(
+                session,
+                event_type="page_transition",
+                route=RESEARCH_COMPLETE_ROUTE,
+                action="view",
+                user=user,
+                request={"method": "GET"},
+                response={"status": 200},
+            )
             return self._render(start_response, render_research_complete_page(session))
         if path == SYNTHESIS_ROUTE and method == "GET":
             return self._handle_synthesis_get(environ, start_response)
@@ -298,6 +309,9 @@ class OvertureUiApp:
                 render_peer_onboarding_page(session, template=template),
                 extra_headers=[("Set-Cookie", _session_cookie(session))],
             )
+        observation_session_id = _observation_session_id_from_path(path)
+        if observation_session_id and method == "GET":
+            return self._handle_observation_log_get(observation_session_id, start_response, user)
         if path == "/examples/intake_examples" and method == "GET":
             return self._render(start_response, render_examples_library())
         if path in ROUTES_BY_PATH and method == "GET":
@@ -315,6 +329,21 @@ class OvertureUiApp:
             )
 
         return self._render(start_response, render_not_found(path), status="404 Not Found")
+
+    def _handle_observation_log_get(
+        self,
+        session_id: str,
+        start_response: StartResponse,
+        user: AuthenticatedUser,
+    ) -> Iterable[bytes]:
+        log = ObservationLog(Path(self.store_dir) / "observation.sqlite")
+        try:
+            events = log.iter_session_events(session_id, user=user, founder_emails=founder_emails_from_env())
+        except PermissionError:
+            return self._render(start_response, render_observation_forbidden_page(session_id), status="403 Forbidden")
+        if not events:
+            return self._render(start_response, render_observation_log_page(session_id, events=()), status="404 Not Found")
+        return self._render(start_response, render_observation_log_page(session_id, events=events))
 
     def _handle_magic_link_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         fields = _form_fields(environ)
@@ -352,6 +381,16 @@ class OvertureUiApp:
         session = session_from_environ(environ, user=user)
         error = validate_intake_text(raw_text)
         if error:
+            self._record_observation(
+                session,
+                event_type="validation_error",
+                route="/intake",
+                action="submit",
+                user=user,
+                request={"fields": _flatten_form_fields(fields)},
+                response={"status": 400, "message": error},
+                error=error,
+            )
             return self._render(
                 start_response,
                 render_intake_page(session, raw_text=raw_text, error=error),
@@ -359,6 +398,24 @@ class OvertureUiApp:
             )
 
         result = submit_intake(raw_text, self.store_dir, session, user=user)
+        self._record_observation(
+            result.session,
+            event_type="form_submission",
+            route="/intake",
+            action="submit",
+            user=user,
+            request={"fields": _flatten_form_fields(fields)},
+            response={"status": 303, "location": RESEARCH_APPROVAL_ROUTE, "intake_id": result.record.id},
+        )
+        self._record_observation(
+            result.session,
+            event_type="page_transition",
+            route=RESEARCH_APPROVAL_ROUTE,
+            action="advance",
+            user=user,
+            request={"from": "/intake", "method": "POST"},
+            response={"status": 303, "location": RESEARCH_APPROVAL_ROUTE},
+        )
         return self._redirect(
             start_response,
             RESEARCH_APPROVAL_ROUTE,
@@ -368,6 +425,19 @@ class OvertureUiApp:
     def _handle_research_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         user = _require_user(environ)
         result = prepare_research_review(session_from_environ(environ, user=user), self.store_dir, self.llm_client)
+        self._record_observation(
+            result.session,
+            event_type="page_transition",
+            route=RESEARCH_APPROVAL_ROUTE,
+            action="view",
+            user=user,
+            request={"method": "GET"},
+            response={
+                "status": 400 if result.error and not result.candidates else 200,
+                "candidate_count": len(result.candidates),
+            },
+            error=result.error,
+        )
         return self._render(
             start_response,
             render_research_approval_page(result.session, candidates=result.candidates, error=result.error),
@@ -390,12 +460,44 @@ class OvertureUiApp:
             user=_require_user(environ),
         )
         if result.error:
+            self._record_observation(
+                result.session,
+                event_type="validation_error",
+                route=RESEARCH_APPROVAL_ROUTE,
+                action="submit",
+                user=_require_user(environ),
+                request={"fields": _flatten_form_fields(fields), "approved_keys": approved_keys},
+                response={"status": 400, "message": result.error},
+                error=result.error,
+            )
             return self._render(
                 start_response,
                 render_research_approval_page(result.session, candidates=result.candidates, error=result.error),
                 status="400 Bad Request",
                 extra_headers=[("Set-Cookie", _session_cookie(result.session))],
             )
+        self._record_observation(
+            result.session,
+            event_type="form_submission",
+            route=RESEARCH_APPROVAL_ROUTE,
+            action="submit",
+            user=_require_user(environ),
+            request={"fields": _flatten_form_fields(fields), "approved_keys": approved_keys},
+            response={
+                "status": 303,
+                "location": RESEARCH_COMPLETE_ROUTE,
+                "research_id": result.session.get("research_id"),
+            },
+        )
+        self._record_observation(
+            result.session,
+            event_type="page_transition",
+            route=RESEARCH_COMPLETE_ROUTE,
+            action="advance",
+            user=_require_user(environ),
+            request={"from": RESEARCH_APPROVAL_ROUTE, "method": "POST"},
+            response={"status": 303, "location": RESEARCH_COMPLETE_ROUTE},
+        )
         return self._redirect(
             start_response,
             RESEARCH_COMPLETE_ROUTE,
@@ -403,12 +505,23 @@ class OvertureUiApp:
         )
 
     def _handle_synthesis_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        user = _require_user(environ)
         result = prepare_synthesis_review(
-            session_from_environ(environ, user=_require_user(environ)),
+            session_from_environ(environ, user=user),
             self.store_dir,
             synthesizer=self.synthesizer,
             graph_backend=self.graph_backend,
-            user=_require_user(environ),
+            user=user,
+        )
+        self._record_observation(
+            result.session,
+            event_type="page_transition",
+            route=SYNTHESIS_ROUTE,
+            action="view",
+            user=user,
+            request={"method": "GET"},
+            response={"status": 200, "cached": result.cached, "has_brief": result.brief is not None},
+            error=result.error,
         )
         return self._render(
             start_response,
@@ -417,14 +530,44 @@ class OvertureUiApp:
         )
 
     def _handle_synthesis_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
-        result = advance_synthesis_review(session_from_environ(environ, user=_require_user(environ)), self.store_dir, user=_require_user(environ))
+        user = _require_user(environ)
+        session = session_from_environ(environ, user=user)
+        result = advance_synthesis_review(session, self.store_dir, user=user)
         if result.error:
+            self._record_observation(
+                result.session,
+                event_type="validation_error",
+                route=SYNTHESIS_ROUTE,
+                action="advance",
+                user=user,
+                request={"fields": {}},
+                response={"status": 400, "message": result.error},
+                error=result.error,
+            )
             return self._render(
                 start_response,
                 render_synthesis_review_page(result.session, brief=result.brief, error=result.error, cached=result.cached),
                 status="400 Bad Request",
                 extra_headers=[("Set-Cookie", _session_cookie(result.session))],
             )
+        self._record_observation(
+            result.session,
+            event_type="form_submission",
+            route=SYNTHESIS_ROUTE,
+            action="advance",
+            user=user,
+            request={"fields": {}},
+            response={"status": 303, "location": TICKET_REVIEW_ROUTE, "synthesis_id": result.session.get("synthesis_id")},
+        )
+        self._record_observation(
+            result.session,
+            event_type="page_transition",
+            route=TICKET_REVIEW_ROUTE,
+            action="advance",
+            user=user,
+            request={"from": SYNTHESIS_ROUTE, "method": "POST"},
+            response={"status": 303, "location": TICKET_REVIEW_ROUTE},
+        )
         return self._redirect(
             start_response,
             TICKET_REVIEW_ROUTE,
@@ -432,7 +575,18 @@ class OvertureUiApp:
         )
 
     def _handle_ticket_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
-        result = prepare_ticket_review(session_from_environ(environ, user=_require_user(environ)), user=_require_user(environ))
+        user = _require_user(environ)
+        result = prepare_ticket_review(session_from_environ(environ, user=user), user=user)
+        self._record_observation(
+            result.session,
+            event_type="page_transition",
+            route=TICKET_REVIEW_ROUTE,
+            action="view",
+            user=user,
+            request={"method": "GET"},
+            response={"status": 200, "has_markdown": bool(result.markdown)},
+            error=result.error,
+        )
         return self._render(
             start_response,
             render_ticket_review_page(result.session, markdown=result.markdown, error=result.error),
@@ -442,14 +596,43 @@ class OvertureUiApp:
     def _handle_ticket_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         fields = _form_fields(environ)
         markdown = fields.get("ticket_markdown", [""])[0]
-        result = submit_ticket_review(session_from_environ(environ, user=_require_user(environ)), markdown, user=_require_user(environ))
+        user = _require_user(environ)
+        result = submit_ticket_review(session_from_environ(environ, user=user), markdown, user=user)
         if result.error:
+            self._record_observation(
+                result.session,
+                event_type="validation_error",
+                route=TICKET_REVIEW_ROUTE,
+                action="submit",
+                user=user,
+                request={"fields": _flatten_form_fields(fields)},
+                response={"status": 400, "message": result.error},
+                error=result.error,
+            )
             return self._render(
                 start_response,
                 render_ticket_review_page(result.session, markdown=result.markdown, error=result.error),
                 status="400 Bad Request",
                 extra_headers=[("Set-Cookie", _session_cookie(result.session))],
             )
+        self._record_observation(
+            result.session,
+            event_type="form_submission",
+            route=TICKET_REVIEW_ROUTE,
+            action="submit",
+            user=user,
+            request={"fields": _flatten_form_fields(fields)},
+            response={"status": 303, "location": "/export", "ticket_title": result.session.get("ticket_title")},
+        )
+        self._record_observation(
+            result.session,
+            event_type="page_transition",
+            route="/export",
+            action="advance",
+            user=user,
+            request={"from": TICKET_REVIEW_ROUTE, "method": "POST"},
+            response={"status": 303, "location": "/export"},
+        )
         return self._redirect(
             start_response,
             "/export",
@@ -457,7 +640,18 @@ class OvertureUiApp:
         )
 
     def _handle_export_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
-        result = prepare_export_review(session_from_environ(environ, user=_require_user(environ)), self.store_dir, user=_require_user(environ))
+        user = _require_user(environ)
+        result = prepare_export_review(session_from_environ(environ, user=user), self.store_dir, user=user)
+        self._record_observation(
+            result.session,
+            event_type="page_transition",
+            route="/export",
+            action="view",
+            user=user,
+            request={"method": "GET"},
+            response={"status": 200, "has_ticket": result.ticket_path is not None},
+            error=result.message if result.ticket_path is None else None,
+        )
         return self._render(
             start_response,
             render_export_page(result),
@@ -471,11 +665,39 @@ class OvertureUiApp:
         user = _require_user(environ)
         session = session_from_environ(environ, user=user)
         if action == "back":
+            self._record_observation(
+                session,
+                event_type="form_submission",
+                route="/export",
+                action="retreat",
+                user=user,
+                request={"fields": _flatten_form_fields(fields)},
+                response={"status": 303, "location": TICKET_REVIEW_ROUTE},
+            )
+            self._record_observation(
+                session,
+                event_type="page_transition",
+                route=TICKET_REVIEW_ROUTE,
+                action="retreat",
+                user=user,
+                request={"from": "/export", "method": "POST"},
+                response={"status": 303, "location": TICKET_REVIEW_ROUTE},
+            )
             return self._redirect(start_response, TICKET_REVIEW_ROUTE, extra_headers=[("Set-Cookie", _session_cookie(session))])
 
         dry_run = action == "dry-run"
         if action not in {"dry-run", "export"}:
             review = prepare_export_review(session, self.store_dir, message="Choose Dry-run or Export before continuing.", user=user)
+            self._record_observation(
+                review.session,
+                event_type="validation_error",
+                route="/export",
+                action="submit",
+                user=user,
+                request={"fields": _flatten_form_fields(fields)},
+                response={"status": 400, "message": review.message},
+                error=review.message,
+            )
             return self._render(
                 start_response,
                 render_export_page(review),
@@ -485,6 +707,16 @@ class OvertureUiApp:
 
         review = prepare_export_review(session, self.store_dir, user=user)
         if review.ticket_path is None:
+            self._record_observation(
+                review.session,
+                event_type="validation_error",
+                route="/export",
+                action=action,
+                user=user,
+                request={"fields": _flatten_form_fields(fields)},
+                response={"status": 400, "message": review.message},
+                error=review.message,
+            )
             return self._render(
                 start_response,
                 render_export_page(review),
@@ -498,6 +730,16 @@ class OvertureUiApp:
                 title=review.title,
                 body_preview=review.body_preview,
                 message="LINEAR_API_KEY is required before exporting to Linear. Dry-run remains available.",
+            )
+            self._record_observation(
+                review.session,
+                event_type="validation_error",
+                route="/export",
+                action=action,
+                user=user,
+                request={"fields": _flatten_form_fields(fields)},
+                response={"status": 400, "message": review.message},
+                error=review.message,
             )
             return self._render(
                 start_response,
@@ -521,6 +763,16 @@ class OvertureUiApp:
             title=review.title,
             body_preview=review.body_preview,
             result=export_result,
+        )
+        self._record_observation(
+            review.session,
+            event_type="form_submission",
+            route="/export",
+            action=action,
+            user=user,
+            request={"fields": _flatten_form_fields(fields)},
+            response={"status": int(status.split()[0]), "export_status": export_result.status, "url": export_result.url},
+            error=export_result.message if status.startswith("400") else None,
         )
         return self._render(
             start_response,
@@ -569,6 +821,34 @@ class OvertureUiApp:
             return []
         token = self.auth_manager.refresh_session(self._active_auth_session)
         return [("Set-Cookie", auth_cookie(token))]
+
+    def _record_observation(
+        self,
+        session: Mapping[str, str],
+        *,
+        event_type: str,
+        route: str,
+        action: str,
+        user: AuthenticatedUser,
+        request: Mapping[str, object] | None = None,
+        response: Mapping[str, object] | None = None,
+        error: str | None = None,
+    ) -> None:
+        session_id = _observation_session_id(session)
+        if not session_id:
+            return
+        ObservationLog(Path(self.store_dir) / "observation.sqlite").append(
+            session_id=session_id,
+            event_type=event_type,
+            route=route,
+            action=action,
+            actor=user,
+            author_id=session.get(SESSION_AUTHOR_ID_KEY) or session.get("user_id"),
+            author_email=session.get(SESSION_AUTHOR_EMAIL_KEY) or session.get("user_email"),
+            request=request,
+            response=response,
+            error=error,
+        )
 
     def _server_session(self, environ: dict[str, object], user: AuthenticatedUser) -> tuple[str, dict[str, object], bool]:
         return self.session_store.get_or_create(_opaque_session_id_from_environ(environ), user_id=user.user_id)
@@ -1433,6 +1713,67 @@ def render_export_page(review: ExportReviewResult) -> str:
     )
 
 
+def render_observation_forbidden_page(session_id: str) -> str:
+    return render_layout(
+        title="Observation log unavailable",
+        active_path=None,
+        content=f"""
+        <section class="workspace">
+          <h2>Observation log unavailable</h2>
+          <p>Session <code>{html.escape(session_id)}</code> is only readable by the session author or founder.</p>
+        </section>
+        """,
+    )
+
+
+def render_observation_log_page(session_id: str, *, events: Iterable[ObservationEvent]) -> str:
+    event_rows = []
+    for event in events:
+        request = html.escape(json.dumps(dict(event.request), sort_keys=True))
+        response = html.escape(json.dumps(dict(event.response), sort_keys=True))
+        error = html.escape(event.error or "")
+        event_rows.append(
+            f"""
+            <tr>
+              <td>{event.id}</td>
+              <td><time>{html.escape(event.occurred_at)}</time></td>
+              <td>{html.escape(event.event_type)}</td>
+              <td>{html.escape(event.route)}</td>
+              <td>{html.escape(event.action)}</td>
+              <td><code>{request}</code></td>
+              <td><code>{response}</code></td>
+              <td>{error}</td>
+            </tr>
+            """
+        )
+    rows = "".join(event_rows) or '<tr><td colspan="8" class="empty-state">No observation events were captured for this session.</td></tr>'
+    return render_layout(
+        title="Observation log",
+        active_path=None,
+        content=f"""
+        <section class="workspace observation-log">
+          <h2>Observation log</h2>
+          <p>Session <code>{html.escape(session_id)}</code></p>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Timestamp</th>
+                <th>Event</th>
+                <th>Route</th>
+                <th>Action</th>
+                <th>Input</th>
+                <th>Output</th>
+                <th>Error</th>
+              </tr>
+            </thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </section>
+        """,
+    )
+
+
 def render_peer_onboarding_page(session: Mapping[str, str], *, template: Mapping[str, object]) -> str:
     author = template.get("author", {})
     author_email = ""
@@ -1601,6 +1942,9 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
     .export-summary dt {{ color: var(--muted); font-weight: 650; }}
     .export-summary dd {{ margin: 0; overflow-wrap: anywhere; }}
     .export-result {{ background: #ecfdf5; border: 1px solid #99f6e4; border-radius: 6px; margin-top: 18px; padding: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    th, td {{ border-top: 1px solid var(--line); padding: 8px; text-align: left; vertical-align: top; }}
+    td code {{ display: block; max-width: 260px; overflow-wrap: anywhere; white-space: normal; }}
     button, a {{ color: var(--accent); font-weight: 650; }}
     button {{ border: 0; border-radius: 6px; background: var(--accent); color: white; padding: 10px 14px; cursor: pointer; font: inherit; }}
     button.secondary {{ background: #edf2f7; color: var(--ink); }}
@@ -1642,6 +1986,28 @@ def _form_fields(environ: dict[str, object]) -> dict[str, list[str]]:
         length = 0
     body = environ["wsgi.input"].read(length).decode("utf-8") if length else ""
     return parse_qs(body, keep_blank_values=True)
+
+
+def _flatten_form_fields(fields: Mapping[str, list[str]]) -> dict[str, object]:
+    flattened: dict[str, object] = {}
+    for key, values in fields.items():
+        flattened[str(key)] = values[0] if len(values) == 1 else list(values)
+    return flattened
+
+
+def _observation_session_id(session: Mapping[str, str]) -> str:
+    return str(session.get("intake_id") or session.get("research_id") or "").strip()
+
+
+def _is_observation_log_route(path: str) -> bool:
+    return _observation_session_id_from_path(path) is not None
+
+
+def _observation_session_id_from_path(path: str) -> str | None:
+    if not path.startswith(OBSERVATION_LOG_ROUTE_PREFIX) or not path.endswith("/observation"):
+        return None
+    session_id = path[len(OBSERVATION_LOG_ROUTE_PREFIX) : -len("/observation")].strip("/")
+    return session_id or None
 
 
 def _session_cookie(session: dict[str, str]) -> str:
