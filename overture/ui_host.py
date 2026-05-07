@@ -23,7 +23,14 @@ from .intake import IntakeRecord, create_intake_record, load_intake_record
 from .export import parse_ticket_file
 from .export_runner import ExportRunResult, run_ticket_export
 from .linear_client import LinearClient
-from .peer_onboarding import initialize_peer_onboarding_template, ordered_peer_onboarding_sections
+from .peer_onboarding import (
+    PEER_ONBOARDING_ROUTE,
+    PeerOnboardingArtifact,
+    initialize_peer_onboarding_template,
+    load_designer_one_peer_onboarding_artifact,
+    ordered_peer_onboarding_sections,
+    validate_designer_one_peer_onboarding_artifact,
+)
 from .research import CuratedSource, ResearchClaim, ResearchError, ResearchItem, ResearchResult, SourceReference, _normalize_source
 from .research_llm import (
     LLMSuggestedSourceAdapter,
@@ -57,7 +64,6 @@ SESSION_PEER_ONBOARDING_TEMPLATE_KEY = "peer_onboarding_template"
 AUTH_LOGIN_ROUTE = "/auth/login"
 AUTH_MAGIC_LINK_ROUTE = "/auth/magic-link"
 AUTH_CONSUME_ROUTE = "/auth/consume"
-PEER_ONBOARDING_ROUTE = "/peer-onboarding"
 
 StartResponse = Callable[[str, list[tuple[str, str]]], None]
 
@@ -287,16 +293,14 @@ class OvertureUiApp:
         if path == "/export" and method == "POST":
             return self._handle_export_post(environ, start_response)
         if path == PEER_ONBOARDING_ROUTE and method == "GET":
-            session = session_from_environ(environ, user=user)
-            session = _session_for_user(session, user)
-            template = _peer_onboarding_template_from_session(session)
-            if template is None:
-                template = initialize_peer_onboarding_template(user.user_id, user.email)
-                session[SESSION_PEER_ONBOARDING_TEMPLATE_KEY] = json.dumps(template, sort_keys=True, separators=(",", ":"))
+            store = SqliteGraphStore(Path(self.store_dir) / "graph.sqlite")
+            artifact = load_designer_one_peer_onboarding_artifact(store)
+            errors = validate_designer_one_peer_onboarding_artifact(artifact)
+            status = "500 Internal Server Error" if errors else "200 OK"
             return self._render(
                 start_response,
-                render_peer_onboarding_page(session, template=template),
-                extra_headers=[("Set-Cookie", _session_cookie(session))],
+                render_peer_onboarding_artifact_page(artifact, errors=errors),
+                status=status,
             )
         if path == "/examples/intake_examples" and method == "GET":
             return self._render(start_response, render_examples_library())
@@ -1506,6 +1510,68 @@ def render_examples_library() -> str:
         </section>
         """,
     )
+
+
+def render_peer_onboarding_artifact_page(artifact: PeerOnboardingArtifact, *, errors: Iterable[str] = ()) -> str:
+    error_items = "".join(f"<li>{html.escape(error)}</li>" for error in errors)
+    error_markup = f'<div class="validation" role="alert"><ul>{error_items}</ul></div>' if error_items else ""
+    section_markup = "\n".join(_peer_onboarding_section_markup(section) for section in artifact.sections)
+    example_markup = '<ol class="source-list">' + "".join(
+        _peer_example_markup(example) for example in artifact.intake_examples
+    ) + "</ol>"
+    source_nodes = ", ".join(f"<code>{html.escape(node)}</code>" for node in artifact.source_nodes)
+    return render_layout(
+        title=artifact.title,
+        active_path=PEER_ONBOARDING_ROUTE,
+        content=f"""
+        <section class="workspace peer-onboarding">
+          <h2>{html.escape(artifact.title)}</h2>
+          <p>{html.escape(ROUTES_BY_PATH[PEER_ONBOARDING_ROUTE].placeholder)}</p>
+          <p>Author: <code>{html.escape(artifact.author_id)}</code> &lt;{html.escape(artifact.author_email)}&gt;</p>
+          <p>Template: <code>{html.escape(artifact.template_id)}</code></p>
+          {error_markup}
+          <article aria-label="Peer onboarding template">
+            {section_markup}
+          </article>
+          <section class="brief-section">
+            <h3>Original intake examples</h3>
+            {example_markup}
+          </section>
+          <section class="brief-section">
+            <h3>Graph sources</h3>
+            <p>{source_nodes}</p>
+          </section>
+        </section>
+        <aside class="side-panel" aria-label="Wizard context">
+          <h3>Wizard context</h3>
+          <ol class="wizard-context">
+            <li><a href="/intake">Intake</a></li>
+            <li><a href="{RESEARCH_APPROVAL_ROUTE}">Research approval</a></li>
+            <li><a href="{SYNTHESIS_ROUTE}">Synthesis</a></li>
+            <li><a href="{TICKET_REVIEW_ROUTE}">Ticket</a></li>
+            <li><a href="/export">Export</a></li>
+          </ol>
+        </aside>
+        """,
+        shell_class="shell",
+    )
+
+
+def _peer_example_markup(example: object) -> str:
+    payload = example if isinstance(example, Mapping) else {}
+    href = str(payload.get("href") or "")
+    title = str(payload.get("title") or href)
+    raw_intake = str(payload.get("raw_intake") or "")
+    why = str(payload.get("why_it_helped") or "")
+    return f"""
+    <li class="source-option">
+      <div>
+        <h3><a href="/{html.escape(href)}">{html.escape(title)}</a></h3>
+        <p><strong>Original intake:</strong> {html.escape(raw_intake)}</p>
+        <p>{html.escape(why)}</p>
+      </div>
+    </li>
+    """
 
 
 def render_not_found(path: str) -> str:
