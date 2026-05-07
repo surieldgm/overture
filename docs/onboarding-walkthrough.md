@@ -35,6 +35,29 @@ You created a local Python environment and installed the Overture command line
 tool from this checkout. After this step, `python -m overture ...` runs the same
 code that the tests use.
 
+Command:
+
+```sh
+LINEAR_API_KEY=local-smoke-key python -m overture setup --workspace /tmp/overture-onboarding
+```
+
+Expected output shape:
+
+```text
+workspace: /tmp/overture-onboarding
+[PASS] env LINEAR_API_KEY: observed=set
+...
+scaffold: created=...
+summary: PASS
+```
+
+What just happened:
+
+Overture validated the local environment and created the empty workspace
+directories used by the remaining walkthrough commands. The placeholder key only
+proves that export credentials are configured; `--dry-run` export later in this
+walkthrough does not call Linear.
+
 ## 2. Intake
 
 Command:
