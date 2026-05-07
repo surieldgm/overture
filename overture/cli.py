@@ -36,7 +36,7 @@ from .research_llm import (
     write_research_result,
 )
 from .setup import render_setup_report, run_setup
-from .ui_host import DEFAULT_STORE_DIR, OvertureUiApp
+from .ui_host import DEFAULT_STORE_DIR, DEFAULT_UI_HOST, DEFAULT_UI_PORT
 
 
 def _linear_client_factory() -> LinearClient:
@@ -178,18 +178,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     ui = subparsers.add_parser(
         "ui",
-        help="Run the form-based Overture wizard UI.",
+        help="Start the local-only wizard UI host.",
     )
     ui.add_argument(
         "--host",
-        default="127.0.0.1",
-        help="Host interface for the local UI server. Defaults to 127.0.0.1.",
+        default=DEFAULT_UI_HOST,
+        help="Loopback address to bind. Defaults to 127.0.0.1.",
     )
     ui.add_argument(
         "--port",
-        type=int,
-        default=8080,
-        help="Port for the local UI server. Defaults to 8080.",
+        type=_positive_int,
+        default=DEFAULT_UI_PORT,
+        help="Local port for the UI host. Defaults to 8765.",
     )
     ui.add_argument(
         "--store-dir",
@@ -601,15 +601,13 @@ def _run_single_shot(args: argparse.Namespace) -> int:
 
 
 def _ui(args: argparse.Namespace) -> int:
-    from wsgiref.simple_server import make_server
+    from .ui_host import serve_ui_host
 
-    app = OvertureUiApp(store_dir=args.store_dir)
-    with make_server(args.host, args.port, app) as server:
-        print(f"Overture UI listening on http://{args.host}:{args.port}/intake")
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            return 0
+    try:
+        serve_ui_host(host=args.host, port=args.port, store_dir=args.store_dir)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     return 0
 
 

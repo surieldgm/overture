@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Idea intake and ticket preparation tools for Overture."
 requires-python = ">=3.11"
 
+[project.optional-dependencies]
+ui = []
+
 [project.scripts]
 overture = "overture.cli:main"
 
