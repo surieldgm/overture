@@ -26,6 +26,16 @@ You can also run the CLI without installing the package by using
 
 ## CLI Usage
 
+Validate a first-run workspace before running the pipeline:
+
+```sh
+LINEAR_API_KEY=<key> python -m overture setup --workspace /tmp/overture-workspace
+```
+
+The setup command reports pass/fail status for environment, write permission,
+and import checks, then creates empty workspace directories under
+`.overture/`. It does not install dependencies or write secrets to disk.
+
 Create an intake record from a raw idea:
 
 ```sh

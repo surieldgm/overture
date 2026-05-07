@@ -35,6 +35,7 @@ from .research_llm import (
     fake_llm_client,
     write_research_result,
 )
+from .setup import render_setup_report, run_setup
 
 
 def _linear_client_factory() -> LinearClient:
@@ -161,6 +162,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="SQLite export ledger path for --export. Defaults to $OVERTURE_HOME/.overture/exports.sqlite.",
+    )
+
+    setup = subparsers.add_parser(
+        "setup",
+        help="Validate first-run environment and create empty workspace directories.",
+    )
+    setup.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help="Workspace root to validate. Defaults to $OVERTURE_HOME or the current directory.",
     )
 
     research = subparsers.add_parser(
@@ -465,6 +477,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "run":
         return _run_single_shot(args)
+
+    if args.command == "setup":
+        workspace = args.workspace if args.workspace is not None else _default_overture_home()
+        report = run_setup(workspace)
+        print(render_setup_report(report), end="")
+        return 0 if report.ok else 1
 
     if args.command == "research":
         intake_path = args.store_dir / "intake" / f"{args.intake_id}.json"
