@@ -25,6 +25,7 @@ from .friction_log import FRICTION_CATEGORIES, FrictionLog
 from .intake import create_intake_record, load_intake_record
 from .linear_client import LinearAPIError, LinearClient
 from .metrics_store import DEFAULT_METRICS_DB_PATH, MetricsStore
+from .milestone_verifier import render_human_report, verify_milestone_config
 from .research_llm import (
     LLMSuggestedSourceAdapter,
     cli_approver,
@@ -300,6 +301,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format. Defaults to table.",
     )
 
+    milestone = subparsers.add_parser(
+        "milestone",
+        help="Verify milestone done conditions from local persisted evidence.",
+    )
+    milestone_subparsers = milestone.add_subparsers(dest="milestone_command", required=True)
+    milestone_verify = milestone_subparsers.add_parser(
+        "verify",
+        help="Report pass/fail status for each declared milestone criterion.",
+    )
+    milestone_verify.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Path to a JSON milestone configuration.",
+    )
+    milestone_verify.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path("."),
+        help="Workspace root for relative config paths. Defaults to the current directory.",
+    )
+    milestone_verify.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format. Defaults to text.",
+    )
+
     return parser
 
 
@@ -380,6 +409,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "friction":
         return _friction(args)
+
+    if args.command == "milestone":
+        return _milestone(args)
 
     parser.print_help(sys.stderr)
     return 2
@@ -536,6 +568,21 @@ def _friction(args: argparse.Namespace) -> int:
         print(_friction_table(entries))
         return 0
 
+    return 2
+
+
+def _milestone(args: argparse.Namespace) -> int:
+    if args.milestone_command == "verify":
+        try:
+            verification = verify_milestone_config(args.config, workspace=args.workspace)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if args.format == "json":
+            print(json.dumps(verification.to_json_dict(), sort_keys=True))
+        else:
+            print(render_human_report(verification))
+        return 0 if verification.passed else 1
     return 2
 
 

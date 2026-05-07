@@ -1,0 +1,30 @@
+{
+  "milestone": "M1 founder dogfooding",
+  "criteria": {
+    "dogfooding_days": {
+      "kind": "dogfooding_days",
+      "target": 5,
+      "metrics_db": ".overture/metrics.sqlite"
+    },
+    "exported_tickets": {
+      "kind": "exported_tickets",
+      "target": 10,
+      "ledger_db": ".overture/exports.sqlite"
+    },
+    "metric_runs": {
+      "kind": "metric_runs",
+      "target": 10,
+      "metrics_db": ".overture/metrics.sqlite"
+    },
+    "friction_entries": {
+      "kind": "friction_entries",
+      "target": 5,
+      "metrics_db": ".overture/metrics.sqlite"
+    },
+    "generated_retro": {
+      "kind": "generated_retro",
+      "target": 1,
+      "paths": [".overture/retro/*.md"]
+    }
+  }
+}
