@@ -387,6 +387,7 @@ def render_ticket_draft(synthesis: SynthesisBrief, graph_context: GraphContext) 
 
     return "\n".join(
         [
+            *_ticket_frontmatter_lines(ticket),
             "# Add Overture end-to-end fixture",
             "",
             "## Context",
@@ -670,6 +671,9 @@ def _graph_context_from_fixture(
                 "Run the test suite and confirm the generated ticket draft passes schema validation.",
             ],
             "readiness": "ready",
+            "sprint_label": "mvp-fixture",
+            "priority": 2,
+            "milestone": "Overture MVP",
             "status": "proposed",
             "created_at": timestamp,
             "updated_at": timestamp,
@@ -805,6 +809,28 @@ def _source_node_ids(graph_context: GraphContext, synthesis: SynthesisBrief) -> 
     current_ids = [str(node["id"]) for node in graph_context.nodes if node.get("id")]
     prior_ids = [f"prior:{concept.id}" for concept in synthesis.connected_concepts if concept.id and concept.from_prior]
     return list(dict.fromkeys((*current_ids, *prior_ids)))
+
+
+def _ticket_frontmatter_lines(ticket: Any) -> tuple[str, ...]:
+    lines = ["---"]
+    sprint_label = str(getattr(ticket, "sprint_label", "") or "").strip()
+    milestone = str(getattr(ticket, "milestone", "") or "").strip()
+    priority = getattr(ticket, "priority", None)
+    if sprint_label:
+        lines.append(f'sprint_label = "{_toml_string(sprint_label)}"')
+    if isinstance(priority, int) and not isinstance(priority, bool):
+        lines.append(f"priority = {priority}")
+    if milestone:
+        lines.append(f'milestone = "{_toml_string(milestone)}"')
+    if len(lines) == 1:
+        return ()
+    lines.append("---")
+    lines.append("")
+    return tuple(lines)
+
+
+def _toml_string(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _confidence_text(value: str | float | None) -> str:

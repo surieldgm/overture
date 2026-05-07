@@ -642,11 +642,20 @@ def _export_ticket(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         print(f"would create: title={parsed.title}")
+        if parsed.metadata.sprint_label:
+            print(f"metadata sprint_label={parsed.metadata.sprint_label}")
+        if parsed.metadata.priority is not None:
+            print(f"metadata priority={parsed.metadata.priority}")
+        if parsed.metadata.milestone:
+            print(f"metadata milestone={parsed.metadata.milestone}")
         print(parsed.description, end="" if parsed.description.endswith("\n") else "\n")
         return 0
 
     if not args.team_id:
         print("missing required Linear team id: pass --team-id or set LINEAR_TEAM_ID", file=sys.stderr)
+        return 2
+    if parsed.metadata.milestone and not args.project_id:
+        print("missing required Linear project id for frontmatter milestone: pass --project-id or set LINEAR_PROJECT_ID", file=sys.stderr)
         return 2
 
     try:
@@ -656,6 +665,9 @@ def _export_ticket(args: argparse.Namespace) -> int:
             title=parsed.title,
             description=parsed.description,
             project_id=args.project_id,
+            priority=parsed.metadata.priority,
+            sprint_label=parsed.metadata.sprint_label,
+            milestone=parsed.metadata.milestone,
         )
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)

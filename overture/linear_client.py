@@ -20,6 +20,22 @@ ISSUE_CREATE_MUTATION = (
     "}"
 )
 
+ISSUE_LABELS_QUERY = (
+    "query IssueLabels($teamId: String!, $name: String!) { "
+    "issueLabels(filter: { team: { id: { eq: $teamId } }, name: { eqIgnoreCase: $name } }, first: 2) { "
+    "nodes { id name } "
+    "} "
+    "}"
+)
+
+PROJECT_MILESTONES_QUERY = (
+    "query ProjectMilestones($projectId: String!, $name: String!) { "
+    "projectMilestones(filter: { project: { id: { eq: $projectId } }, name: { eqIgnoreCase: $name } }, first: 2) { "
+    "nodes { id name } "
+    "} "
+    "}"
+)
+
 
 @dataclass(frozen=True)
 class CreatedIssue:
@@ -78,6 +94,9 @@ class LinearClient:
         title: str,
         description: str,
         project_id: str | None = None,
+        priority: int | None = None,
+        sprint_label: str | None = None,
+        milestone: str | None = None,
     ) -> CreatedIssue:
         issue_input = {
             "teamId": team_id,
@@ -86,6 +105,14 @@ class LinearClient:
         }
         if project_id is not None:
             issue_input["projectId"] = project_id
+        if priority is not None:
+            issue_input["priority"] = priority
+        if sprint_label is not None:
+            issue_input["labelIds"] = [self._resolve_issue_label_id(team_id, sprint_label)]
+        if milestone is not None:
+            if project_id is None:
+                raise LinearAPIError("project id is required when frontmatter includes milestone")
+            issue_input["projectMilestoneId"] = self._resolve_project_milestone_id(project_id, milestone)
 
         response_payload = self._post_graphql(
             {
@@ -115,6 +142,30 @@ class LinearClient:
             )
         except KeyError as exc:
             raise LinearAPIError(f"Linear issue response missing field: {exc.args[0]}") from exc
+
+    def _resolve_issue_label_id(self, team_id: str, name: str) -> str:
+        payload = self._post_graphql(
+            {
+                "query": ISSUE_LABELS_QUERY,
+                "variables": {"teamId": team_id, "name": name},
+            }
+        )
+        errors = _graphql_errors(payload)
+        if errors:
+            raise LinearAPIError(errors[0], errors=errors)
+        return _single_node_id(payload, ("data", "issueLabels", "nodes"), "issue label", name)
+
+    def _resolve_project_milestone_id(self, project_id: str, name: str) -> str:
+        payload = self._post_graphql(
+            {
+                "query": PROJECT_MILESTONES_QUERY,
+                "variables": {"projectId": project_id, "name": name},
+            }
+        )
+        errors = _graphql_errors(payload)
+        if errors:
+            raise LinearAPIError(errors[0], errors=errors)
+        return _single_node_id(payload, ("data", "projectMilestones", "nodes"), "project milestone", name)
 
     def _post_graphql(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
@@ -194,6 +245,24 @@ def _graphql_errors(payload: dict[str, Any]) -> tuple[str, ...]:
         else:
             messages.append(str(error))
     return tuple(messages)
+
+
+def _single_node_id(payload: dict[str, Any], path: tuple[str, ...], kind: str, name: str) -> str:
+    value: Any = payload
+    for segment in path:
+        if not isinstance(value, dict):
+            raise LinearAPIError(f"Linear response missing {kind} lookup nodes")
+        value = value.get(segment)
+    if not isinstance(value, list):
+        raise LinearAPIError(f"Linear response missing {kind} lookup nodes")
+    if len(value) == 0:
+        raise LinearAPIError(f"Linear {kind} not found: {name}")
+    if len(value) > 1:
+        raise LinearAPIError(f"Linear {kind} is ambiguous: {name}")
+    node = value[0]
+    if not isinstance(node, dict) or not isinstance(node.get("id"), str) or not node["id"]:
+        raise LinearAPIError(f"Linear {kind} lookup returned an invalid node")
+    return node["id"]
 
 
 def _retry_after(headers: Any) -> str | None:

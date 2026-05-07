@@ -16,13 +16,26 @@ class StubLinearClient:
     def __init__(self) -> None:
         self.calls = []
 
-    def create_issue(self, *, team_id, title, description, project_id=None):
+    def create_issue(
+        self,
+        *,
+        team_id,
+        title,
+        description,
+        project_id=None,
+        priority=None,
+        sprint_label=None,
+        milestone=None,
+    ):
         self.calls.append(
             {
                 "team_id": team_id,
                 "title": title,
                 "description": description,
                 "project_id": project_id,
+                "priority": priority,
+                "sprint_label": sprint_label,
+                "milestone": milestone,
             }
         )
         return CreatedIssue(
@@ -47,7 +60,9 @@ class ExportE2ETests(unittest.TestCase):
                 with mock.patch.object(cli, "_linear_client_factory", return_value=stub):
                     first_stdout = io.StringIO()
                     with contextlib.redirect_stdout(first_stdout):
-                        first_exit_code = cli.main(["export", str(ticket_path), "--team-id", "team-1"])
+                        first_exit_code = cli.main(
+                            ["export", str(ticket_path), "--team-id", "team-1", "--project-id", "project-1"]
+                        )
 
                     self.assertEqual(first_exit_code, 0, "first export CLI exit code should be 0")
                     self.assertEqual(len(stub.calls), 1, "stub should be called exactly once on first export")
@@ -60,6 +75,9 @@ class ExportE2ETests(unittest.TestCase):
                         stub.calls[0]["description"].startswith("## Context"),
                         "export description should begin with the Context section",
                     )
+                    self.assertEqual(stub.calls[0]["sprint_label"], "mvp-fixture")
+                    self.assertEqual(stub.calls[0]["priority"], 2)
+                    self.assertEqual(stub.calls[0]["milestone"], "Overture MVP")
                     self.assertTrue(ledger_path.exists(), "export ledger DB should be created under OVERTURE_HOME")
                     self.assertIn(
                         "https://linear.app/eria/issue/ERI-999/export-smoke",
@@ -77,7 +95,9 @@ class ExportE2ETests(unittest.TestCase):
 
                     second_stdout = io.StringIO()
                     with contextlib.redirect_stdout(second_stdout):
-                        second_exit_code = cli.main(["export", str(ticket_path), "--team-id", "team-1"])
+                        second_exit_code = cli.main(
+                            ["export", str(ticket_path), "--team-id", "team-1", "--project-id", "project-1"]
+                        )
 
                     self.assertEqual(second_exit_code, 0, "second export CLI exit code should be 0")
                     self.assertEqual(
