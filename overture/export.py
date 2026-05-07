@@ -40,6 +40,7 @@ def parse_ticket_markdown(markdown: str) -> ParsedTicket:
     """Parse and validate ticket Markdown using the export contract."""
 
     metadata, body = parse_ticket_frontmatter(markdown)
+    body = _ticket_body_from_fixture_markdown(body)
 
     lines = body.splitlines()
     title = next((line[2:].strip() for line in lines if line.startswith("# ")), "")
@@ -57,6 +58,15 @@ def parse_ticket_markdown(markdown: str) -> ParsedTicket:
         except ValueError:
             raise ValueError("; ".join(errors)) from None
     return ParsedTicket(title=title, description=description, metadata=metadata)
+
+
+def _ticket_body_from_fixture_markdown(markdown: str) -> str:
+    """Extract the embedded ticket draft from an intake example when present."""
+
+    marker = "\n## Ticket\n"
+    if marker not in markdown:
+        return markdown
+    return markdown.split(marker, 1)[1].lstrip()
 
 
 def parse_ticket_frontmatter(markdown: str) -> tuple[TicketMetadata, str]:

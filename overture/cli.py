@@ -37,6 +37,11 @@ from .research_llm import (
     write_research_result,
 )
 from .setup import render_setup_report, run_setup
+from .ticket_fixture_validation import (
+    default_ticket_fixture_paths,
+    render_ticket_fixture_errors,
+    validate_ticket_fixture_paths,
+)
 from .ui_host import DEFAULT_STORE_DIR, DEFAULT_UI_HOST, DEFAULT_UI_PORT
 
 
@@ -291,6 +296,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="SQLite export ledger path. Defaults to $OVERTURE_HOME/.overture/exports.sqlite.",
+    )
+
+    validate_fixtures = subparsers.add_parser(
+        "validate-ticket-fixtures",
+        help="Validate repository Markdown ticket fixtures for CI.",
+    )
+    validate_fixtures.add_argument(
+        "paths",
+        nargs="*",
+        type=Path,
+        help="Specific Markdown ticket fixtures to validate. Defaults to repository fixtures.",
     )
 
     metrics = subparsers.add_parser(
@@ -606,6 +622,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "export":
         return _export_ticket(args)
 
+    if args.command == "validate-ticket-fixtures":
+        return _validate_ticket_fixtures(args)
+
     if args.command == "metrics":
         return _metrics(args)
 
@@ -694,6 +713,16 @@ def _export_ticket(args: argparse.Namespace) -> int:
     if result.status == "changed":
         return 3
     return 2 if result.message.startswith(("ticket file not found:", "could not read ticket file", "missing required", "LINEAR_API_KEY")) else 1
+
+
+def _validate_ticket_fixtures(args: argparse.Namespace) -> int:
+    paths = tuple(args.paths) if args.paths else default_ticket_fixture_paths()
+    errors = validate_ticket_fixture_paths(paths)
+    if errors:
+        print(render_ticket_fixture_errors(errors), file=sys.stderr)
+        return 1
+    print(f"validated {len(paths)} ticket fixtures")
+    return 0
 
 
 def _metrics(args: argparse.Namespace) -> int:
