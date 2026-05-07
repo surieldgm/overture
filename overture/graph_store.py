@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any
+from typing import Any, Iterable
 
 from .graph import GraphRecord
 from .synthesis import GraphContext
@@ -77,6 +77,15 @@ class SqliteGraphStore:
 
             raise ValueError(f"unsupported graph record kind: {record.kind}")
 
+    def upsert_records(self, records: Iterable[GraphRecord]) -> int:
+        """Insert or update graph records and return the number accepted."""
+
+        count = 0
+        for record in records:
+            self.upsert_record(record)
+            count += 1
+        return count
+
     def load_context(self, limit: int = 100) -> GraphContext:
         """Load recent nodes and every edge touching those nodes."""
 
@@ -111,6 +120,80 @@ class SqliteGraphStore:
             ).fetchall()
 
         return GraphContext(nodes=nodes, edges=tuple(_edge_mapping(row) for row in edge_rows))
+
+    def list_nodes(self, *, kind: str | None = None, limit: int | None = None) -> tuple[dict[str, Any], ...]:
+        """List persisted nodes, optionally restricted by kind."""
+
+        query = "SELECT id, kind, properties, created_at FROM nodes"
+        params: list[Any] = []
+        if kind is not None:
+            query += " WHERE kind = ?"
+            params.append(kind)
+        query += " ORDER BY created_at DESC, id ASC"
+        if limit is not None:
+            if limit < 1:
+                return ()
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return tuple(_node_mapping(row) for row in rows)
+
+    def list_edges(self, *, kind: str | None = None, limit: int | None = None) -> tuple[dict[str, Any], ...]:
+        """List persisted edges, optionally restricted by kind."""
+
+        query = "SELECT from_id, to_id, kind, properties, created_at FROM edges"
+        params: list[Any] = []
+        if kind is not None:
+            query += " WHERE kind = ?"
+            params.append(kind)
+        query += " ORDER BY created_at DESC, from_id ASC, to_id ASC, kind ASC"
+        if limit is not None:
+            if limit < 1:
+                return ()
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return tuple(_edge_mapping(row) for row in rows)
+
+    def iter_records(self) -> tuple[GraphRecord, ...]:
+        """Return every persisted graph record in migration-safe form."""
+
+        records: list[GraphRecord] = []
+        for node in reversed(self.list_nodes()):
+            node_id = str(node["id"])
+            records.append(
+                GraphRecord(
+                    kind=str(node["kind"]),  # type: ignore[arg-type]
+                    key=node_id,
+                    properties=dict(node.get("properties") or {}),
+                )
+            )
+        for edge in reversed(self.list_edges()):
+            from_id = str(edge["from"])
+            to_id = str(edge["to"])
+            kind = str(edge["kind"])
+            properties = dict(edge.get("properties") or {})
+            properties["from"] = from_id
+            properties["to"] = to_id
+            records.append(
+                GraphRecord(
+                    kind=kind,  # type: ignore[arg-type]
+                    key=str(edge.get("id") or f"{from_id}:{kind}:{to_id}"),
+                    properties=properties,
+                )
+            )
+        return tuple(records)
+
+    def table_counts(self) -> dict[str, int]:
+        """Return row counts for migration and integrity checks."""
+
+        with self._connect() as connection:
+            return {
+                "nodes": int(connection.execute("SELECT count(*) FROM nodes").fetchone()[0]),
+                "edges": int(connection.execute("SELECT count(*) FROM edges").fetchone()[0]),
+            }
 
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

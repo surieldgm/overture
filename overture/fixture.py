@@ -13,6 +13,7 @@ from typing import Any, Callable, Mapping, TextIO, TypeVar
 from uuid import uuid4
 
 from .graph import GraphRecord, research_result_to_graph_records
+from .graph_http import GraphHttpClient
 from .graph_store import DEFAULT_GRAPH_DB_PATH, SqliteGraphStore
 from .intake import IntakeRecord, create_intake_record
 from .metrics_store import MetricsStore, StageMetric
@@ -318,7 +319,7 @@ def _run_graph_stage(
     research_result: ResearchResult,
 ) -> tuple[tuple[GraphRecord, ...], GraphContext, GraphContext, Path]:
     graph_records = research_result_to_graph_records(research_result)
-    store = SqliteGraphStore(_graph_store_db_path(graph_store_base_path))
+    store = _open_graph_store(graph_store_base_path)
     prior_context = store.load_context()
     for record in graph_records:
         store.upsert_record(record)
@@ -709,6 +710,12 @@ def _graph_store_db_path(base_path: Path | str | None) -> Path:
     if base_path is None:
         return DEFAULT_GRAPH_DB_PATH
     return Path(base_path) / "graph.sqlite"
+
+
+def _open_graph_store(base_path: Path | str | None) -> SqliteGraphStore | GraphHttpClient:
+    if isinstance(base_path, str) and base_path.startswith(("http://", "https://")):
+        return GraphHttpClient(base_path)
+    return SqliteGraphStore(_graph_store_db_path(base_path))
 
 
 def _write_json(path: Path, value: Any) -> Path:
