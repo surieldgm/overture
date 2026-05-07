@@ -43,6 +43,27 @@ class ReworkMetric:
     occurred_at: str
 
 
+@dataclass(frozen=True)
+class TicketMetric:
+    ticket_id: str
+    author_id: str | None = None
+    author_email: str | None = None
+    sprint_label: str | None = None
+    milestone: str | None = None
+    rework_count: int = 0
+
+
+@dataclass(frozen=True)
+class ReworkSignal:
+    signal_id: str
+    ticket_id: str
+    detected_at: str
+    author_id: str | None = None
+    author_email: str | None = None
+    sprint_label: str | None = None
+    milestone: str | None = None
+
+
 class MetricsStore:
     """Persist per-stage timing metrics for Overture pipeline runs."""
 
@@ -91,6 +112,192 @@ class MetricsStore:
                     metric.author_email,
                 ),
             )
+
+    def record_ticket(self, ticket: TicketMetric) -> None:
+        ticket_id = _required_text(ticket.ticket_id, "ticket_id")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ticket_rework_counters (
+                    ticket_id,
+                    author_id,
+                    author_email,
+                    sprint_label,
+                    milestone,
+                    rework_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticket_id) DO UPDATE SET
+                    author_id = COALESCE(excluded.author_id, ticket_rework_counters.author_id),
+                    author_email = COALESCE(excluded.author_email, ticket_rework_counters.author_email),
+                    sprint_label = COALESCE(excluded.sprint_label, ticket_rework_counters.sprint_label),
+                    milestone = COALESCE(excluded.milestone, ticket_rework_counters.milestone),
+                    rework_count = ticket_rework_counters.rework_count + excluded.rework_count
+                """,
+                (
+                    ticket_id,
+                    _optional_text(ticket.author_id),
+                    _optional_text(ticket.author_email),
+                    _optional_text(ticket.sprint_label),
+                    _optional_text(ticket.milestone),
+                    ticket.rework_count,
+                ),
+            )
+
+    def record_rework_signal(self, signal: ReworkSignal) -> bool:
+        """Persist a classifier signal and increment its ticket once.
+
+        Returns True when a new signal id was recorded and False when the signal
+        id had already been seen.
+        """
+
+        signal_id = _required_text(signal.signal_id, "signal_id")
+        ticket_id = _required_text(signal.ticket_id, "ticket_id")
+        _required_text(signal.detected_at, "detected_at")
+
+        with self._connect() as connection:
+            self._ensure_ticket_for_signal(connection, signal)
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO rework_signals (
+                    signal_id,
+                    ticket_id,
+                    detected_at,
+                    author_id,
+                    author_email,
+                    sprint_label,
+                    milestone
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    signal_id,
+                    ticket_id,
+                    signal.detected_at,
+                    _optional_text(signal.author_id),
+                    _optional_text(signal.author_email),
+                    _optional_text(signal.sprint_label),
+                    _optional_text(signal.milestone),
+                ),
+            )
+            if cursor.rowcount == 0:
+                return False
+
+            connection.execute(
+                """
+                UPDATE ticket_rework_counters
+                SET rework_count = rework_count + 1
+                WHERE ticket_id = ?
+                """,
+                (ticket_id,),
+            )
+            return True
+
+    def iter_ticket_rework_counters(self) -> Iterator[TicketMetric]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT ticket_id, author_id, author_email, sprint_label, milestone, rework_count
+                FROM ticket_rework_counters
+                ORDER BY ticket_id
+                """
+            ).fetchall()
+
+        for row in rows:
+            yield _ticket_metric_from_row(row)
+
+    def rework_counts_by_author(
+        self, *, milestone: str | None = None
+    ) -> dict[str, int] | dict[str, dict[str, str | int | None]]:
+        if milestone is None:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT author_id, count(*) AS count
+                    FROM rework_metrics
+                    GROUP BY author_id
+                    ORDER BY author_id
+                    """
+                ).fetchall()
+            return {str(row["author_id"]): int(row["count"]) for row in rows}
+
+        milestone = _required_text(milestone, "milestone")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    COALESCE(NULLIF(author_id, ''), 'unknown author') AS author_key,
+                    CASE
+                        WHEN author_id IS NULL OR author_id = '' THEN NULL
+                        ELSE author_email
+                    END AS author_email,
+                    SUM(rework_count) AS rework_count
+                FROM ticket_rework_counters
+                WHERE milestone = ?
+                GROUP BY author_key, author_email
+                HAVING rework_count > 0
+                ORDER BY author_key
+                """,
+                (milestone,),
+            ).fetchall()
+
+        return {
+            row["author_key"]: {
+                "author_email": row["author_email"],
+                "rework_count": int(row["rework_count"]),
+            }
+            for row in rows
+        }
+
+    def rework_rate_by_sprint_label(self) -> dict[str, dict[str, float | int]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    COALESCE(NULLIF(sprint_label, ''), 'unknown sprint') AS sprint_key,
+                    SUM(rework_count) AS rework_count,
+                    COUNT(*) AS total_tickets
+                FROM ticket_rework_counters
+                GROUP BY sprint_key
+                ORDER BY sprint_key
+                """
+            ).fetchall()
+
+        return {
+            row["sprint_key"]: {
+                "rework_count": int(row["rework_count"]),
+                "total_tickets": int(row["total_tickets"]),
+                "rework_rate": int(row["rework_count"]) / int(row["total_tickets"]),
+            }
+            for row in rows
+        }
+
+    def _ensure_ticket_for_signal(self, connection: sqlite3.Connection, signal: ReworkSignal) -> None:
+        connection.execute(
+            """
+            INSERT INTO ticket_rework_counters (
+                ticket_id,
+                author_id,
+                author_email,
+                sprint_label,
+                milestone,
+                rework_count
+            )
+            VALUES (?, ?, ?, ?, ?, 0)
+            ON CONFLICT(ticket_id) DO UPDATE SET
+                author_id = COALESCE(ticket_rework_counters.author_id, excluded.author_id),
+                author_email = COALESCE(ticket_rework_counters.author_email, excluded.author_email),
+                sprint_label = COALESCE(ticket_rework_counters.sprint_label, excluded.sprint_label),
+                milestone = COALESCE(ticket_rework_counters.milestone, excluded.milestone)
+            """,
+            (
+                _required_text(signal.ticket_id, "ticket_id"),
+                _optional_text(signal.author_id),
+                _optional_text(signal.author_email),
+                _optional_text(signal.sprint_label),
+                _optional_text(signal.milestone),
+            ),
+        )
 
     def iter_stages(self, limit: int | None = None) -> Iterator[StageMetric]:
         query = """
@@ -226,18 +433,6 @@ class MetricsStore:
                 ),
             )
 
-    def rework_counts_by_author(self) -> dict[str, int]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT author_id, count(*) AS count
-                FROM rework_metrics
-                GROUP BY author_id
-                ORDER BY author_id
-                """
-            ).fetchall()
-        return {str(row["author_id"]): int(row["count"]) for row in rows}
-
     def iter_rework_metrics(self) -> Iterator[ReworkMetric]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -307,6 +502,44 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ticket_rework_counters (
+            ticket_id TEXT PRIMARY KEY,
+            author_id TEXT,
+            author_email TEXT,
+            sprint_label TEXT,
+            milestone TEXT,
+            rework_count INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rework_signals (
+            signal_id TEXT PRIMARY KEY,
+            ticket_id TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            author_id TEXT,
+            author_email TEXT,
+            sprint_label TEXT,
+            milestone TEXT,
+            FOREIGN KEY(ticket_id) REFERENCES ticket_rework_counters(ticket_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ticket_rework_counters_milestone_author
+        ON ticket_rework_counters(milestone, author_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_ticket_rework_counters_sprint
+        ON ticket_rework_counters(sprint_label)
+        """
+    )
 
 
 def _metric_from_row(row: sqlite3.Row) -> StageMetric:
@@ -335,6 +568,29 @@ def _rework_metric_from_row(row: sqlite3.Row) -> ReworkMetric:
         to_state=row["to_state"],
         occurred_at=row["occurred_at"],
     )
+
+
+def _ticket_metric_from_row(row: sqlite3.Row) -> TicketMetric:
+    return TicketMetric(
+        ticket_id=row["ticket_id"],
+        author_id=row["author_id"],
+        author_email=row["author_email"],
+        sprint_label=row["sprint_label"],
+        milestone=row["milestone"],
+        rework_count=row["rework_count"],
+    )
+
+
+def _required_text(value: str | None, field_name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    return text
+
+
+def _optional_text(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    return text or None
 
 
 def _parse_iso_timestamp(value: str) -> datetime:
