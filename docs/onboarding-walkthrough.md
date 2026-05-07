@@ -7,9 +7,7 @@ the repository stays clean.
 
 For inspiration before writing your own idea, skim the curated examples library:
 
-- [Linear issue draft example](../examples/overture_mvp_linear_issue_draft.md)
-- [Curated research validation example](../examples/validate_curated_research.py)
-- [Two-intake loop validation example](../examples/validate_two_intake_loop.py)
+- [Curated intake examples](../examples/intake_examples/README.md)
 
 ## 1. Setup
 
