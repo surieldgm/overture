@@ -24,6 +24,11 @@ python -m pip install -e .
 You can also run the CLI without installing the package by using
 `python -m overture` from the repository root.
 
+First-time non-technical operators should start with the
+[First-Time Operator Walkthrough](docs/onboarding-walkthrough.md), which covers
+setup, intake, research approval, brief review, ticket review, and export in
+order.
+
 ## CLI Usage
 
 Create an intake record from a raw idea:
