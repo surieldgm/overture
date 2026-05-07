@@ -23,6 +23,12 @@ from .intake import IntakeRecord, create_intake_record, load_intake_record
 from .export import parse_ticket_file
 from .export_runner import ExportRunResult, run_ticket_export
 from .linear_client import LinearClient
+from .peer_onboarding import (
+    PEER_ONBOARDING_ROUTE,
+    PeerOnboardingArtifact,
+    load_designer_one_peer_onboarding_artifact,
+    validate_designer_one_peer_onboarding_artifact,
+)
 from .research import CuratedSource, ResearchClaim, ResearchError, ResearchItem, ResearchResult, SourceReference, _normalize_source
 from .research_llm import (
     LLMSuggestedSourceAdapter,
@@ -107,6 +113,7 @@ AUTHENTICATED_WIZARD_PATHS = {
     SYNTHESIS_ROUTE,
     TICKET_REVIEW_ROUTE,
     "/export",
+    PEER_ONBOARDING_ROUTE,
 }
 
 
@@ -276,6 +283,12 @@ class OvertureUiApp:
             return self._handle_export_get(environ, start_response)
         if path == "/export" and method == "POST":
             return self._handle_export_post(environ, start_response)
+        if path == PEER_ONBOARDING_ROUTE and method == "GET":
+            store = SqliteGraphStore(Path(self.store_dir) / "graph.sqlite")
+            artifact = load_designer_one_peer_onboarding_artifact(store)
+            errors = validate_designer_one_peer_onboarding_artifact(artifact)
+            status = "500 Internal Server Error" if errors else "200 OK"
+            return self._render(start_response, render_peer_onboarding_artifact_page(artifact, errors=errors), status=status)
         if path == "/examples/intake_examples" and method == "GET":
             return self._render(start_response, render_examples_library())
         if path in ROUTES_BY_PATH and method == "GET":
@@ -1379,6 +1392,66 @@ def render_examples_library() -> str:
         </section>
         """,
     )
+
+
+def render_peer_onboarding_artifact_page(artifact: PeerOnboardingArtifact, *, errors: Iterable[str] = ()) -> str:
+    error_items = "".join(f"<li>{html.escape(error)}</li>" for error in errors)
+    error_markup = f'<div class="validation" role="alert"><ul>{error_items}</ul></div>' if error_items else ""
+    section_markup = []
+    for section in artifact.sections:
+        bullets = section.get("bullets")
+        bullet_markup = ""
+        if isinstance(bullets, list) and bullets:
+            bullet_markup = "<ul>" + "".join(f"<li>{html.escape(str(item))}</li>" for item in bullets) + "</ul>"
+        examples = section.get("examples")
+        example_markup = ""
+        if isinstance(examples, list) and examples:
+            example_markup = '<ol class="source-list">' + "".join(_peer_example_markup(example) for example in examples) + "</ol>"
+        section_markup.append(
+            f"""
+            <section class="brief-section">
+              <h3>{html.escape(str(section.get("title") or ""))}</h3>
+              <p>{html.escape(str(section.get("body") or ""))}</p>
+              {bullet_markup}
+              {example_markup}
+            </section>
+            """
+        )
+    source_nodes = ", ".join(f"<code>{html.escape(node)}</code>" for node in artifact.source_nodes)
+    return render_layout(
+        title=artifact.title,
+        active_path=None,
+        content=f"""
+        <section class="workspace">
+          <h2>{html.escape(artifact.title)}</h2>
+          <p>Author: <code>{html.escape(artifact.author_id)}</code> &lt;{html.escape(artifact.author_email)}&gt;</p>
+          <p>Template: <code>{html.escape(artifact.template_id)}</code></p>
+          {error_markup}
+          {''.join(section_markup)}
+          <section class="brief-section">
+            <h3>Graph sources</h3>
+            <p>{source_nodes}</p>
+          </section>
+        </section>
+        """,
+    )
+
+
+def _peer_example_markup(example: object) -> str:
+    payload = example if isinstance(example, Mapping) else {}
+    href = str(payload.get("href") or "")
+    title = str(payload.get("title") or href)
+    raw_intake = str(payload.get("raw_intake") or "")
+    why = str(payload.get("why_it_helped") or "")
+    return f"""
+    <li class="source-option">
+      <div>
+        <h3><a href="/{html.escape(href)}">{html.escape(title)}</a></h3>
+        <p><strong>Original intake:</strong> {html.escape(raw_intake)}</p>
+        <p>{html.escape(why)}</p>
+      </div>
+    </li>
+    """
 
 
 def render_not_found(path: str) -> str:
