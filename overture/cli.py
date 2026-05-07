@@ -26,6 +26,7 @@ from .intake import create_intake_record, load_intake_record
 from .linear_client import LinearAPIError, LinearClient
 from .metrics_store import DEFAULT_METRICS_DB_PATH, MetricsStore
 from .milestone_verifier import render_human_report, verify_milestone_config
+from .retro_generator import DEFAULT_RETRO_OUTPUT_PATH, generate_retro_document
 from .research_llm import (
     LLMSuggestedSourceAdapter,
     cli_approver,
@@ -329,6 +330,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format. Defaults to text.",
     )
 
+    retro = subparsers.add_parser(
+        "retro",
+        help="Generate a milestone retrospective Markdown document.",
+    )
+    retro.add_argument(
+        "--db-path",
+        type=Path,
+        default=DEFAULT_METRICS_DB_PATH,
+        help="SQLite metrics DB path. Defaults to .overture/metrics.sqlite.",
+    )
+    retro.add_argument(
+        "--milestone",
+        required=True,
+        help="Milestone label for the generated document, for example M1.",
+    )
+    retro.add_argument(
+        "--started-at",
+        required=True,
+        help="Inclusive milestone window start timestamp in ISO-8601 format.",
+    )
+    retro.add_argument(
+        "--completed-at",
+        required=True,
+        help="Inclusive milestone window end timestamp in ISO-8601 format.",
+    )
+    retro.add_argument(
+        "--output-path",
+        type=Path,
+        default=DEFAULT_RETRO_OUTPUT_PATH,
+        help="Markdown output path. Defaults to .overture/retros/milestone-retro.md.",
+    )
+
     return parser
 
 
@@ -412,6 +445,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "milestone":
         return _milestone(args)
+
+    if args.command == "retro":
+        return _retro(args)
 
     parser.print_help(sys.stderr)
     return 2
@@ -584,6 +620,22 @@ def _milestone(args: argparse.Namespace) -> int:
             print(render_human_report(verification))
         return 0 if verification.passed else 1
     return 2
+
+
+def _retro(args: argparse.Namespace) -> int:
+    try:
+        path = generate_retro_document(
+            db_path=args.db_path,
+            output_path=args.output_path,
+            milestone=args.milestone,
+            started_at=args.started_at,
+            completed_at=args.completed_at,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(path)
+    return 0
 
 
 def _resolve_friction_run_id(log: FrictionLog, run_id: str) -> str | None:
