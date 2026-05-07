@@ -20,6 +20,8 @@ class IntakeRecord:
     created_at: str
     source_type: str
     normalized_summary: str
+    author_id: str | None = None
+    author_email: str | None = None
 
 
 def create_intake_record(
@@ -27,6 +29,8 @@ def create_intake_record(
     store_dir: Path | str = Path(".overture") / "intake",
     *,
     source_type: str = "cli",
+    author_id: str | None = None,
+    author_email: str | None = None,
 ) -> tuple[IntakeRecord, Path]:
     normalized_summary = normalize_summary(raw_text)
     if not normalized_summary:
@@ -39,6 +43,8 @@ def create_intake_record(
         created_at=created_at,
         source_type=source_type,
         normalized_summary=normalized_summary,
+        author_id=author_id,
+        author_email=author_email,
     )
 
     target_dir = Path(store_dir)
@@ -56,6 +62,8 @@ def load_intake_record(path: Path | str) -> IntakeRecord:
         created_at=payload["created_at"],
         source_type=payload["source_type"],
         normalized_summary=payload["normalized_summary"],
+        author_id=payload.get("author_id"),
+        author_email=payload.get("author_email"),
     )
 
 
