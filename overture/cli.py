@@ -10,6 +10,7 @@ Metrics table output assumes the canonical fixture stage names fit in a
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import inspect
 import json
 import os
@@ -20,6 +21,7 @@ from typing import Sequence
 from .export import parse_ticket_file
 from .export_store import ExportLedger, compute_hash
 from .fixture import PIPELINE_STAGES, PipelineStageError, run_overture_fixture
+from .friction_log import FRICTION_CATEGORIES, FrictionLog
 from .intake import create_intake_record, load_intake_record
 from .linear_client import LinearAPIError, LinearClient
 from .metrics_store import DEFAULT_METRICS_DB_PATH, MetricsStore
@@ -233,6 +235,71 @@ def build_parser() -> argparse.ArgumentParser:
         help="Restrict summary to the last N distinct runs by started_at.",
     )
 
+    friction = subparsers.add_parser(
+        "friction",
+        help="Append or query dogfooding friction notes.",
+    )
+    friction_subparsers = friction.add_subparsers(dest="friction_command", required=True)
+
+    friction_append = friction_subparsers.add_parser(
+        "append",
+        help="Append one friction note for a session and run.",
+    )
+    friction_append.add_argument(
+        "--db-path",
+        type=Path,
+        default=DEFAULT_METRICS_DB_PATH,
+        help="SQLite metrics DB path. Defaults to .overture/metrics.sqlite.",
+    )
+    friction_append.add_argument(
+        "--session-id",
+        required=True,
+        help="Dogfooding session identifier, for example day-1.",
+    )
+    friction_append.add_argument(
+        "--run-id",
+        required=True,
+        help='Run identifier to reference. Use "latest" for the most recent metrics run.',
+    )
+    friction_append.add_argument(
+        "--category",
+        required=True,
+        choices=FRICTION_CATEGORIES,
+        help="Operator-selected friction category.",
+    )
+    friction_append.add_argument(
+        "--note",
+        required=True,
+        help="Free-text friction note.",
+    )
+
+    friction_list = friction_subparsers.add_parser(
+        "list",
+        help="List friction notes, optionally filtered by session and run.",
+    )
+    friction_list.add_argument(
+        "--db-path",
+        type=Path,
+        default=DEFAULT_METRICS_DB_PATH,
+        help="SQLite metrics DB path. Defaults to .overture/metrics.sqlite.",
+    )
+    friction_list.add_argument(
+        "--session-id",
+        default=None,
+        help="Only include entries for this dogfooding session.",
+    )
+    friction_list.add_argument(
+        "--run-id",
+        default=None,
+        help='Only include entries for this run. Use "latest" for the most recent metrics run.',
+    )
+    friction_list.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default="table",
+        help="Output format. Defaults to table.",
+    )
+
     return parser
 
 
@@ -310,6 +377,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "metrics":
         return _metrics(args)
+
+    if args.command == "friction":
+        return _friction(args)
 
     parser.print_help(sys.stderr)
     return 2
@@ -432,6 +502,49 @@ def _metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def _friction(args: argparse.Namespace) -> int:
+    log = FrictionLog(args.db_path)
+    if args.friction_command == "append":
+        run_id = _resolve_friction_run_id(log, args.run_id)
+        if run_id is None:
+            print("no metrics runs recorded yet", file=sys.stderr)
+            return 1
+        try:
+            entry = log.append(
+                session_id=args.session_id,
+                run_id=run_id,
+                category=args.category,
+                note=args.note,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(f"friction entry {entry.id}: {entry.run_id} {entry.category}")
+        return 0
+
+    if args.friction_command == "list":
+        run_id = None
+        if args.run_id is not None:
+            run_id = _resolve_friction_run_id(log, args.run_id)
+            if run_id is None:
+                print("no metrics runs recorded yet", file=sys.stderr)
+                return 1
+        entries = list(log.iter_entries(session_id=args.session_id, run_id=run_id))
+        if args.format == "json":
+            print(json.dumps([asdict(entry) for entry in entries], sort_keys=True))
+            return 0
+        print(_friction_table(entries))
+        return 0
+
+    return 2
+
+
+def _resolve_friction_run_id(log: FrictionLog, run_id: str) -> str | None:
+    if run_id == "latest":
+        return log.latest_run_id()
+    return run_id
+
+
 def _metrics_table(summary: dict[str, dict[str, float | int]]) -> str:
     widths = {
         "stage": 12,
@@ -462,6 +575,44 @@ def _format_metrics_row(values: dict[str, str], widths: dict[str, int]) -> str:
         f"{values['median_ms']:>{widths['median_ms']}} "
         f"{values['p95_ms']:>{widths['p95_ms']}} "
         f"{values['success_rate']:>{widths['success_rate']}}"
+    ).rstrip()
+
+
+def _friction_table(entries) -> str:
+    widths = {
+        "id": 4,
+        "session": 14,
+        "run_id": 12,
+        "category": 10,
+        "note": 48,
+    }
+    headers = {
+        "id": "id",
+        "session": "session",
+        "run_id": "run_id",
+        "category": "category",
+        "note": "note",
+    }
+    lines = [_format_friction_row(headers, widths)]
+    for entry in entries:
+        values = {
+            "id": str(entry.id),
+            "session": entry.session_id[: widths["session"]],
+            "run_id": entry.run_id[: widths["run_id"]],
+            "category": entry.category,
+            "note": entry.note[: widths["note"]],
+        }
+        lines.append(_format_friction_row(values, widths))
+    return "\n".join(lines)
+
+
+def _format_friction_row(values: dict[str, str], widths: dict[str, int]) -> str:
+    return (
+        f"{values['id']:>{widths['id']}} "
+        f"{values['session']:<{widths['session']}} "
+        f"{values['run_id']:<{widths['run_id']}} "
+        f"{values['category']:<{widths['category']}} "
+        f"{values['note']:<{widths['note']}}"
     ).rstrip()
 
 
