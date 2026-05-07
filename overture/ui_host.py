@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+from socketserver import ThreadingMixIn
 from typing import Callable, Iterable, Mapping
 from urllib.parse import parse_qs
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
@@ -49,6 +50,8 @@ SESSION_TICKET_MARKDOWN_KEY = "ticket_markdown"
 SESSION_TICKET_PATH_KEY = "ticket_path"
 SESSION_TICKET_TITLE_KEY = "ticket_title"
 SESSION_TICKET_BODY_KEY = "ticket_body"
+SESSION_AUTHOR_ID_KEY = "author_id"
+SESSION_AUTHOR_EMAIL_KEY = "author_email"
 AUTH_LOGIN_ROUTE = "/auth/login"
 AUTH_MAGIC_LINK_ROUTE = "/auth/magic-link"
 AUTH_CONSUME_ROUTE = "/auth/consume"
@@ -163,8 +166,10 @@ class SessionStore:
         return new_session_id, session, True
 
 
-class LoopbackOnlyWSGIServer(WSGIServer):
+class LoopbackOnlyWSGIServer(ThreadingMixIn, WSGIServer):
     """WSGI server that accepts only loopback clients."""
+
+    daemon_threads = True
 
     def verify_request(self, request: object, client_address: tuple[str, int]) -> bool:
         try:
@@ -186,6 +191,7 @@ class OvertureUiApp:
         llm_client: Callable[[str], str] = fake_llm_client,
         synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
         linear_client_factory: Callable[[], object] | None = None,
+        graph_backend: object | None = None,
         auth_manager: MagicLinkAuth | None = None,
     ) -> None:
         self.store_dir = Path(store_dir)
@@ -193,6 +199,7 @@ class OvertureUiApp:
         self.llm_client = llm_client
         self.synthesizer = synthesizer
         self.linear_client_factory = linear_client_factory or _linear_client_from_env
+        self.graph_backend = graph_backend
         self.auth_manager = auth_manager or MagicLinkAuth(sender=sender_from_env(self.store_dir))
         self._active_auth_session: DesignerSession | None = None
 
@@ -378,6 +385,7 @@ class OvertureUiApp:
             session_from_environ(environ, user=_require_user(environ)),
             self.store_dir,
             synthesizer=self.synthesizer,
+            graph_backend=self.graph_backend,
             user=_require_user(environ),
         )
         return self._render(
@@ -552,6 +560,7 @@ def build_ui_server(
     llm_client: Callable[[str], str] = fake_llm_client,
     synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
     linear_client_factory: Callable[[], object] | None = None,
+    graph_backend: object | None = None,
     auth_manager: MagicLinkAuth | None = None,
 ) -> LoopbackOnlyWSGIServer:
     _ensure_loopback_bind_host(host)
@@ -561,6 +570,7 @@ def build_ui_server(
         llm_client=llm_client,
         synthesizer=synthesizer,
         linear_client_factory=linear_client_factory,
+        graph_backend=graph_backend,
         auth_manager=auth,
     )
     server = make_server(
@@ -584,6 +594,7 @@ def serve_ui_host(
     llm_client: Callable[[str], str] = fake_llm_client,
     synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
     linear_client_factory: Callable[[], object] | None = None,
+    graph_backend: object | None = None,
     auth_manager: MagicLinkAuth | None = None,
 ) -> None:
     server = build_ui_server(
@@ -593,6 +604,7 @@ def serve_ui_host(
         llm_client=llm_client,
         synthesizer=synthesizer,
         linear_client_factory=linear_client_factory,
+        graph_backend=graph_backend,
         auth_manager=auth_manager,
     )
     bound_host, bound_port = server.server_address[:2]
@@ -617,6 +629,8 @@ def submit_intake(
         raw_text,
         Path(store_dir) / "intake",
         source_type="ui",
+        author_id=session.get(SESSION_AUTHOR_ID_KEY) if session else None,
+        author_email=session.get(SESSION_AUTHOR_EMAIL_KEY) if session else None,
     )
     _tag_json_file(_path, user)
     next_session = _session_for_user(session or {}, user)
@@ -712,6 +726,7 @@ def prepare_synthesis_review(
     store_dir: Path | str,
     *,
     synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
+    graph_backend: object | None = None,
     user: AuthenticatedUser | None = None,
 ) -> SynthesisReviewResult:
     intake_id = session.get("intake_id", "")
@@ -744,7 +759,8 @@ def prepare_synthesis_review(
 
     current_context = _synthesis_context_from_intake_research(intake, research, user=user)
     graph_store = SqliteGraphStore(Path(store_dir) / "graph.sqlite")
-    prior_context = graph_store.load_context()
+    writable_graph = graph_backend if graph_backend is not None else graph_store
+    prior_context = writable_graph.load_context()
     brief = synthesizer(current_context, prior_context=prior_context).to_dict()
     if user is not None:
         brief["author_id"] = user.user_id
@@ -752,7 +768,7 @@ def prepare_synthesis_review(
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(brief, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if user is not None:
-        graph_store.upsert_records(_graph_records_from_context(current_context, user))
+        writable_graph.upsert_records(_graph_records_from_context(current_context, user))
 
     next_session = dict(session)
     next_session["synthesis_id"] = intake_id
@@ -796,7 +812,7 @@ def prepare_ticket_review(session: dict[str, str], *, user: AuthenticatedUser | 
     except (TypeError, ValueError, IndexError, json.JSONDecodeError) as exc:
         return TicketReviewResult(session=next_session, error=f"Could not generate ticket draft: {exc}")
 
-    next_session[SESSION_TICKET_MARKDOWN_KEY] = draft.description
+    next_session[SESSION_TICKET_MARKDOWN_KEY] = _ticket_markdown_with_author(draft.description, next_session)
     return TicketReviewResult(session=next_session, markdown=draft.description)
 
 
@@ -1643,6 +1659,35 @@ def _research_result_from_json(payload: Mapping[str, object]) -> ResearchResult:
                 )
             )
     return ResearchResult(intake_id=_optional_text(payload.get("intake_id")), items=tuple(items), errors=tuple(errors))
+
+
+def _author_identity(session: Mapping[str, str]) -> dict[str, str]:
+    author_id = str(session.get("author_id") or session.get("user_id") or "").strip()
+    author_email = str(session.get("author_email") or session.get("user_email") or "").strip()
+    identity: dict[str, str] = {}
+    if author_id:
+        identity["author_id"] = author_id
+    if author_email:
+        identity["author_email"] = author_email
+    return identity
+
+
+def _with_author_identity(payload: Mapping[str, object], session: Mapping[str, str]) -> dict[str, object]:
+    next_payload = dict(payload)
+    identity = _author_identity(session)
+    if identity:
+        next_payload.update(identity)
+    return next_payload
+
+
+def _ticket_markdown_with_author(markdown: str, session: Mapping[str, str]) -> str:
+    identity = _author_identity(session)
+    if not identity:
+        return markdown
+    author_lines = "\n".join(f"<!-- {key}: {value} -->" for key, value in sorted(identity.items()))
+    if "\n## " in markdown:
+        return markdown.replace("\n## ", f"\n{author_lines}\n\n## ", 1)
+    return f"{markdown.rstrip()}\n\n{author_lines}\n"
 
 
 def _synthesis_context_from_intake_research(
