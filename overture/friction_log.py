@@ -21,6 +21,7 @@ class FrictionEntry:
     category: str
     note: str
     created_at: str
+    confirmed: bool = False
 
 
 class FrictionLog:
@@ -39,6 +40,7 @@ class FrictionLog:
         category: str,
         note: str,
         created_at: str | None = None,
+        confirmed: bool = False,
     ) -> FrictionEntry:
         session_id = _require_text(session_id, "session_id")
         run_id = _require_text(run_id, "run_id")
@@ -50,10 +52,10 @@ class FrictionLog:
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO friction_entries (session_id, run_id, category, note, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO friction_entries (session_id, run_id, category, note, created_at, confirmed)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, run_id, category, note, timestamp),
+                (session_id, run_id, category, note, timestamp, int(confirmed)),
             )
             entry_id = int(cursor.lastrowid)
 
@@ -64,13 +66,38 @@ class FrictionLog:
             category=category,
             note=note,
             created_at=timestamp,
+            confirmed=confirmed,
         )
+
+    def confirm(self, entry_id: int) -> FrictionEntry:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE friction_entries
+                SET confirmed = 1
+                WHERE id = ?
+                """,
+                (entry_id,),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"friction entry not found: {entry_id}")
+            row = connection.execute(
+                """
+                SELECT id, session_id, run_id, category, note, created_at, confirmed
+                FROM friction_entries
+                WHERE id = ?
+                """,
+                (entry_id,),
+            ).fetchone()
+
+        return _entry_from_row(row)
 
     def iter_entries(
         self,
         *,
         session_id: str | None = None,
         run_id: str | None = None,
+        confirmed: bool | None = None,
     ) -> Iterator[FrictionEntry]:
         conditions: list[str] = []
         parameters: list[str] = []
@@ -80,9 +107,12 @@ class FrictionLog:
         if run_id is not None:
             conditions.append("run_id = ?")
             parameters.append(run_id)
+        if confirmed is not None:
+            conditions.append("confirmed = ?")
+            parameters.append(str(int(confirmed)))
 
         query = """
-            SELECT id, session_id, run_id, category, note, created_at
+            SELECT id, session_id, run_id, category, note, created_at, confirmed
             FROM friction_entries
         """
         if conditions:
@@ -137,6 +167,12 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(friction_entries)").fetchall()
+    }
+    if "confirmed" not in columns:
+        connection.execute("ALTER TABLE friction_entries ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
     connection.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_friction_entries_session_run
@@ -149,6 +185,12 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         ON friction_entries (run_id, created_at)
         """
     )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_friction_entries_confirmed
+        ON friction_entries (confirmed, created_at)
+        """
+    )
 
 
 def _entry_from_row(row: sqlite3.Row) -> FrictionEntry:
@@ -159,6 +201,7 @@ def _entry_from_row(row: sqlite3.Row) -> FrictionEntry:
         category=row["category"],
         note=row["note"],
         created_at=row["created_at"],
+        confirmed=bool(row["confirmed"]),
     )
 
 
