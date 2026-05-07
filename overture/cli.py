@@ -603,7 +603,8 @@ def _run_single_shot(args: argparse.Namespace) -> int:
 def _ui(args: argparse.Namespace) -> int:
     from wsgiref.simple_server import make_server
 
-    app = OvertureUiApp(store_dir=args.store_dir)
+    llm_client = fake_llm_client if os.environ.get("OVERTURE_LLM_CLIENT") == "fake" else codex_cli_client
+    app = OvertureUiApp(store_dir=args.store_dir, llm_client=llm_client)
     with make_server(args.host, args.port, app) as server:
         print(f"Overture UI listening on http://{args.host}:{args.port}/intake")
         try:
