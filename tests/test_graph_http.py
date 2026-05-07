@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -5,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from overture.fixture import run_overture_fixture
@@ -89,15 +92,65 @@ class GraphHttpTests(unittest.TestCase):
             with sqlite3.connect(server.db_path) as connection:
                 self.assertEqual(connection.execute("SELECT count(*) FROM nodes").fetchone()[0], 100)
 
+    def test_linear_webhook_rejects_missing_signature(self) -> None:
+        with _running_server(linear_webhook_secret="secret") as server:
+            with self.assertRaises(HTTPError) as raised:
+                _post_json(server.base_url, "/linear/webhook", _linear_issue_payload())
+
+            self.assertEqual(raised.exception.code, 401)
+            events = _get_json(server.base_url, "/linear/webhook/events")["events"]
+            self.assertEqual(events, [])
+
+    def test_linear_webhook_rejects_wrong_signature(self) -> None:
+        with _running_server(linear_webhook_secret="secret") as server:
+            with self.assertRaises(HTTPError) as raised:
+                _post_linear_webhook(server.base_url, _linear_issue_payload(), signature="bad")
+
+            self.assertEqual(raised.exception.code, 401)
+            events = _get_json(server.base_url, "/linear/webhook/events")["events"]
+            self.assertEqual(events, [])
+
+    def test_linear_webhook_accepts_signature_and_persists_normalized_shape(self) -> None:
+        with _running_server(linear_webhook_secret="secret") as server:
+            response = _post_linear_webhook(server.base_url, _linear_issue_payload(), secret="secret")
+
+            self.assertEqual(response, {"accepted": 1, "duplicate": False})
+            events = _get_json(server.base_url, "/linear/webhook/events")["events"]
+            self.assertEqual(len(events), 1)
+            event = events[0]
+            self.assertEqual(event["event_id"], "delivery-1")
+            self.assertEqual(event["timestamp"], "2026-05-07T18:00:00.000Z")
+            self.assertEqual(event["issue_id"], "issue-1")
+            self.assertEqual(event["previous_status"], "Todo")
+            self.assertEqual(event["new_status"], "In Progress")
+            self.assertEqual(event["actor"]["id"], "user-1")
+            self.assertEqual(event["actor"]["name"], "Designer")
+            self.assertEqual(event["raw_event"]["action"], "update")
+
+    def test_linear_webhook_deduplicates_retries_without_raising(self) -> None:
+        with _running_server(linear_webhook_secret="secret") as server:
+            first = _post_linear_webhook(server.base_url, _linear_issue_payload(), secret="secret")
+            second = _post_linear_webhook(
+                server.base_url,
+                _linear_issue_payload(delivery_id="delivery-retry"),
+                secret="secret",
+                delivery_id="delivery-retry",
+            )
+
+            self.assertEqual(first, {"accepted": 1, "duplicate": False})
+            self.assertEqual(second, {"accepted": 0, "duplicate": True})
+            events = _get_json(server.base_url, "/linear/webhook/events")["events"]
+            self.assertEqual(len(events), 1)
+
 
 class _running_server:
-    def __init__(self, db_path: Path | None = None) -> None:
+    def __init__(self, db_path: Path | None = None, *, linear_webhook_secret: str | None = None) -> None:
         self._tempdir: TemporaryDirectory[str] | None = None
         if db_path is None:
             self._tempdir = TemporaryDirectory()
             db_path = Path(self._tempdir.name) / "graph.sqlite"
         self.db_path = db_path
-        self._server = create_graph_http_server(db_path, port=0)
+        self._server = create_graph_http_server(db_path, port=0, linear_webhook_secret=linear_webhook_secret)
         self._thread = Thread(target=self._server.serve_forever, daemon=True)
         host, port = self._server.server_address
         self.base_url = f"http://{host}:{port}"
@@ -125,9 +178,53 @@ def _post_json(base_url: str, path: str, payload: dict[str, object]) -> dict[str
         return json.loads(response.read().decode("utf-8"))
 
 
+def _post_linear_webhook(
+    base_url: str,
+    payload: dict[str, object],
+    *,
+    secret: str | None = None,
+    signature: str | None = None,
+    delivery_id: str = "delivery-1",
+) -> dict[str, object]:
+    body = json.dumps(payload, sort_keys=True).encode("utf-8")
+    if signature is None:
+        if secret is None:
+            raise ValueError("secret or signature is required")
+        signature = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    request = Request(
+        f"{base_url}/linear/webhook",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Linear-Delivery": delivery_id,
+            "Linear-Event": "Issue",
+            "Linear-Signature": signature,
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def _get_json(base_url: str, path: str) -> dict[str, object]:
     with urlopen(f"{base_url}{path}", timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _linear_issue_payload(*, delivery_id: str = "delivery-1") -> dict[str, object]:
+    return {
+        "action": "update",
+        "createdAt": "2026-05-07T18:00:00.000Z",
+        "data": {
+            "id": "issue-1",
+            "identifier": "ERI-65",
+            "state": {"id": "state-in-progress", "name": "In Progress"},
+        },
+        "updatedFrom": {"state": {"id": "state-todo", "name": "Todo"}},
+        "actor": {"id": "user-1", "name": "Designer"},
+        "webhookTimestamp": 1778176800000,
+        "id": delivery_id,
+    }
 
 
 if __name__ == "__main__":
