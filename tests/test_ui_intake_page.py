@@ -5,8 +5,9 @@ import unittest
 from http import cookies
 from pathlib import Path
 from urllib.parse import urlencode
+from urllib.parse import urlparse
 
-from overture.auth import auth_cookie
+from overture.auth import AUTH_COOKIE_NAME
 from overture.intake import load_intake_record
 from overture.ui_host import (
     INTAKE_TEXT_MAX_CHARS,
@@ -26,7 +27,58 @@ class IntakePageTests(unittest.TestCase):
             response = _request(OvertureUiApp(store_dir=tmpdir), "GET", "/intake", authenticated=False)
 
         self.assertEqual(response.status, "302 Found")
-        self.assertEqual(response.headers["Location"], "/login?next=/intake")
+        self.assertEqual(response.headers["Location"], "/auth/login?next=/intake")
+
+    def test_unauthenticated_backend_write_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response = _request(
+                OvertureUiApp(store_dir=tmpdir),
+                "POST",
+                "/intake",
+                {"idea": "Anonymous writes must be rejected"},
+                authenticated=False,
+            )
+
+            self.assertEqual(response.status, "302 Found")
+            self.assertEqual(response.headers["Location"], "/auth/login?next=/intake")
+            self.assertEqual(list((Path(tmpdir) / "intake").glob("*.json")), [])
+
+    def test_magic_link_flow_establishes_refreshed_designer_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            sent = _request(app, "POST", "/auth/magic-link", {"email": "Designer@Example.COM"}, authenticated=False)
+
+            self.assertEqual(sent.status, "200 OK")
+            self.assertIn("designer@example.com", sent.body)
+            outbox = Path(tmpdir) / "magic-links.jsonl"
+            payload = json.loads(outbox.read_text(encoding="utf-8").splitlines()[-1])
+            link_path = urlparse(payload["link"]).path + "?" + urlparse(payload["link"]).query
+
+            consumed = _request(app, "GET", link_path, authenticated=False)
+            self.assertEqual(consumed.status, "303 See Other")
+            self.assertEqual(consumed.headers["Location"], "/intake")
+            self.assertIn(AUTH_COOKIE_NAME, consumed.headers["Set-Cookie"])
+
+            page = _request(app, "GET", "/intake", cookie=consumed.headers["Set-Cookie"], authenticated=False)
+            self.assertEqual(page.status, "200 OK")
+            self.assertIn("Signed in as <code>designer@example.com</code>", page.body)
+            self.assertTrue(any(AUTH_COOKIE_NAME in value for value in page.header_values("Set-Cookie")))
+
+    def test_expired_auth_token_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            expired = app.auth_manager.issue_session("designer@example.com", ttl_seconds=-1)
+            response = _request(
+                app,
+                "POST",
+                "/intake",
+                {"idea": "Expired token should fail"},
+                cookie=f"{AUTH_COOKIE_NAME}={expired}",
+                authenticated=False,
+            )
+
+        self.assertEqual(response.status, "302 Found")
+        self.assertEqual(response.headers["Location"], "/auth/login?next=/intake")
 
     def test_intake_page_renders_form_and_curated_examples_link(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -55,6 +107,7 @@ class IntakePageTests(unittest.TestCase):
             cookie_header = response.headers["Set-Cookie"]
             session = _session_from_set_cookie(cookie_header)
             self.assertEqual(session["intake_id"], record.id)
+            self.assertEqual(session["designer_email"], "designer@example.com")
 
             approval = _request(
                 app,
@@ -249,8 +302,12 @@ class IntakePageTests(unittest.TestCase):
 class Response:
     def __init__(self, status: str, headers: list[tuple[str, str]], body: str) -> None:
         self.status = status
+        self.all_headers = headers
         self.headers = dict(headers)
         self.body = body
+
+    def header_values(self, name: str) -> list[str]:
+        return [value for key, value in self.all_headers if key.lower() == name.lower()]
 
 
 def _request(
@@ -264,6 +321,7 @@ def _request(
 ) -> Response:
     encoded = urlencode(fields or {}, doseq=True).encode("utf-8")
     captured: dict[str, object] = {}
+    parsed = urlparse(path)
 
     def start_response(status: str, headers: list[tuple[str, str]]) -> None:
         captured["status"] = status
@@ -271,15 +329,17 @@ def _request(
 
     environ: dict[str, object] = {
         "REQUEST_METHOD": method,
-        "PATH_INFO": path,
+        "PATH_INFO": parsed.path,
+        "QUERY_STRING": parsed.query,
         "CONTENT_LENGTH": str(len(encoded)),
         "CONTENT_TYPE": "application/x-www-form-urlencoded",
         "wsgi.input": io.BytesIO(encoded),
     }
+    request_cookie = cookie
     if authenticated:
-        environ["HTTP_COOKIE"] = _with_auth_cookie(cookie)
-    elif cookie:
-        environ["HTTP_COOKIE"] = cookie
+        request_cookie = _merge_cookie(request_cookie, AUTH_COOKIE_NAME, app.auth_manager.issue_session("designer@example.com"))
+    if request_cookie:
+        environ["HTTP_COOKIE"] = request_cookie
 
     body = b"".join(app(environ, start_response)).decode("utf-8")
     return Response(str(captured["status"]), list(captured["headers"]), body)
@@ -297,9 +357,13 @@ def _session_cookie(session: dict[str, str]) -> str:
     return jar.output(header="").strip()
 
 
-def _with_auth_cookie(cookie: str | None, user_id: str = "designer-1") -> str:
-    login_cookie = auth_cookie(user_id, email=f"{user_id}@example.test")
-    return f"{cookie}; {login_cookie}" if cookie else login_cookie
+def _merge_cookie(cookie_header: str | None, name: str, value: str) -> str:
+    jar = cookies.SimpleCookie()
+    if cookie_header:
+        jar.load(cookie_header)
+    if name not in jar:
+        jar[name] = value
+    return jar.output(header="").strip()
 
 
 def _synthesis_brief() -> dict[str, object]:

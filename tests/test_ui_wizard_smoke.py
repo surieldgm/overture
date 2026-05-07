@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlencode, urlparse
 
-from overture.auth import AUTH_COOKIE_NAME, auth_cookie
+from overture.auth import AUTH_COOKIE_NAME, MagicLinkAuth
 from overture.graph import GraphRecord
 from overture.graph_store import SqliteGraphStore
 from overture.intake import load_intake_record
@@ -23,6 +23,8 @@ from overture.ui_host import (
     TICKET_REVIEW_ROUTE,
     build_ui_server,
 )
+
+TEST_AUTH = MagicLinkAuth(secret="ui-wizard-smoke-test")
 
 
 class WizardPhaseOneSmokeTests(unittest.TestCase):
@@ -236,8 +238,8 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
 
         self.assertEqual(first.status, 303)
         self.assertEqual(second.status, 303)
-        self.assertEqual(first_session["user_id"], "designer-1")
-        self.assertEqual(second_session["user_id"], "designer-2")
+        self.assertEqual(first_session["user_id"], "designer-1@example.test")
+        self.assertEqual(second_session["user_id"], "designer-2@example.test")
         self.assertNotEqual(first_session["intake_id"], second_session["intake_id"])
         self.assertEqual(intake_file_count, 2)
 
@@ -332,8 +334,8 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
         self.assertEqual(synthesis_page.status, 200)
         self.assertTrue(nodes)
         self.assertTrue(edges)
-        self.assertTrue(all(node["author_id"] == "designer-2" for node in nodes))
-        self.assertTrue(all(edge["author_id"] == "designer-2" for edge in edges))
+        self.assertTrue(all(node["author_id"] == "designer-2@example.test" for node in nodes))
+        self.assertTrue(all(edge["author_id"] == "designer-2@example.test" for edge in edges))
 
 
 def _running_server(
@@ -365,6 +367,7 @@ class _ServerContext:
             llm_client=self.llm_client,
             synthesizer=self.synthesizer,
             linear_client_factory=self.linear_client_factory,
+            auth_manager=TEST_AUTH,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -417,7 +420,7 @@ def _request(
         payload = response.read().decode("utf-8")
         return _Response(
             status=response.status,
-            headers={key: value for key, value in response.getheaders()},
+            headers=response.getheaders(),
             body=payload,
         )
     finally:
@@ -430,11 +433,24 @@ def _session_from_set_cookie(header: str) -> dict[str, str]:
     return json.loads(jar[SESSION_COOKIE_NAME].value)
 
 
+def _merge_cookie(cookie_header: str | None, name: str, value: str) -> str:
+    jar = cookies.SimpleCookie()
+    if cookie_header:
+        jar.load(cookie_header)
+    if name not in jar:
+        jar[name] = value
+    return jar.output(header="").strip()
+
+
 class _Response:
-    def __init__(self, *, status: int, headers: dict[str, str], body: str) -> None:
+    def __init__(self, *, status: int, headers: list[tuple[str, str]], body: str) -> None:
         self.status = status
-        self.headers = headers
+        self.all_headers = headers
+        self.headers = dict(headers)
         self.body = body
+
+    def header_values(self, name: str) -> list[str]:
+        return [value for key, value in self.all_headers if key.lower() == name.lower()]
 
 def _stub_llm_client(_prompt: str) -> str:
     return json.dumps(
@@ -456,7 +472,7 @@ def _stub_llm_client(_prompt: str) -> str:
 
 
 def _auth_header(user_id: str) -> str:
-    return auth_cookie(user_id, email=f"{user_id}@example.test")
+    return _merge_cookie(None, AUTH_COOKIE_NAME, TEST_AUTH.issue_session(f"{user_id}@example.test"))
 
 
 def _approved_research_cookie(base_url: str, *, user_id: str = "designer-1") -> str:

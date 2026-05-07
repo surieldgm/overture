@@ -14,7 +14,7 @@ from typing import Callable, Iterable, Mapping
 from urllib.parse import parse_qs
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
-from .auth import AuthenticatedUser, LOGIN_ROUTE, authenticated_user_from_environ
+from .auth import AuthenticatedUser, DesignerSession, MagicLinkAuth, auth_cookie, authenticated_user_from_session, sender_from_env
 from .export import parse_ticket_markdown
 from .graph import GraphRecord, research_result_to_graph_records
 from .graph_store import EDGE_KINDS, NODE_KINDS, SqliteGraphStore
@@ -49,6 +49,9 @@ SESSION_TICKET_MARKDOWN_KEY = "ticket_markdown"
 SESSION_TICKET_PATH_KEY = "ticket_path"
 SESSION_TICKET_TITLE_KEY = "ticket_title"
 SESSION_TICKET_BODY_KEY = "ticket_body"
+AUTH_LOGIN_ROUTE = "/auth/login"
+AUTH_MAGIC_LINK_ROUTE = "/auth/magic-link"
+AUTH_CONSUME_ROUTE = "/auth/consume"
 
 StartResponse = Callable[[str, list[tuple[str, str]]], None]
 
@@ -183,12 +186,15 @@ class OvertureUiApp:
         llm_client: Callable[[str], str] = fake_llm_client,
         synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
         linear_client_factory: Callable[[], object] | None = None,
+        auth_manager: MagicLinkAuth | None = None,
     ) -> None:
         self.store_dir = Path(store_dir)
         self.session_store = SessionStore()
         self.llm_client = llm_client
         self.synthesizer = synthesizer
         self.linear_client_factory = linear_client_factory or _linear_client_from_env
+        self.auth_manager = auth_manager or MagicLinkAuth(sender=sender_from_env(self.store_dir))
+        self._active_auth_session: DesignerSession | None = None
 
     def __call__(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         method = str(environ.get("REQUEST_METHOD", "GET")).upper()
@@ -198,13 +204,35 @@ class OvertureUiApp:
 
         if path in {"", "/"}:
             return self._redirect(start_response, "/intake", status="302 Found")
-        if path == LOGIN_ROUTE and method == "GET":
+        if path == AUTH_LOGIN_ROUTE and method == "GET":
             return self._render(start_response, render_login_page())
+        if path == AUTH_MAGIC_LINK_ROUTE and method == "POST":
+            return self._handle_magic_link_post(environ, start_response)
+        if path == AUTH_CONSUME_ROUTE and method == "GET":
+            return self._handle_auth_consume(environ, start_response)
 
-        user = authenticated_user_from_environ(environ)
-        if path in AUTHENTICATED_WIZARD_PATHS and user is None:
-            return self._redirect(start_response, f"{LOGIN_ROUTE}?next={path}", status="302 Found")
+        auth_session = self.auth_manager.authenticate(environ)
+        if auth_session is None:
+            if path in AUTHENTICATED_WIZARD_PATHS:
+                return self._redirect(start_response, f"{AUTH_LOGIN_ROUTE}?next={path}", status="302 Found")
+            return self._unauthorized(start_response)
 
+        self._active_auth_session = auth_session
+        user = authenticated_user_from_session(auth_session)
+        environ["overture.authenticated_user"] = user
+        try:
+            return self._route_authenticated(method, path, environ, start_response, user)
+        finally:
+            self._active_auth_session = None
+
+    def _route_authenticated(
+        self,
+        method: str,
+        path: str,
+        environ: dict[str, object],
+        start_response: StartResponse,
+        user: AuthenticatedUser,
+    ) -> Iterable[bytes]:
         if path == "/intake" and method == "GET":
             assert user is not None
             session_id, server_session, is_new = self._server_session(environ, user)
@@ -212,6 +240,7 @@ class OvertureUiApp:
                 session_from_environ(environ, user=user),
                 session_id=session_id,
                 visit_count=_record_visit(server_session),
+                designer_email=self._active_auth_session.email if self._active_auth_session else None,
             )
             return self._render(
                 start_response,
@@ -258,6 +287,35 @@ class OvertureUiApp:
 
         return self._render(start_response, render_not_found(path), status="404 Not Found")
 
+    def _handle_magic_link_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        fields = _form_fields(environ)
+        email = fields.get("email", [""])[0]
+        try:
+            delivery = self.auth_manager.request_link(email)
+        except (RuntimeError, ValueError) as exc:
+            return self._render(start_response, render_login_page(email=email, error=str(exc)), status="400 Bad Request")
+        return self._render(start_response, render_magic_link_sent_page(delivery.email, delivery.link, delivery.outbox_path))
+
+    def _handle_auth_consume(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        query = parse_qs(str(environ.get("QUERY_STRING", "")), keep_blank_values=True)
+        token = query.get("token", [""])[0]
+        session_token = self.auth_manager.consume_link(token)
+        if session_token is None:
+            return self._render(
+                start_response,
+                render_login_page(error="This magic link is invalid or expired. Request a new link."),
+                status="401 Unauthorized",
+            )
+        return self._redirect(start_response, "/intake", extra_headers=[("Set-Cookie", auth_cookie(session_token))])
+
+    def _unauthorized(self, start_response: StartResponse) -> list[bytes]:
+        return self._render(
+            start_response,
+            render_unauthorized_page(),
+            status="401 Unauthorized",
+            extra_headers=[("WWW-Authenticate", 'Bearer realm="overture"')],
+        )
+
     def _handle_intake_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         fields = _form_fields(environ)
         raw_text = fields.get("idea", [""])[0]
@@ -297,7 +355,7 @@ class OvertureUiApp:
             if value.startswith("approve:")
         ]
         result = submit_research_approvals(
-            session=session_from_environ(environ),
+            session=session_from_environ(environ, user=_require_user(environ)),
             store_dir=self.store_dir,
             approved_keys=approved_keys,
             user=_require_user(environ),
@@ -317,7 +375,7 @@ class OvertureUiApp:
 
     def _handle_synthesis_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
         result = prepare_synthesis_review(
-            session_from_environ(environ),
+            session_from_environ(environ, user=_require_user(environ)),
             self.store_dir,
             synthesizer=self.synthesizer,
             user=_require_user(environ),
@@ -455,6 +513,7 @@ class OvertureUiApp:
             ("Content-Length", str(len(payload))),
             ("Cache-Control", "no-store"),
         ]
+        headers.extend(self._auth_refresh_headers())
         if extra_headers:
             headers.extend(extra_headers)
         start_response(status, headers)
@@ -469,10 +528,17 @@ class OvertureUiApp:
         extra_headers: list[tuple[str, str]] | None = None,
     ) -> list[bytes]:
         headers = [("Location", location), ("Content-Length", "0")]
+        headers.extend(self._auth_refresh_headers())
         if extra_headers:
             headers.extend(extra_headers)
         start_response(status, headers)
         return [b""]
+
+    def _auth_refresh_headers(self) -> list[tuple[str, str]]:
+        if self._active_auth_session is None:
+            return []
+        token = self.auth_manager.refresh_session(self._active_auth_session)
+        return [("Set-Cookie", auth_cookie(token))]
 
     def _server_session(self, environ: dict[str, object], user: AuthenticatedUser) -> tuple[str, dict[str, object], bool]:
         return self.session_store.get_or_create(_opaque_session_id_from_environ(environ), user_id=user.user_id)
@@ -486,21 +552,28 @@ def build_ui_server(
     llm_client: Callable[[str], str] = fake_llm_client,
     synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
     linear_client_factory: Callable[[], object] | None = None,
+    auth_manager: MagicLinkAuth | None = None,
 ) -> LoopbackOnlyWSGIServer:
     _ensure_loopback_bind_host(host)
+    auth = auth_manager or MagicLinkAuth(sender=sender_from_env(store_dir), base_url=f"http://localhost:{port}")
     app = OvertureUiApp(
         store_dir=store_dir,
         llm_client=llm_client,
         synthesizer=synthesizer,
         linear_client_factory=linear_client_factory,
+        auth_manager=auth,
     )
-    return make_server(
+    server = make_server(
         host,
         port,
         app,
         server_class=LoopbackOnlyWSGIServer,
         handler_class=QuietRequestHandler,
     )
+    if auth_manager is None:
+        _bound_host, bound_port = server.server_address[:2]
+        auth.base_url = f"http://localhost:{bound_port}"
+    return server
 
 
 def serve_ui_host(
@@ -511,6 +584,7 @@ def serve_ui_host(
     llm_client: Callable[[str], str] = fake_llm_client,
     synthesizer: Callable[..., SynthesisBrief] = synthesize_graph_context,
     linear_client_factory: Callable[[], object] | None = None,
+    auth_manager: MagicLinkAuth | None = None,
 ) -> None:
     server = build_ui_server(
         host=host,
@@ -519,6 +593,7 @@ def serve_ui_host(
         llm_client=llm_client,
         synthesizer=synthesizer,
         linear_client_factory=linear_client_factory,
+        auth_manager=auth_manager,
     )
     bound_host, bound_port = server.server_address[:2]
     print(f"Overture UI host listening on http://localhost:{bound_port}/intake")
@@ -935,14 +1010,60 @@ def _source_key(source: CuratedSource) -> str:
     return source.url or source.citation or source.title
 
 
-def render_login_page() -> str:
+def render_login_page(*, email: str = "", error: str | None = None) -> str:
+    escaped_email = html.escape(email)
+    error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
     return render_layout(
-        title="Login",
+        title="Designer sign in",
+        active_path="/intake",
+        content=f"""
+        <section class="workspace auth-panel">
+          <h2>Designer sign in</h2>
+          <p>Enter the email address you use for Overture. We will send a short-lived sign-in link.</p>
+          <form method="post" action="{AUTH_MAGIC_LINK_ROUTE}" novalidate>
+            <label for="email">Email</label>
+            <input id="email" name="email" type="email" value="{escaped_email}" autocomplete="email" autofocus required>
+            <div class="form-footer">
+              <span>No password or SSO is required.</span>
+              <button type="submit">Send magic link</button>
+            </div>
+            {error_markup}
+          </form>
+        </section>
+        """,
+    )
+
+
+def render_magic_link_sent_page(email: str, link: str, outbox_path: Path | None) -> str:
+    escaped_path = html.escape(str(outbox_path)) if outbox_path else ""
+    outbox_markup = (
+        f'<p class="session-note">Development outbox: <code>{escaped_path}</code></p>'
+        if outbox_path
+        else ""
+    )
+    return render_layout(
+        title="Magic link sent",
+        active_path="/intake",
+        content=f"""
+        <section class="workspace auth-panel">
+          <h2>Magic link sent</h2>
+          <p>A sign-in link was sent to <code>{html.escape(email)}</code>. It expires in 15 minutes.</p>
+          {outbox_markup}
+          <p class="session-note"><a href="{html.escape(link)}">Open development magic link</a></p>
+        </section>
+        """,
+    )
+
+
+def render_unauthorized_page() -> str:
+    return render_layout(
+        title="Authentication required",
         active_path=None,
-        content="""
-        <section class="workspace">
-          <h2>Login required</h2>
-          <p>Open the magic-link sign-in flow before continuing to the wizard.</p>
+        content=f"""
+        <section class="workspace auth-panel">
+          <h2>Authentication required</h2>
+          <p>This backend route requires a current designer session.</p>
+          <p><a href="{AUTH_LOGIN_ROUTE}">Request a magic link</a></p>
         </section>
         """,
     )
@@ -955,6 +1076,7 @@ def render_intake_page(
     error: str | None = None,
     session_id: str | None = None,
     visit_count: int | None = None,
+    designer_email: str | None = None,
 ) -> str:
     value = html.escape(raw_text)
     escaped_error = html.escape(error) if error else ""
@@ -966,6 +1088,11 @@ def render_intake_page(
         else ""
     )
     server_session_markup = _server_session_markup(session_id, visit_count)
+    designer_markup = (
+        f'<p class="session-note">Signed in as <code>{html.escape(designer_email)}</code></p>'
+        if designer_email
+        else ""
+    )
     return render_layout(
         title="Intake",
         active_path="/intake",
@@ -982,6 +1109,7 @@ def render_intake_page(
             </div>
             {error_markup}
             {session_markup}
+            {designer_markup}
             {server_session_markup}
           </form>
         </section>
@@ -1297,8 +1425,9 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
     h2 {{ font-size: 28px; }}
     h3 {{ font-size: 18px; }}
     label {{ display: block; font-weight: 650; margin-bottom: 8px; }}
-    textarea {{ width: 100%; min-height: 280px; resize: vertical; border: 1px solid var(--line); border-radius: 6px; padding: 12px; color: var(--ink); font: inherit; background: #fff; }}
-    textarea:focus {{ outline: 3px solid #99f6e4; border-color: var(--accent); }}
+    input, textarea {{ width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 12px; color: var(--ink); font: inherit; background: #fff; }}
+    textarea {{ min-height: 280px; resize: vertical; }}
+    input:focus, textarea:focus {{ outline: 3px solid #99f6e4; border-color: var(--accent); }}
     .form-footer {{ display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 12px; color: var(--muted); font-size: 14px; }}
     .source-list {{ display: grid; gap: 16px; list-style: none; margin: 24px 0 0; padding: 0; }}
     .source-option {{ display: grid; grid-template-columns: minmax(0, 1fr) 180px; gap: 20px; border: 1px solid var(--line); border-radius: 6px; padding: 16px; }}
@@ -1375,10 +1504,10 @@ def _session_cookie(session: dict[str, str]) -> str:
 
 
 def _require_user(environ: Mapping[str, object]) -> AuthenticatedUser:
-    user = authenticated_user_from_environ(environ)
-    if user is None:
-        raise RuntimeError("authenticated user required after auth gate")
-    return user
+    user = environ.get("overture.authenticated_user")
+    if isinstance(user, AuthenticatedUser):
+        return user
+    raise RuntimeError("authenticated user required after auth gate")
 
 
 def _session_for_user(session: Mapping[str, str], user: AuthenticatedUser) -> dict[str, str]:
@@ -1387,6 +1516,7 @@ def _session_for_user(session: Mapping[str, str], user: AuthenticatedUser) -> di
     next_session = {str(key): str(value) for key, value in session.items()}
     next_session["user_id"] = user.user_id
     next_session["user_email"] = user.email
+    next_session["designer_email"] = user.email
     return next_session
 
 

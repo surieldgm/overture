@@ -10,9 +10,11 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlencode, urlparse
 
-from overture.auth import AUTH_COOKIE_NAME, auth_cookie
+from overture.auth import AUTH_COOKIE_NAME, MagicLinkAuth
 from overture.linear_client import CreatedIssue
 from overture.ui_host import SESSION_COOKIE_NAME, build_ui_server
+
+TEST_AUTH = MagicLinkAuth(secret="ui-export-test")
 
 
 class ExportPageTests(unittest.TestCase):
@@ -102,7 +104,12 @@ class _ServerContext:
         self.linear_client_factory = linear_client_factory
 
     def __enter__(self) -> str:
-        self.server = build_ui_server(port=0, store_dir=self.store_dir, linear_client_factory=self.linear_client_factory)
+        self.server = build_ui_server(
+            port=0,
+            store_dir=self.store_dir,
+            linear_client_factory=self.linear_client_factory,
+            auth_manager=TEST_AUTH,
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.server.server_address[:2]
@@ -142,13 +149,11 @@ def _request(
     connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=2)
     try:
         request_headers = dict(headers or {})
-        if AUTH_COOKIE_NAME not in request_headers.get("Cookie", ""):
-            auth_header = auth_cookie("designer-1", email="designer-1@example.test")
-            request_headers["Cookie"] = (
-                f'{request_headers["Cookie"]}; {auth_header}'
-                if "Cookie" in request_headers
-                else auth_header
-            )
+        request_headers["Cookie"] = _merge_cookie(
+            request_headers.get("Cookie"),
+            AUTH_COOKIE_NAME,
+            TEST_AUTH.issue_session("designer@example.com"),
+        )
         connection.request(method, path, body=body, headers=request_headers)
         response = connection.getresponse()
         payload = response.read().decode("utf-8")
@@ -164,6 +169,15 @@ def _request(
 def _session_cookie(session: dict[str, str]) -> str:
     jar = cookies.SimpleCookie()
     jar[SESSION_COOKIE_NAME] = json.dumps(session, sort_keys=True, separators=(",", ":"))
+    return jar.output(header="").strip()
+
+
+def _merge_cookie(cookie_header: str | None, name: str, value: str) -> str:
+    jar = cookies.SimpleCookie()
+    if cookie_header:
+        jar.load(cookie_header)
+    if name not in jar:
+        jar[name] = value
     return jar.output(header="").strip()
 
 
