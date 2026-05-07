@@ -32,6 +32,18 @@ class StageMetric:
 
 
 @dataclass(frozen=True)
+class ReworkMetric:
+    event_id: str
+    issue_id: str
+    issue_identifier: str | None
+    author_id: str
+    author_email: str | None
+    from_state: str
+    to_state: str
+    occurred_at: str
+
+
+@dataclass(frozen=True)
 class TicketMetric:
     ticket_id: str
     author_id: str | None = None
@@ -194,7 +206,21 @@ class MetricsStore:
         for row in rows:
             yield _ticket_metric_from_row(row)
 
-    def rework_counts_by_author(self, *, milestone: str) -> dict[str, dict[str, str | int | None]]:
+    def rework_counts_by_author(
+        self, *, milestone: str | None = None
+    ) -> dict[str, int] | dict[str, dict[str, str | int | None]]:
+        if milestone is None:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT author_id, count(*) AS count
+                    FROM rework_metrics
+                    GROUP BY author_id
+                    ORDER BY author_id
+                    """
+                ).fetchall()
+            return {str(row["author_id"]): int(row["count"]) for row in rows}
+
         milestone = _required_text(milestone, "milestone")
         with self._connect() as connection:
             rows = connection.execute(
@@ -371,6 +397,54 @@ class MetricsStore:
 
         return summaries
 
+    def record_rework(self, metric: ReworkMetric) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO rework_metrics (
+                    event_id,
+                    issue_id,
+                    issue_identifier,
+                    author_id,
+                    author_email,
+                    from_state,
+                    to_state,
+                    occurred_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    issue_id = excluded.issue_id,
+                    issue_identifier = excluded.issue_identifier,
+                    author_id = excluded.author_id,
+                    author_email = excluded.author_email,
+                    from_state = excluded.from_state,
+                    to_state = excluded.to_state,
+                    occurred_at = excluded.occurred_at
+                """,
+                (
+                    metric.event_id,
+                    metric.issue_id,
+                    metric.issue_identifier,
+                    metric.author_id,
+                    metric.author_email,
+                    metric.from_state,
+                    metric.to_state,
+                    metric.occurred_at,
+                ),
+            )
+
+    def iter_rework_metrics(self) -> Iterator[ReworkMetric]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_id, issue_id, issue_identifier, author_id, author_email, from_state, to_state, occurred_at
+                FROM rework_metrics
+                ORDER BY occurred_at, event_id
+                """
+            ).fetchall()
+        for row in rows:
+            yield _rework_metric_from_row(row)
+
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.db_path)
@@ -414,6 +488,20 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE stage_metrics ADD COLUMN author_id TEXT")
     if "author_email" not in columns:
         connection.execute("ALTER TABLE stage_metrics ADD COLUMN author_email TEXT")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rework_metrics (
+            event_id TEXT NOT NULL PRIMARY KEY,
+            issue_id TEXT NOT NULL,
+            issue_identifier TEXT,
+            author_id TEXT NOT NULL,
+            author_email TEXT,
+            from_state TEXT NOT NULL,
+            to_state TEXT NOT NULL,
+            occurred_at TEXT NOT NULL
+        )
+        """
+    )
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS ticket_rework_counters (
@@ -466,6 +554,19 @@ def _metric_from_row(row: sqlite3.Row) -> StageMetric:
         error_message=row["error_message"],
         author_id=row["author_id"],
         author_email=row["author_email"],
+    )
+
+
+def _rework_metric_from_row(row: sqlite3.Row) -> ReworkMetric:
+    return ReworkMetric(
+        event_id=row["event_id"],
+        issue_id=row["issue_id"],
+        issue_identifier=row["issue_identifier"],
+        author_id=row["author_id"],
+        author_email=row["author_email"],
+        from_state=row["from_state"],
+        to_state=row["to_state"],
+        occurred_at=row["occurred_at"],
     )
 
 

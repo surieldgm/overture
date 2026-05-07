@@ -1,4 +1,4 @@
-"""Classify Linear status transitions into normalized rework signals."""
+"""Classify Linear events into normalized rework signals."""
 
 from __future__ import annotations
 
@@ -10,10 +10,26 @@ from typing import Any, Iterable, Mapping
 REWORK_STATUS_RULE = "status_entered_rework"
 DONE_TO_NON_DONE_RULE = "done_to_non_done_within_7_days"
 REOPENED_ACTION_RULE = "reopened_action"
+BACKWARD_STATE_RULE = "backward_state_transition"
 
 HIGH_CONFIDENCE = "high"
 MEDIUM_CONFIDENCE = "medium"
 DONE_REOPEN_WINDOW = timedelta(days=7)
+
+_STATE_RANKS = {
+    "triage": 0,
+    "backlog": 0,
+    "todo": 1,
+    "in progress": 2,
+    "in review": 3,
+    "review": 3,
+    "human review": 3,
+    "merging": 4,
+    "done": 5,
+    "completed": 5,
+    "canceled": 5,
+    "cancelled": 5,
+}
 
 
 @dataclass(frozen=True)
@@ -25,9 +41,63 @@ class ReworkSignal:
     rule_name: str
     confidence: str
     occurred_at: str
+    issue_identifier: str | None = None
+    author_id: str | None = None
+    author_email: str | None = None
+    from_state: str | None = None
+    to_state: str | None = None
+
+    @property
+    def event_id(self) -> str:
+        return self.source_event_id
 
     def to_dict(self) -> dict[str, str]:
-        return asdict(self)
+        return {key: value for key, value in asdict(self).items() if value is not None}
+
+
+def classify_linear_webhook(payload: Mapping[str, Any]) -> ReworkSignal | None:
+    """Return a rework signal when a Linear issue webhook moves backward."""
+
+    if str(payload.get("type") or "").lower() != "issue":
+        return None
+    if str(payload.get("action") or "").lower() not in {"update", "updated"}:
+        return None
+
+    data = _mapping(payload.get("data"))
+    updated_from = _mapping(payload.get("updatedFrom"))
+    from_state = _state_name(updated_from.get("state"))
+    to_state = _state_name(data.get("state"))
+    if not from_state or not to_state:
+        return None
+    if _state_rank(to_state) >= _state_rank(from_state):
+        return None
+
+    actor = _mapping(payload.get("actor"))
+    author_id = _text(actor.get("id")) or _text(actor.get("email"))
+    if not author_id:
+        return None
+
+    issue_id = _text(data.get("id"))
+    if not issue_id:
+        return None
+
+    source_event_id = (
+        _text(payload.get("webhookId"))
+        or _text(payload.get("id"))
+        or f"{issue_id}:{from_state}:{to_state}:{_text(payload.get('createdAt'))}"
+    )
+    return ReworkSignal(
+        issue_id=issue_id,
+        source_event_id=source_event_id,
+        rule_name=BACKWARD_STATE_RULE,
+        confidence=HIGH_CONFIDENCE,
+        occurred_at=_text(payload.get("createdAt")) or _text(data.get("updatedAt")) or _text(data.get("createdAt")) or "",
+        issue_identifier=_text(data.get("identifier")),
+        author_id=author_id,
+        author_email=_text(actor.get("email")),
+        from_state=from_state,
+        to_state=to_state,
+    )
 
 
 def classify_rework_events(events: Iterable[Mapping[str, Any]]) -> tuple[ReworkSignal, ...]:
@@ -114,6 +184,27 @@ def _is_reopened_action(event: Mapping[str, Any]) -> bool:
         return False
     action = str(raw_event.get("action") or "").strip().lower().replace("_", "-")
     return action in {"reopen", "reopened"}
+
+
+def _state_name(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        return _text(value.get("name") or value.get("type"))
+    return _text(value)
+
+
+def _state_rank(value: str) -> int:
+    return _STATE_RANKS.get(value.strip().lower(), -1)
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _parse_timestamp(value: str) -> datetime:
