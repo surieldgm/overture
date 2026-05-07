@@ -393,6 +393,8 @@ def submit_research_approvals(
 
     write_research_result(Path(store_dir) / "research" / f"{intake.id}.json", result)
     next_session["research_result"] = json.dumps(research_result_to_jsonable(result), sort_keys=True, separators=(",", ":"))
+    next_session["research_id"] = intake.id
+    next_session["next_route"] = "/synthesis"
     return ResearchReviewResult(next_session, candidates)
 
 
