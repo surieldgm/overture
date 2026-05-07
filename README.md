@@ -132,35 +132,89 @@ tests do not dirty the working tree.
    python examples/validate_two_intake_loop.py
    ```
 
-## Manual Testing
+## Human Testing
 
-Use these checks when validating changes manually:
+Use this section when a human reviewer needs to smoke test Overture from a
+fresh checkout. The commands keep generated files under `/tmp` so the working
+tree stays clean.
 
-1. Run an intake command with a temporary output directory.
-2. Confirm the command prints the created JSON path and stable intake ID.
-3. Open the JSON file and confirm it contains `raw_text`, `source_type`,
-   `normalized_summary`, `created_at`, and `id`.
-4. Run the fixture command with a temporary output directory.
-5. Confirm the command prints paths for `intake`, `research`, `graph`,
-   `synthesis`, and `ticket_draft`.
-6. Inspect the generated ticket draft and confirm it contains the documented
-   ticket sections in order.
-7. When research approval behavior changes, run the research command with
-   `OVERTURE_LLM_CLIENT=fake`, approve at least one suggested source, and
-   confirm `/tmp/overture-store/research/<intake-id>.json` contains approved
-   `items`.
-8. When export behavior changes, run `python -m overture export <ticket-path>
-   --team-id <linear-team-id> --dry-run` and confirm it prints the issue title
-   and body without calling Linear.
+### 1. Prepare the CLI
 
-Example:
+From the repository root:
 
 ```sh
-python -m overture intake "Manual smoke test for Overture" --store-dir /tmp/overture-intake
-python -m overture fixture --output-dir /tmp/overture-fixture
-python -m overture export examples/overture_mvp_linear_issue_draft.md --team-id team-id --dry-run
-sed -n '1,160p' /tmp/overture-fixture/ticket/symphony-ticket-draft.md
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
 ```
+
+If the editable install is already active, you can skip this step. The examples
+below also work with `python -m overture` from the repository root.
+
+### 2. Verify intake output
+
+Create an intake record in a temporary store:
+
+```sh
+python -m overture intake "Manual smoke test for Overture" --store-dir /tmp/overture-human-test/intake
+```
+
+Expected result:
+
+- The command prints the path to the created JSON file.
+- The command prints a stable intake ID on the second output line.
+- The JSON file contains `raw_text`, `source_type`, `normalized_summary`,
+  `created_at`, and `id`.
+
+### 3. Verify the deterministic artifact path
+
+Run the end-to-end fixture:
+
+```sh
+python -m overture fixture --output-dir /tmp/overture-human-test/fixture
+```
+
+Expected result:
+
+- The command prints paths for `intake`, `research`, `graph`, `synthesis`, and
+  `ticket_draft`.
+- The ticket draft exists at
+  `/tmp/overture-human-test/fixture/ticket/symphony-ticket-draft.md`.
+- The ticket draft contains the expected Symphony ticket sections in order.
+
+Inspect the generated ticket draft:
+
+```sh
+sed -n '1,160p' /tmp/overture-human-test/fixture/ticket/symphony-ticket-draft.md
+```
+
+### 4. Verify export dry run behavior
+
+Validate an export-ready payload without creating a Linear issue:
+
+```sh
+python -m overture export examples/overture_mvp_linear_issue_draft.md --team-id team-id --dry-run
+```
+
+Expected result:
+
+- The command prints the issue title and body.
+- No Linear issue is created.
+- No `LINEAR_API_KEY` is required for the dry run.
+
+### 5. Optional checks for changed areas
+
+Run these only when the matching behavior changed:
+
+- Research approval: run
+  `OVERTURE_LLM_CLIENT=fake python -m overture research <intake-id> --store-dir /tmp/overture-human-test`,
+  approve at least one suggested source, and confirm
+  `/tmp/overture-human-test/research/<intake-id>.json` contains approved
+  `items`.
+- Prior graph context: run `python examples/validate_two_intake_loop.py` and
+  confirm it completes successfully.
+- Curated research: run `python examples/validate_curated_research.py` and
+  confirm it completes successfully.
 
 ## Validation
 
