@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from http import cookies
 import html
+from io import BytesIO
 from ipaddress import ip_address
 import json
 import os
@@ -23,6 +24,7 @@ from .intake import IntakeRecord, create_intake_record, load_intake_record
 from .export import parse_ticket_file
 from .export_runner import ExportRunResult, run_ticket_export
 from .linear_client import LinearClient
+from .observation_log import ObservationEvent, ObservationLog
 from .peer_onboarding import (
     PEER_ONBOARDING_ROUTE,
     PeerOnboardingArtifact,
@@ -64,6 +66,14 @@ SESSION_PEER_ONBOARDING_TEMPLATE_KEY = "peer_onboarding_template"
 AUTH_LOGIN_ROUTE = "/auth/login"
 AUTH_MAGIC_LINK_ROUTE = "/auth/magic-link"
 AUTH_CONSUME_ROUTE = "/auth/consume"
+WIZARD_ROUTE_ORDER = {
+    "/intake": 0,
+    RESEARCH_APPROVAL_ROUTE: 1,
+    RESEARCH_COMPLETE_ROUTE: 2,
+    SYNTHESIS_ROUTE: 3,
+    TICKET_REVIEW_ROUTE: 4,
+    "/export": 5,
+}
 
 StartResponse = Callable[[str, list[tuple[str, str]]], None]
 
@@ -217,6 +227,7 @@ class OvertureUiApp:
         self.linear_client_factory = linear_client_factory or _linear_client_from_env
         self.graph_backend = graph_backend
         self.auth_manager = auth_manager or MagicLinkAuth(sender=sender_from_env(self.store_dir))
+        self.observation_log = ObservationLog(self.store_dir)
         self._active_auth_session: DesignerSession | None = None
 
     def __call__(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
@@ -244,9 +255,45 @@ class OvertureUiApp:
         user = authenticated_user_from_session(auth_session)
         environ["overture.authenticated_user"] = user
         try:
-            return self._route_authenticated(method, path, environ, start_response, user)
+            return self._route_authenticated_observed(method, path, environ, start_response, user)
         finally:
             self._active_auth_session = None
+
+    def _route_authenticated_observed(
+        self,
+        method: str,
+        path: str,
+        environ: dict[str, object],
+        start_response: StartResponse,
+        user: AuthenticatedUser,
+    ) -> Iterable[bytes]:
+        if path not in AUTHENTICATED_WIZARD_PATHS:
+            return self._route_authenticated(method, path, environ, start_response, user)
+
+        prior_session = session_from_environ(environ, user=user)
+        fields = _peek_form_fields(environ) if method == "POST" else {}
+        status_headers: dict[str, object] = {"status": 200, "headers": []}
+
+        def observing_start_response(status: str, headers: list[tuple[str, str]]) -> None:
+            status_headers["status"] = int(status.split(" ", 1)[0])
+            status_headers["headers"] = list(headers)
+            start_response(status, headers)
+
+        response = self._route_authenticated(method, path, environ, observing_start_response, user)
+        status = int(status_headers["status"])
+        headers = list(status_headers["headers"])
+        self.observation_log.append(
+            _observation_events_for_request(
+                method=method,
+                path=path,
+                status=status,
+                headers=headers,
+                prior_session=prior_session,
+                fields=fields,
+                user=user,
+            )
+        )
+        return response
 
     def _route_authenticated(
         self,
@@ -1708,6 +1755,144 @@ def _form_fields(environ: dict[str, object]) -> dict[str, list[str]]:
         length = 0
     body = environ["wsgi.input"].read(length).decode("utf-8") if length else ""
     return parse_qs(body, keep_blank_values=True)
+
+
+def _peek_form_fields(environ: dict[str, object]) -> dict[str, list[str]]:
+    try:
+        length = int(str(environ.get("CONTENT_LENGTH") or "0"))
+    except ValueError:
+        length = 0
+    if not length:
+        return {}
+    body = environ["wsgi.input"].read(length)
+    environ["wsgi.input"] = BytesIO(body)
+    return parse_qs(body.decode("utf-8"), keep_blank_values=True)
+
+
+def _observation_events_for_request(
+    *,
+    method: str,
+    path: str,
+    status: int,
+    headers: list[tuple[str, str]],
+    prior_session: Mapping[str, str],
+    fields: Mapping[str, list[str]],
+    user: AuthenticatedUser,
+) -> tuple[ObservationEvent, ...]:
+    events: list[ObservationEvent] = []
+    next_session = _session_from_response_headers(headers) or dict(prior_session)
+    location = _header_value(headers, "Location")
+
+    if method == "GET":
+        events.append(
+            ObservationEvent(
+                event_type="page_transition",
+                method=method,
+                path=path,
+                status=status,
+                user_id=user.user_id,
+                user_email=user.email,
+                from_route=prior_session.get("next_route"),
+                to_route=path,
+            )
+        )
+
+    if method == "POST":
+        events.append(
+            ObservationEvent(
+                event_type="form_submission",
+                method=method,
+                path=path,
+                status=status,
+                user_id=user.user_id,
+                user_email=user.email,
+                from_route=path,
+                to_route=location or next_session.get("next_route") or path,
+                form_fields=tuple(sorted(fields)),
+            )
+        )
+
+    if status >= 400:
+        events.append(
+            ObservationEvent(
+                event_type="error",
+                method=method,
+                path=path,
+                status=status,
+                user_id=user.user_id,
+                user_email=user.email,
+                from_route=path,
+                to_route=location or path,
+                form_fields=tuple(sorted(fields)),
+                error=f"HTTP {status}",
+            )
+        )
+
+    if location:
+        events.append(
+            ObservationEvent(
+                event_type="page_transition",
+                method=method,
+                path=path,
+                status=status,
+                user_id=user.user_id,
+                user_email=user.email,
+                from_route=path,
+                to_route=location,
+            )
+        )
+        movement = _wizard_movement(path, location)
+        if movement:
+            events.append(
+                ObservationEvent(
+                    event_type=movement,
+                    method=method,
+                    path=path,
+                    status=status,
+                    user_id=user.user_id,
+                    user_email=user.email,
+                    from_route=path,
+                    to_route=location,
+                    form_fields=tuple(sorted(fields)),
+                )
+            )
+
+    return tuple(events)
+
+
+def _session_from_response_headers(headers: Iterable[tuple[str, str]]) -> dict[str, str] | None:
+    for key, value in reversed(list(headers)):
+        if key.lower() != "set-cookie" or SESSION_COOKIE_NAME not in value:
+            continue
+        jar = cookies.SimpleCookie()
+        jar.load(value)
+        morsel = jar.get(SESSION_COOKIE_NAME)
+        if morsel is None:
+            continue
+        try:
+            payload = json.loads(morsel.value)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return {str(item_key): str(item_value) for item_key, item_value in payload.items()}
+    return None
+
+
+def _header_value(headers: Iterable[tuple[str, str]], name: str) -> str | None:
+    for key, value in headers:
+        if key.lower() == name.lower():
+            return value
+    return None
+
+
+def _wizard_movement(from_route: str, to_route: str) -> str | None:
+    if from_route not in WIZARD_ROUTE_ORDER or to_route not in WIZARD_ROUTE_ORDER:
+        return None
+    if WIZARD_ROUTE_ORDER[to_route] > WIZARD_ROUTE_ORDER[from_route]:
+        return "advance"
+    if WIZARD_ROUTE_ORDER[to_route] < WIZARD_ROUTE_ORDER[from_route]:
+        return "retreat"
+    return None
 
 
 def _session_cookie(session: dict[str, str]) -> str:
