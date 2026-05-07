@@ -11,6 +11,27 @@ Symphony-ready ticket drafts.
 
 The package currently uses the Python standard library at runtime.
 
+## Local UI Host
+
+Start the local wizard scaffold from the repository root:
+
+```sh
+python -m overture ui
+```
+
+The host binds to `localhost` on port `8765` by default and serves the wizard at
+`http://localhost:8765/intake`. Use `--port` to choose another local port. The
+server rejects non-loopback bind addresses and non-loopback clients; session
+state is held in memory on the server and keyed by an opaque session id cookie.
+
+Current placeholder routes are:
+
+- `/intake`
+- `/research`
+- `/synthesis`
+- `/ticket`
+- `/export`
+
 ## Setup
 
 From the repository root:
