@@ -1,4 +1,69 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.python-version
+
+# Overture runtime state (contains potentially sensitive workspace data)
 .overture/
+
+# Local data stores (defense-in-depth in case .overture/ rule is bypassed)
+*.sqlite
+*.sqlite3
+*.db
+
+# Environment variables and secrets — NEVER commit real values
+.env
+.env.*
+!.env.example
+.envrc
+
+# Cryptographic material
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
+# Credential and secret files by convention
+secrets/
+secrets.*
+credentials.*
+service-account*.json
+*-credentials.json
+*-secrets.json
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Node (in case future tooling lands)
+node_modules/
+
+# Coverage
+.coverage
+htmlcov/
+coverage.xml
