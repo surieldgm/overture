@@ -22,6 +22,8 @@ from .backlog_seeder import seed_confirmed_friction_intakes
 from .export_runner import run_ticket_export
 from .fixture import PIPELINE_STAGES, PipelineStageError, run_overture_fixture
 from .friction_log import FRICTION_CATEGORIES, FrictionLog
+from .graph_http import create_graph_http_server, migrate_graph_store
+from .graph_store import DEFAULT_GRAPH_DB_PATH
 from .intake import create_intake_record, load_intake_record
 from .linear_client import LinearClient
 from .metrics_store import DEFAULT_METRICS_DB_PATH, MetricsStore
@@ -97,6 +99,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--quiet-progress",
         action="store_true",
         help="Suppress live fixture stage progress output on stderr.",
+    )
+    fixture.add_argument(
+        "--graph-store",
+        default=None,
+        help="Shared graph HTTP base URL, or local store base directory. Defaults to .overture/graph.sqlite.",
+    )
+
+    graph_server = subparsers.add_parser(
+        "graph-server",
+        help="Serve the shared graph store HTTP API.",
+    )
+    graph_server.add_argument(
+        "--db-path",
+        type=Path,
+        default=DEFAULT_GRAPH_DB_PATH,
+        help="SQLite graph DB path. Defaults to .overture/graph.sqlite.",
+    )
+    graph_server.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host to bind. Defaults to 127.0.0.1.",
+    )
+    graph_server.add_argument(
+        "--port",
+        type=_positive_int,
+        default=8766,
+        help="Port to bind. Defaults to 8766.",
+    )
+
+    graph_migrate = subparsers.add_parser(
+        "graph-migrate",
+        help="Upload an existing local graph SQLite store to the shared graph backend.",
+    )
+    graph_migrate.add_argument(
+        "--source-db",
+        type=Path,
+        default=DEFAULT_GRAPH_DB_PATH,
+        help="Local SQLite graph DB to upload. Defaults to .overture/graph.sqlite.",
+    )
+    graph_migrate.add_argument(
+        "--target-url",
+        required=True,
+        help="Shared graph HTTP base URL, for example http://127.0.0.1:8766.",
     )
 
     run = subparsers.add_parser(
@@ -480,6 +525,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             fixture_kwargs = {
                 "metrics_db_path": args.metrics_db_path,
                 "quiet_progress": args.quiet_progress,
+                "graph_store_base_path": args.graph_store,
             }
             if args.idea:
                 artifacts = run_overture_fixture(
@@ -495,6 +541,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         for stage, path in artifacts.items():
             print(f"{stage}: {path}")
+        return 0
+
+    if args.command == "graph-server":
+        server = create_graph_http_server(args.db_path, host=args.host, port=args.port)
+        print(f"serving graph store on http://{args.host}:{args.port}", flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            return 130
+        finally:
+            server.server_close()
+        return 0
+
+    if args.command == "graph-migrate":
+        try:
+            result = migrate_graph_store(args.source_db, args.target_url)
+        except Exception as exc:
+            print(f"graph migration failed: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, sort_keys=True))
         return 0
 
     if args.command == "run":

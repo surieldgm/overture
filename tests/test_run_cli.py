@@ -151,6 +151,28 @@ class RunCliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 1)
         self.assertIn("run failed at research: no approved sources", result.stderr)
 
+    def test_graph_migrate_command_uploads_source_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_db = Path(tmpdir) / "graph.sqlite"
+            with mock.patch.object(
+                cli,
+                "migrate_graph_store",
+                return_value={"source_records": 3, "accepted": 3, "target_nodes": 2, "target_edges": 1},
+            ) as migrate:
+                result = self._run_cli(
+                    [
+                        "graph-migrate",
+                        "--source-db",
+                        str(source_db),
+                        "--target-url",
+                        "http://127.0.0.1:8766",
+                    ]
+                )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(json.loads(result.stdout), {"source_records": 3, "accepted": 3, "target_nodes": 2, "target_edges": 1})
+        migrate.assert_called_once_with(source_db, "http://127.0.0.1:8766")
+
     def test_fixture_stop_at_stage_writes_only_upstream_artifacts(self) -> None:
         stop_expectations = {
             "intake": ("intake",),
