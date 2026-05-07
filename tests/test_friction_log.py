@@ -28,6 +28,31 @@ class FrictionLogTests(unittest.TestCase):
         self.assertEqual(rows[0].run_id, "run-1")
         self.assertEqual(rows[0].category, "slow")
         self.assertEqual(rows[0].note, "research approval paused long enough to lose context")
+        self.assertFalse(rows[0].confirmed)
+
+    def test_append_and_confirm_flag_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = FrictionLog(Path(tmpdir) / "metrics.sqlite")
+            appended = store.append(
+                session_id="dogfood-day-1",
+                run_id="run-1",
+                category="slow",
+                note="research approval paused long enough to lose context",
+                confirmed=True,
+            )
+            unconfirmed = store.append(
+                session_id="dogfood-day-1",
+                run_id="run-1",
+                category="confusing",
+                note="handoff status was unclear",
+            )
+
+            confirmed_later = store.confirm(unconfirmed.id or 0)
+            confirmed_rows = list(store.iter_entries(confirmed=True))
+
+        self.assertTrue(appended.confirmed)
+        self.assertTrue(confirmed_later.confirmed)
+        self.assertEqual([entry.id for entry in confirmed_rows], [appended.id, unconfirmed.id])
 
     def test_iter_entries_filters_by_session_and_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -37,6 +62,7 @@ class FrictionLogTests(unittest.TestCase):
                 run_id="run-1",
                 category="confusing",
                 note="unclear prompt",
+                confirmed=True,
                 created_at="2026-05-07T10:00:00.000000Z",
             )
             store.append(
@@ -57,10 +83,12 @@ class FrictionLogTests(unittest.TestCase):
             day_one = list(store.iter_entries(session_id="dogfood-day-1"))
             run_one = list(store.iter_entries(run_id="run-1"))
             exact = list(store.iter_entries(session_id="dogfood-day-1", run_id="run-1"))
+            confirmed = list(store.iter_entries(confirmed=True))
 
         self.assertEqual([entry.note for entry in day_one], ["unclear prompt", "export failed"])
         self.assertEqual([entry.note for entry in run_one], ["unclear prompt", "unexpected handoff"])
         self.assertEqual([entry.note for entry in exact], ["unclear prompt"])
+        self.assertEqual([entry.note for entry in confirmed], ["unclear prompt"])
 
     def test_latest_run_id_uses_most_recent_metrics_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

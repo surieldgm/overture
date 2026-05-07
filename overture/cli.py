@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .backlog_seeder import seed_confirmed_friction_intakes
 from .export import parse_ticket_file
 from .export_store import ExportLedger, compute_hash
 from .fixture import PIPELINE_STAGES, PipelineStageError, run_overture_fixture
@@ -274,6 +275,27 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Free-text friction note.",
     )
+    friction_append.add_argument(
+        "--confirmed",
+        action="store_true",
+        help="Flag this friction entry as operator-confirmed for backlog seeding.",
+    )
+
+    friction_confirm = friction_subparsers.add_parser(
+        "confirm",
+        help="Mark an existing friction entry as operator-confirmed.",
+    )
+    friction_confirm.add_argument(
+        "entry_id",
+        type=_positive_int,
+        help="Friction entry id to confirm.",
+    )
+    friction_confirm.add_argument(
+        "--db-path",
+        type=Path,
+        default=DEFAULT_METRICS_DB_PATH,
+        help="SQLite metrics DB path. Defaults to .overture/metrics.sqlite.",
+    )
 
     friction_list = friction_subparsers.add_parser(
         "list",
@@ -296,6 +318,44 @@ def build_parser() -> argparse.ArgumentParser:
         help='Only include entries for this run. Use "latest" for the most recent metrics run.',
     )
     friction_list.add_argument(
+        "--format",
+        choices=("table", "json"),
+        default="table",
+        help="Output format. Defaults to table.",
+    )
+    friction_list.add_argument(
+        "--confirmed",
+        action="store_true",
+        help="Only include operator-confirmed entries.",
+    )
+
+    backlog_seed = subparsers.add_parser(
+        "backlog-seed",
+        help="Seed intake records from confirmed friction entries.",
+    )
+    backlog_seed.add_argument(
+        "--db-path",
+        type=Path,
+        default=DEFAULT_METRICS_DB_PATH,
+        help="SQLite metrics DB path. Defaults to .overture/metrics.sqlite.",
+    )
+    backlog_seed.add_argument(
+        "--store-dir",
+        type=Path,
+        default=Path(".overture") / "intake",
+        help="Directory where seeded intake records are stored.",
+    )
+    backlog_seed.add_argument(
+        "--session-id",
+        default=None,
+        help="Only seed entries for this dogfooding session.",
+    )
+    backlog_seed.add_argument(
+        "--run-id",
+        default=None,
+        help='Only seed entries for this run. Use "latest" for the most recent metrics run.',
+    )
+    backlog_seed.add_argument(
         "--format",
         choices=("table", "json"),
         default="table",
@@ -446,6 +506,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "milestone":
         return _milestone(args)
 
+    if args.command == "backlog-seed":
+        return _backlog_seed(args)
+
     if args.command == "retro":
         return _retro(args)
 
@@ -583,11 +646,21 @@ def _friction(args: argparse.Namespace) -> int:
                 run_id=run_id,
                 category=args.category,
                 note=args.note,
+                confirmed=args.confirmed,
             )
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
         print(f"friction entry {entry.id}: {entry.run_id} {entry.category}")
+        return 0
+
+    if args.friction_command == "confirm":
+        try:
+            entry = log.confirm(args.entry_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"confirmed friction entry {entry.id}: {entry.run_id} {entry.category}")
         return 0
 
     if args.friction_command == "list":
@@ -597,7 +670,13 @@ def _friction(args: argparse.Namespace) -> int:
             if run_id is None:
                 print("no metrics runs recorded yet", file=sys.stderr)
                 return 1
-        entries = list(log.iter_entries(session_id=args.session_id, run_id=run_id))
+        entries = list(
+            log.iter_entries(
+                session_id=args.session_id,
+                run_id=run_id,
+                confirmed=True if args.confirmed else None,
+            )
+        )
         if args.format == "json":
             print(json.dumps([asdict(entry) for entry in entries], sort_keys=True))
             return 0
@@ -620,6 +699,46 @@ def _milestone(args: argparse.Namespace) -> int:
             print(render_human_report(verification))
         return 0 if verification.passed else 1
     return 2
+
+
+def _backlog_seed(args: argparse.Namespace) -> int:
+    log = FrictionLog(args.db_path)
+    run_id = None
+    if args.run_id is not None:
+        run_id = _resolve_friction_run_id(log, args.run_id)
+        if run_id is None:
+            print("no metrics runs recorded yet", file=sys.stderr)
+            return 1
+
+    seeded = seed_confirmed_friction_intakes(
+        friction_log=log,
+        intake_store_dir=args.store_dir,
+        session_id=args.session_id,
+        run_id=run_id,
+    )
+    if args.format == "json":
+        print(
+            json.dumps(
+                [
+                    {
+                        "friction_entry_id": item.friction_entry.id,
+                        "intake_id": item.intake.id,
+                        "path": str(item.path),
+                    }
+                    for item in seeded
+                ],
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if not seeded:
+        print("no confirmed friction entries")
+        return 0
+
+    for item in seeded:
+        print(f"{item.friction_entry.id}: {item.intake.id} {item.path}")
+    return 0
 
 
 def _retro(args: argparse.Namespace) -> int:
@@ -698,7 +817,7 @@ def _friction_table(entries) -> str:
             "id": str(entry.id),
             "session": entry.session_id[: widths["session"]],
             "run_id": entry.run_id[: widths["run_id"]],
-            "category": entry.category,
+            "category": ("*" if entry.confirmed else "") + entry.category,
             "note": entry.note[: widths["note"]],
         }
         lines.append(_format_friction_row(values, widths))
