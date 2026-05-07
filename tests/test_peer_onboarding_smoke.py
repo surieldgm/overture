@@ -17,6 +17,7 @@ from overture.peer_onboarding import (
     designer_one_peer_onboarding_artifact,
     load_designer_one_peer_onboarding_artifact,
     seed_designer_one_peer_onboarding_artifact,
+    ordered_peer_onboarding_sections,
     validate_designer_one_peer_onboarding_artifact,
 )
 from overture.ui_host import build_ui_server
@@ -34,8 +35,10 @@ class PeerOnboardingSmokeTests(unittest.TestCase):
         self.assertEqual(artifact.author_id, DESIGNER_ONE_AUTHOR_ID)
         self.assertGreaterEqual(len(artifact.intake_examples), 3)
         self.assertTrue(all(Path(example["href"]).exists() for example in artifact.intake_examples))
-        self.assertTrue(all(section.get("title") for section in artifact.sections))
-        self.assertTrue(all(section.get("body") or section.get("bullets") for section in artifact.sections))
+        self.assertTrue(all(section.get("title") for section in ordered_peer_onboarding_sections(artifact.template)))
+        for section in ordered_peer_onboarding_sections(artifact.template):
+            for field in section["fields"]:
+                self.assertTrue(field["value"], f"empty field: {section['id']}.{field['id']}")
 
     def test_filled_artifact_is_stored_as_graph_node_with_provenance_edges(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
