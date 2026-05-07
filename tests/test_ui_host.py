@@ -1,4 +1,5 @@
 import http.client
+from http import cookies
 import subprocess
 import sys
 import threading
@@ -6,11 +7,14 @@ import unittest
 from urllib.parse import urlparse
 
 import overture.cli as cli
+from overture.auth import AUTH_COOKIE_NAME, MagicLinkAuth
 from overture.ui_host import (
     WIZARD_ROUTES,
     SessionStore,
     build_ui_server,
 )
+
+TEST_AUTH = MagicLinkAuth(secret="ui-host-test")
 
 
 class UIHostTests(unittest.TestCase):
@@ -40,7 +44,7 @@ class UIHostTests(unittest.TestCase):
         self.assertIn(f"Session <code>{session_id}</code>", first.body)
         self.assertIn(f"Session <code>{session_id}</code>", second.body)
         self.assertIn("has rendered 2 page view(s)", second.body)
-        self.assertNotIn("Set-Cookie", second.headers)
+        self.assertFalse(any(value.startswith("overture_session=") for value in second.header_values("Set-Cookie")))
 
     def test_root_redirects_to_intake(self) -> None:
         with _running_server() as base_url:
@@ -105,7 +109,7 @@ def _running_server() -> "_ServerContext":
 
 class _ServerContext:
     def __enter__(self) -> str:
-        self.server = build_ui_server(port=0)
+        self.server = build_ui_server(port=0, auth_manager=TEST_AUTH)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.server.server_address[:2]
@@ -121,12 +125,20 @@ def _get(base_url: str, path: str, *, headers: dict[str, str] | None = None) -> 
     parsed = urlparse(base_url)
     connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=2)
     try:
-        connection.request("GET", path, headers=headers or {})
+        request_headers = dict(headers or {})
+        if path not in {"/auth/login"} and AUTH_COOKIE_NAME not in request_headers.get("Cookie", ""):
+            token = TEST_AUTH.issue_session("designer@example.com")
+            jar = cookies.SimpleCookie()
+            if request_headers.get("Cookie"):
+                jar.load(request_headers["Cookie"])
+            jar[AUTH_COOKIE_NAME] = token
+            request_headers["Cookie"] = jar.output(header="").strip()
+        connection.request("GET", path, headers=request_headers)
         response = connection.getresponse()
         body = response.read().decode("utf-8")
         return _Response(
             status=response.status,
-            headers={key: value for key, value in response.getheaders()},
+            headers=response.getheaders(),
             body=body,
         )
     finally:
@@ -134,10 +146,14 @@ def _get(base_url: str, path: str, *, headers: dict[str, str] | None = None) -> 
 
 
 class _Response:
-    def __init__(self, *, status: int, headers: dict[str, str], body: str) -> None:
+    def __init__(self, *, status: int, headers: list[tuple[str, str]], body: str) -> None:
         self.status = status
-        self.headers = headers
+        self.all_headers = headers
+        self.headers = dict(headers)
         self.body = body
+
+    def header_values(self, name: str) -> list[str]:
+        return [value for key, value in self.all_headers if key.lower() == name.lower()]
 
 
 if __name__ == "__main__":
