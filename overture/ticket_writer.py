@@ -45,6 +45,7 @@ PRECISE_IMPERATIVE_VERBS = {
 IMPERATIVE_TITLE_REWRITES = {
     "build": "Add",
     "create": "Add",
+    "draft": "Add",
     "implement": "Add",
     "improve": "Add",
     "make": "Add",
