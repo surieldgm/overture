@@ -36,6 +36,7 @@ from .research_llm import (
     write_research_result,
 )
 from .setup import render_setup_report, run_setup
+from .ui_host import DEFAULT_STORE_DIR, OvertureUiApp
 
 
 def _linear_client_factory() -> LinearClient:
@@ -173,6 +174,28 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Workspace root to validate. Defaults to $OVERTURE_HOME or the current directory.",
+    )
+
+    ui = subparsers.add_parser(
+        "ui",
+        help="Run the form-based Overture wizard UI.",
+    )
+    ui.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host interface for the local UI server. Defaults to 127.0.0.1.",
+    )
+    ui.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port for the local UI server. Defaults to 8080.",
+    )
+    ui.add_argument(
+        "--store-dir",
+        type=Path,
+        default=DEFAULT_STORE_DIR,
+        help="Base Overture store directory. Defaults to .overture.",
     )
 
     research = subparsers.add_parser(
@@ -484,6 +507,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(render_setup_report(report), end="")
         return 0 if report.ok else 1
 
+    if args.command == "ui":
+        return _ui(args)
+
     if args.command == "research":
         intake_path = args.store_dir / "intake" / f"{args.intake_id}.json"
         try:
@@ -571,6 +597,19 @@ def _run_single_shot(args: argparse.Namespace) -> int:
             print(f"run failed at linear_export: export exited with code {export_code}", file=sys.stderr)
         return export_code
 
+    return 0
+
+
+def _ui(args: argparse.Namespace) -> int:
+    from wsgiref.simple_server import make_server
+
+    app = OvertureUiApp(store_dir=args.store_dir)
+    with make_server(args.host, args.port, app) as server:
+        print(f"Overture UI listening on http://{args.host}:{args.port}/intake")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            return 0
     return 0
 
 

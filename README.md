@@ -54,6 +54,17 @@ By default, intake records are written under `.overture/intake/`. Use
 python -m overture intake "Document the MVP validation path" --store-dir /tmp/overture-intake
 ```
 
+Start the form-based wizard UI:
+
+```sh
+python -m overture ui --store-dir /tmp/overture-store
+```
+
+Then open `http://127.0.0.1:8080/intake`, enter a raw idea, and submit it.
+The UI writes intake records under `<store-dir>/intake/`, stores the resulting
+intake ID in the browser session, and advances to the research approval route.
+Idea text is capped at 5,000 characters and rejected visibly when over the cap.
+
 Run the deterministic end-to-end fixture:
 
 ```sh
