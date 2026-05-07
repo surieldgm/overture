@@ -603,8 +603,9 @@ def _run_single_shot(args: argparse.Namespace) -> int:
 def _ui(args: argparse.Namespace) -> int:
     from .ui_host import serve_ui_host
 
+    llm_client = fake_llm_client if os.environ.get("OVERTURE_LLM_CLIENT") == "fake" else codex_cli_client
     try:
-        serve_ui_host(host=args.host, port=args.port, store_dir=args.store_dir)
+        serve_ui_host(host=args.host, port=args.port, store_dir=args.store_dir, llm_client=llm_client)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2

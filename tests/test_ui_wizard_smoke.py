@@ -8,7 +8,12 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
 from overture.intake import load_intake_record
-from overture.ui_host import RESEARCH_APPROVAL_ROUTE, SESSION_COOKIE_NAME, build_ui_server
+from overture.ui_host import (
+    RESEARCH_APPROVAL_ROUTE,
+    RESEARCH_COMPLETE_ROUTE,
+    SESSION_COOKIE_NAME,
+    build_ui_server,
+)
 
 
 class WizardPhaseOneSmokeTests(unittest.TestCase):
@@ -53,17 +58,18 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
                 approval_page = _get(base_url, RESEARCH_APPROVAL_ROUTE, headers={"Cookie": intake_cookie})
                 self.assertEqual(approval_page.status, 200)
                 self.assertIn(intake_id, approval_page.body)
-                self.assertIn("Approve research and continue", approval_page.body)
+                self.assertIn("Save approved sources", approval_page.body)
+                self.assertIn("Designer intake research workflow", approval_page.body)
 
                 research_response = _post(
                     base_url,
                     RESEARCH_APPROVAL_ROUTE,
-                    {},
-                    headers={"Cookie": intake_cookie},
+                    {"decision-0": "approve:https://example.test/designer-intake-research"},
+                    headers={"Cookie": approval_page.headers["Set-Cookie"]},
                 )
 
             self.assertEqual(research_response.status, 303)
-            self.assertEqual(research_response.headers["Location"], "/synthesis")
+            self.assertEqual(research_response.headers["Location"], RESEARCH_COMPLETE_ROUTE)
             final_session = _session_from_set_cookie(research_response.headers["Set-Cookie"])
             self.assertEqual(final_session["intake_id"], intake_id)
             self.assertEqual(final_session["research_id"], intake_id)
