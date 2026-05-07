@@ -19,7 +19,7 @@ from typing import Sequence
 
 from .export import parse_ticket_file
 from .export_store import ExportLedger, compute_hash
-from .fixture import PipelineStageError, run_overture_fixture
+from .fixture import PIPELINE_STAGES, PipelineStageError, run_overture_fixture
 from .intake import create_intake_record, load_intake_record
 from .linear_client import LinearAPIError, LinearClient
 from .metrics_store import DEFAULT_METRICS_DB_PATH, MetricsStore
@@ -80,6 +80,60 @@ def build_parser() -> argparse.ArgumentParser:
     fixture.add_argument(
         "--idea",
         help="Raw idea string to use instead of the built-in Overture MVP fixture idea.",
+    )
+
+    run = subparsers.add_parser(
+        "run",
+        help="Run intake through ticket draft, with optional Linear export.",
+    )
+    run.add_argument(
+        "idea",
+        nargs="+",
+        help="Free-form idea text to run through the Overture pipeline.",
+    )
+    run.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(".overture") / "runs" / "latest",
+        help="Directory where run artifacts are written.",
+    )
+    run.add_argument(
+        "--stop-at-stage",
+        choices=_stage_choices(),
+        default=None,
+        help="Stop after the named stage and print that stage's artifact path.",
+    )
+    run.add_argument(
+        "--export",
+        action="store_true",
+        dest="export_to_linear",
+        help="Export the generated ticket draft to Linear at the end of the run.",
+    )
+    run.add_argument(
+        "--team-id",
+        default=os.environ.get("LINEAR_TEAM_ID"),
+        help="Linear team ID for --export. Defaults to LINEAR_TEAM_ID.",
+    )
+    run.add_argument(
+        "--project-id",
+        default=os.environ.get("LINEAR_PROJECT_ID"),
+        help="Linear project ID for --export. Defaults to LINEAR_PROJECT_ID.",
+    )
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --export, validate and print the Linear payload without calling Linear.",
+    )
+    run.add_argument(
+        "--force-recreate",
+        action="store_true",
+        help="With --export, create a new Linear issue even when this ticket path was exported before.",
+    )
+    run.add_argument(
+        "--ledger-db",
+        type=Path,
+        default=None,
+        help="SQLite export ledger path for --export. Defaults to $OVERTURE_HOME/.overture/exports.sqlite.",
     )
 
     research = subparsers.add_parser(
@@ -190,6 +244,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"{stage}: {path}")
         return 0
 
+    if args.command == "run":
+        return _run_single_shot(args)
+
     if args.command == "research":
         intake_path = args.store_dir / "intake" / f"{args.intake_id}.json"
         try:
@@ -226,6 +283,44 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser.print_help(sys.stderr)
     return 2
+
+
+def _run_single_shot(args: argparse.Namespace) -> int:
+    raw_text = " ".join(args.idea)
+    stop_at_stage = _normalize_stage(args.stop_at_stage)
+    try:
+        artifacts = run_overture_fixture(
+            args.output_dir,
+            idea=raw_text,
+            stop_at_stage=stop_at_stage,
+        )
+    except PipelineStageError as exc:
+        print(f"run failed at {exc.stage}: {exc.message}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"run failed at setup: {exc}", file=sys.stderr)
+        return 2
+
+    artifact_stage = stop_at_stage or "ticket_draft"
+    artifact_path = artifacts[artifact_stage]
+    print(artifact_path)
+
+    if args.export_to_linear and artifact_stage == "ticket_draft":
+        export_code = _export_ticket(
+            argparse.Namespace(
+                ticket_path=Path(artifact_path),
+                team_id=args.team_id,
+                project_id=args.project_id,
+                dry_run=args.dry_run,
+                force_recreate=args.force_recreate,
+                ledger_db=args.ledger_db,
+            )
+        )
+        if export_code != 0:
+            print(f"run failed at linear_export: export exited with code {export_code}", file=sys.stderr)
+        return export_code
+
+    return 0
 
 
 def _export_ticket(args: argparse.Namespace) -> int:
@@ -352,6 +447,21 @@ def _positive_int(value: str) -> int:
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
+
+
+def _stage_choices() -> tuple[str, ...]:
+    choices: list[str] = []
+    for stage in PIPELINE_STAGES:
+        choices.append(stage)
+        if "_" in stage:
+            choices.append(stage.replace("_", "-"))
+    return tuple(choices)
+
+
+def _normalize_stage(stage: str | None) -> str | None:
+    if stage is None:
+        return None
+    return stage.replace("-", "_")
 
 
 def _build_linear_client():

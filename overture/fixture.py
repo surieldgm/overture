@@ -40,6 +40,8 @@ TICKET_SECTION_ORDER = (
     "Follow-up candidates",
 )
 
+PIPELINE_STAGES = ("intake", "research", "graph", "synthesis", "ticket_draft")
+
 IMPERATIVE_TITLE_VERBS = (
     "Add",
     "Define",
@@ -74,8 +76,12 @@ def run_overture_fixture(
     graph_store_base_path: Path | str | None = None,
     metrics_db_path: Path | str | None = None,
     intake_factory: Callable[[str, Path], tuple[IntakeRecord, Path]] | None = None,
+    stop_at_stage: str | None = None,
 ) -> dict[str, Path | str]:
     """Run the deterministic Overture MVP fixture and persist every stage."""
+
+    if stop_at_stage is not None and stop_at_stage not in PIPELINE_STAGES:
+        raise ValueError(f"unknown stop_at_stage: {stop_at_stage}")
 
     base_dir = Path(output_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -96,6 +102,8 @@ def run_overture_fixture(
         artifacts["intake"] = intake_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
         _raise_stage("intake", exc)
+    if stop_at_stage == "intake":
+        return artifacts
 
     try:
         research_result, research_path = _record_fixture_stage(
@@ -108,6 +116,8 @@ def run_overture_fixture(
         artifacts["research"] = research_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
         _raise_stage("research", exc)
+    if stop_at_stage == "research":
+        return artifacts
 
     try:
         graph_records, prior_context, graph_context, graph_path = _record_fixture_stage(
@@ -125,6 +135,8 @@ def run_overture_fixture(
         artifacts["graph"] = graph_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
         _raise_stage("graph", exc)
+    if stop_at_stage == "graph":
+        return artifacts
 
     try:
         synthesis, synthesis_path = _record_fixture_stage(
@@ -137,6 +149,8 @@ def run_overture_fixture(
         artifacts["synthesis"] = synthesis_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
         _raise_stage("synthesis", exc)
+    if stop_at_stage == "synthesis":
+        return artifacts
 
     try:
         ticket_path = _record_fixture_stage(
@@ -149,6 +163,8 @@ def run_overture_fixture(
         artifacts["ticket_draft"] = ticket_path
     except Exception as exc:  # pragma: no cover - defensive CLI boundary
         _raise_stage("ticket_draft", exc)
+    if stop_at_stage == "ticket_draft":
+        return artifacts
 
     return artifacts
 
