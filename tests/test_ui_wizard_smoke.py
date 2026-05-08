@@ -284,6 +284,41 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
             self.assertEqual(ticket_page.status, 200)
             self.assertIn('<textarea id="ticket_markdown" name="ticket_markdown"', ticket_page.body)
             self.assertIn("# Add ticket for Help designers validate synthesis before ticket drafting", ticket_page.body)
+            self.assertNotIn('role="alert"', ticket_page.body)
+            ticket_session = _session_from_set_cookie(ticket_page.headers["Set-Cookie"])
+            self.assertIn("# Add ticket for Help designers validate synthesis before ticket drafting", ticket_session["ticket_markdown"])
+
+    def test_ticket_review_redirects_without_synthesis_brief(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            with _running_server(store_dir=store_dir, llm_client=_stub_llm_client) as base_url:
+                ticket_page = _get(base_url, TICKET_REVIEW_ROUTE)
+
+            self.assertEqual(ticket_page.status, 303)
+            self.assertEqual(ticket_page.headers["Location"], SYNTHESIS_ROUTE)
+
+    def test_ticket_review_preserves_user_edits_on_revisit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            with _running_server(store_dir=store_dir, llm_client=_stub_llm_client) as base_url:
+                research_cookie = _approved_research_cookie(base_url)
+                synthesis_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": research_cookie})
+                advance_response = _post(base_url, SYNTHESIS_ROUTE, {}, headers={"Cookie": synthesis_page.headers["Set-Cookie"]})
+                ticket_page = _get(base_url, TICKET_REVIEW_ROUTE, headers={"Cookie": advance_response.headers["Set-Cookie"]})
+                ticket_session = _session_from_set_cookie(ticket_page.headers["Set-Cookie"])
+                edited_markdown = ticket_session["ticket_markdown"] + "\n\nReviewer edit: keep this note."
+                ticket_response = _post(
+                    base_url,
+                    TICKET_REVIEW_ROUTE,
+                    {"ticket_markdown": edited_markdown},
+                    headers={"Cookie": ticket_page.headers["Set-Cookie"]},
+                )
+                revisit_page = _get(base_url, TICKET_REVIEW_ROUTE, headers={"Cookie": ticket_response.headers["Set-Cookie"]})
+
+            self.assertEqual(ticket_response.status, 303)
+            self.assertEqual(ticket_response.headers["Location"], "/export")
+            self.assertEqual(revisit_page.status, 200)
+            self.assertIn("Reviewer edit: keep this note.", revisit_page.body)
 
     def test_synthesis_page_distinguishes_prior_connected_concepts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
