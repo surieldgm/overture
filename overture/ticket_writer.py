@@ -163,6 +163,74 @@ def validate_linear_issue_payload(title: str, description: str) -> tuple[str, ..
     return tuple(errors)
 
 
+TITLE_REQUIRED_HINT = "Include a level-1 title line that starts with `# `."
+
+TITLE_WORD_COUNT_HINT = "Title should be 12 words or fewer."
+TITLE_IMPERATIVE_HINT = (
+    "Start the title with one of: Add, Define, Fix, Remove, Migrate, Expose, "
+    "Validate, Document."
+)
+CANONICAL_ORDER_HINT = (
+    "Use the required section order for this draft: Context, Problem, Proposed change, "
+    "Acceptance criteria, Validation plan, Sources / evidence, Graph provenance, "
+    "Dependencies, Out of scope, Risk / uncertainty, Follow-up candidates."
+)
+EMPTY_SECTION_HINT_PREFIX = "required sections cannot be empty: "
+ACCEPTANCE_CRITERIA_HINT = "Add at least three checkbox entries under Acceptance criteria."
+VALIDATION_PLAN_HINT = "Add executable checks in Validation plan (for example: `python -m unittest discover -s tests` or explicit pass/fail commands)."
+GRAPH_PROVENANCE_HINT = "Include Graph provenance lines for Nodes, Edges, Confidence, and Conflicts."
+DEPENDENCIES_HINT = "List at least one explicit dependency item (or `None.` if intentionally no dependency)."
+OUT_OF_SCOPE_HINT = "List at least one explicit out-of-scope item as a bullet."
+MISSING_SECTIONS_HINT_PREFIX = "ticket is missing a level-one title"
+MISSING_BODY_HINT = "ticket is missing section content"
+INVALID_FRONTMATTER_HINT = "invalid frontmatter"
+
+PLAIN_LANGUAGE_ERROR_HINTS: tuple[tuple[str, str], ...] = (
+    ("title is required", TITLE_REQUIRED_HINT),
+    ("title must be 12 words or fewer", TITLE_WORD_COUNT_HINT),
+    ("title must start with a precise imperative verb", TITLE_IMPERATIVE_HINT),
+    ("title must start with an accepted imperative verb", TITLE_IMPERATIVE_HINT),
+    ("required sections must appear in canonical order", CANONICAL_ORDER_HINT),
+    (EMPTY_SECTION_HINT_PREFIX, "Add missing required sections before continuing."),
+    ("Acceptance criteria must include at least three checkboxes", ACCEPTANCE_CRITERIA_HINT),
+    ("Validation plan must include executable commands or explicit run steps", VALIDATION_PLAN_HINT),
+    ("Graph provenance missing Nodes:", GRAPH_PROVENANCE_HINT),
+    ("Graph provenance missing Edges:", GRAPH_PROVENANCE_HINT),
+    ("Graph provenance missing Confidence:", GRAPH_PROVENANCE_HINT),
+    ("Graph provenance missing Conflicts:", GRAPH_PROVENANCE_HINT),
+    ("Dependencies must be explicit", DEPENDENCIES_HINT),
+    ("Out of scope must include at least one explicit non-goal", OUT_OF_SCOPE_HINT),
+    (MISSING_SECTIONS_HINT_PREFIX, "Add a level-1 title line that starts with `# `."),
+    (MISSING_BODY_HINT, "Add required sections starting with `## Context`."),
+    (INVALID_FRONTMATTER_HINT, "Fix frontmatter formatting before validation."),
+)
+
+
+def validation_error_hints(errors: str | Iterable[str]) -> tuple[str, ...]:
+    """Return human-readable validation hints for validator messages."""
+
+    if isinstance(errors, str):
+        raw_errors = [item.strip() for item in errors.split(";") if item.strip()]
+    else:
+        raw_errors = [str(error).strip() for error in errors if str(error).strip()]
+
+    hints: list[str] = []
+    for error in raw_errors:
+        for needle, hint in PLAIN_LANGUAGE_ERROR_HINTS:
+            if error == needle or error.startswith(needle):
+                hints.append(hint)
+                break
+        else:
+            if "title" in error.lower() and "word" in error.lower():
+                hints.append(TITLE_WORD_COUNT_HINT)
+            elif "imperative" in error.lower():
+                hints.append(TITLE_IMPERATIVE_HINT)
+            elif "section" in error.lower() and "order" in error.lower():
+                hints.append(CANONICAL_ORDER_HINT)
+
+    return tuple(dict.fromkeys(hints))
+
+
 def _coerce_brief(synthesis: SynthesisBrief | Mapping[str, Any]) -> SynthesisBrief:
     if isinstance(synthesis, SynthesisBrief):
         return synthesis
