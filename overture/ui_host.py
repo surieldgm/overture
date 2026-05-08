@@ -639,7 +639,7 @@ class OvertureUiApp:
             response={"status": 200, "has_markdown": bool(result.markdown)},
             error=result.error,
         )
-        if result.error == "No synthesis brief is stored in this session. Return to synthesis before reviewing a ticket.":
+        if result.empty_state is not None:
             return self._redirect(
                 start_response,
                 SYNTHESIS_ROUTE,
