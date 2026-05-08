@@ -1,11 +1,14 @@
 import tempfile
 import unittest
-from html.parser import HTMLParser
 from pathlib import Path
+from html.parser import HTMLParser
 
 from overture.auth import AUTH_COOKIE_NAME
+from overture.graph_store import SqliteGraphStore
 from overture.intake import load_intake_record
+from overture.peer_onboarding import load_latest_peer_onboarding_artifact, ordered_peer_onboarding_sections
 from overture.ui_host import (
+    PEER_ONBOARDING_EDITOR_ROUTE,
     PEER_ONBOARDING_ROUTE,
     RESEARCH_APPROVAL_ROUTE,
     OvertureUiApp,
@@ -102,6 +105,74 @@ class PeerOnboardingPageTests(unittest.TestCase):
             self.assertIn("Approve", approval.body)
             self.assertIn("Reject", approval.body)
 
+    def test_unauthenticated_peer_onboarding_editor_redirects_to_login(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response = _request(OvertureUiApp(store_dir=tmpdir), "GET", PEER_ONBOARDING_EDITOR_ROUTE, authenticated=False)
+
+        self.assertEqual(response.status, "302 Found")
+        self.assertEqual(response.headers["Location"], f"/auth/login?next={PEER_ONBOARDING_EDITOR_ROUTE}")
+
+    def test_peer_onboarding_editor_page_renders_all_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response = _request(OvertureUiApp(store_dir=tmpdir), "GET", PEER_ONBOARDING_EDITOR_ROUTE)
+
+        self.assertEqual(response.status, "200 OK")
+        self.assertIn("Edit peer onboarding artifact", response.body)
+        self.assertIn('action="/peer-onboarding/edit"', response.body)
+        self.assertIn("What intake worked", response.body)
+        self.assertIn("What research approval looked like", response.body)
+        self.assertIn("What to watch out for at each wizard step", response.body)
+        self.assertIn("Sprint 5 observation patterns to carry forward", response.body)
+        self.assertIn("Designer #1&#x27;s verb-led intake pattern still works", response.body)
+
+    def test_peer_onboarding_editor_fill_and_save_persists_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            store = SqliteGraphStore(Path(tmpdir) / "graph.sqlite")
+            artifact = load_latest_peer_onboarding_artifact(store)
+            payload = _peer_onboarding_editor_payload(
+                artifact,
+                {
+                    "intake_worked.summary": "Designer #1 can now draft richer handoff summaries.",
+                    "intake_worked.example_prompts": "Prompt A\nPrompt B",
+                    "wizard_watchouts.step_notes.0": "Keep initial raw wording visible before summarization.",
+                },
+            )
+            response = _request(app, "POST", PEER_ONBOARDING_EDITOR_ROUTE, payload)
+
+            self.assertEqual(response.status, "303 See Other")
+            self.assertEqual(response.headers["Location"], PEER_ONBOARDING_ROUTE)
+
+            viewer = _request(app, "GET", PEER_ONBOARDING_ROUTE, cookie=response.headers["Set-Cookie"])
+            self.assertEqual(viewer.status, "200 OK")
+            self.assertIn("Designer #1 can now draft richer handoff summaries.", viewer.body)
+            self.assertIn("Keep initial raw wording visible before summarization.", viewer.body)
+            self.assertIn("<li>Prompt A</li>", viewer.body)
+            self.assertIn("<li>Prompt B</li>", viewer.body)
+
+    def test_peer_onboarding_editor_loads_existing_artifact_and_allows_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            store = SqliteGraphStore(Path(tmpdir) / "graph.sqlite")
+            artifact = load_latest_peer_onboarding_artifact(store)
+            edit_page = _request(app, "GET", PEER_ONBOARDING_EDITOR_ROUTE)
+
+            self.assertEqual(edit_page.status, "200 OK")
+            self.assertIn("Designer #1&#x27;s verb-led intake pattern still works", edit_page.body)
+
+            payload = _peer_onboarding_editor_payload(
+                artifact,
+                {"research_approval.approval_summary": "Designer #3 can now validate evidence before any approval path."},
+            )
+            saved = _request(app, "POST", PEER_ONBOARDING_EDITOR_ROUTE, payload, cookie=edit_page.headers["Set-Cookie"])
+
+            self.assertEqual(saved.status, "303 See Other")
+            self.assertEqual(saved.headers["Location"], PEER_ONBOARDING_ROUTE)
+
+            viewer = _request(app, "GET", PEER_ONBOARDING_ROUTE, cookie=saved.headers["Set-Cookie"])
+            self.assertEqual(viewer.status, "200 OK")
+            self.assertIn("Designer #3 can now validate evidence before any approval path.", viewer.body)
+
 
 def _synthetic_intake_from_peer_artifact(body: str) -> str:
     visible_text = _visible_text(body)
@@ -125,6 +196,45 @@ def _synthetic_intake_from_peer_artifact(body: str) -> str:
         "route check plus a unittest command. Scope the request to reaching research approval with local candidate "
         "sources visible."
     )
+
+
+def _peer_onboarding_editor_payload(artifact: object, overrides: dict[str, str] | None = None) -> dict[str, str]:
+    sections = ordered_peer_onboarding_sections(getattr(artifact, "template", {}))
+    field_values: dict[str, str] = {}
+    for section in sections:
+        section_id = str(section.get("id", ""))
+        fields = section.get("fields", ())
+        if not isinstance(fields, list):
+            continue
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            field_id = str(field.get("id", ""))
+            if not field_id:
+                continue
+            key = f"{section_id}.{field_id}"
+            kind = str(field.get("kind", "free_text"))
+            if kind == "list_text":
+                value_lines = [str(item) for item in field.get("value", ()) if str(item).strip()]
+                field_values[key] = "\n".join(value_lines) if value_lines else "default line"
+            elif kind == "wizard_step_notes":
+                steps = field.get("steps", ())
+                if not isinstance(steps, tuple) and not isinstance(steps, list):
+                    steps = ()
+                existing = field.get("value", ())
+                notes = {
+                    str(item.get("step", "")): str(item.get("note", ""))
+                    for item in existing
+                    if isinstance(item, dict)
+                }
+                for index, step in enumerate(steps):
+                    field_values[f"{key}.{index}"] = notes.get(str(step), "")
+            else:
+                field_values[key] = str(field.get("value", ""))
+
+    if overrides:
+        field_values.update(overrides)
+    return field_values
 
 
 def _visible_text(body: str) -> str:
