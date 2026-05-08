@@ -1279,6 +1279,16 @@ def prepare_ticket_review(session: dict[str, str], *, user: AuthenticatedUser | 
         next_session = _session_for_user(next_session, user)
     existing = next_session.get(SESSION_TICKET_MARKDOWN_KEY)
     if existing:
+        try:
+            parse_ticket_markdown(existing)
+        except ValueError as exc:
+            message = str(exc)
+            return TicketReviewResult(
+                session=next_session,
+                markdown=existing,
+                error=message,
+                validation_hints=validation_error_hints(message),
+            )
         return TicketReviewResult(session=next_session, markdown=existing)
 
     brief_json = next_session.get(SESSION_SYNTHESIS_BRIEF_KEY) or next_session.get("synthesis")
@@ -2037,6 +2047,7 @@ def render_ticket_review_page(
         error_markup = f'<div class="validation" role="alert"><ul>{hint_items}</ul></div>'
     else:
         error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
+    disabled_attr = 'disabled="disabled"' if validation_hints or error else ""
     session_note = (
         '<p class="session-note">Draft is stored in this browser session until export.</p>'
         if session.get(SESSION_TICKET_MARKDOWN_KEY)
@@ -2054,7 +2065,7 @@ def render_ticket_review_page(
             <textarea id="ticket_markdown" name="ticket_markdown" autofocus>{escaped_markdown}</textarea>
             <div class="form-footer">
               <span>{len(markdown)} characters</span>
-              <button type="submit">Validate and continue</button>
+              <button type="submit" name="action" value="advance" {disabled_attr}>Advance to export</button>
             </div>
             {error_markup}
             {session_note}
@@ -2498,6 +2509,7 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
     td code {{ display: block; max-width: 260px; overflow-wrap: anywhere; white-space: normal; }}
     button, a {{ color: var(--accent); font-weight: 650; }}
     button, a.button {{ border: 0; border-radius: 6px; background: var(--accent); color: white; padding: 10px 14px; cursor: pointer; font: inherit; text-decoration: none; }}
+    button:disabled {{ opacity: 0.5; background: #c4cdd6; cursor: not-allowed; color: #4a5568; }}
     button.secondary {{ background: #edf2f7; color: var(--ink); }}
     .primary-action {{ display: inline-block; border-radius: 6px; background: var(--accent); color: white; padding: 10px 14px; text-decoration: none; }}
     .validation {{ color: var(--danger); margin: 12px 0 0; font-weight: 650; }}
