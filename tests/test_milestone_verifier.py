@@ -6,9 +6,14 @@ import unittest
 from pathlib import Path
 
 import overture.cli as cli
+from overture.auth import AuthenticatedUser
 from overture.export_store import ExportLedger, compute_hash
 from overture.friction_log import FrictionLog
+from overture.graph import GraphRecord
+from overture.graph_store import SqliteGraphStore
 from overture.metrics_store import MetricsStore, StageMetric
+from overture.metrics_store import TicketMetric
+from overture.observation_log import ObservationLog
 
 
 class MilestoneVerifierTests(unittest.TestCase):
@@ -76,6 +81,51 @@ class MilestoneVerifierTests(unittest.TestCase):
         self.assertIn("FAIL dogfooding_days: observed=0 target=2 deficit=2", result.stdout)
         self.assertIn("FAIL generated_retro: observed=0 target=1 deficit=1", result.stdout)
 
+    def test_m3_all_pass_loads_registry_rules_and_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            config = _write_m3_config(workspace)
+            _populate_m3_workspace(workspace, designers=3, observation_sessions=3, peer_artifacts=1, retro_docs=1)
+
+            result = _run_cli(["milestone", "verify", "--config", str(config), "--workspace", str(workspace)])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("Milestone M3: PASS", result.stdout)
+        self.assertIn("PASS m3_designers_shipped: observed=3 target=3", result.stdout)
+        self.assertIn("PASS m3_peer_onboarding_artifacts: observed=1 target=1", result.stdout)
+        self.assertIn("PASS m3_observation_sessions: observed=3 target=3", result.stdout)
+        self.assertIn("PASS m3_retro_docs: observed=1 target=1", result.stdout)
+
+    def test_m3_partial_pass_names_missing_peer_artifact_and_exits_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            config = _write_m3_config(workspace)
+            _populate_m3_workspace(workspace, designers=3, observation_sessions=3, peer_artifacts=0, retro_docs=1)
+
+            result = _run_cli(["milestone", "verify", "--config", str(config), "--workspace", str(workspace)])
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("Milestone M3: FAIL", result.stdout)
+        self.assertIn("FAIL m3_peer_onboarding_artifacts: observed=0 target=1 deficit=1", result.stdout)
+        self.assertIn("PASS m3_designers_shipped: observed=3 target=3", result.stdout)
+
+    def test_m3_all_fail_reports_each_registry_deficit_without_mutating_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            config = _write_m3_config(workspace)
+
+            result = _run_cli(["milestone", "verify", "--config", str(config), "--workspace", str(workspace)])
+
+            self.assertFalse((workspace / ".overture").exists(), "M3 verifier must not create local store directories")
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("Milestone M3: FAIL", result.stdout)
+        self.assertIn("FAIL m3_designers_shipped: observed=0 target=3 deficit=3", result.stdout)
+        self.assertIn("FAIL m3_peer_onboarding_artifacts: observed=0 target=1 deficit=1", result.stdout)
+        self.assertIn("FAIL m3_observation_sessions: observed=0 target=3 deficit=3", result.stdout)
+        self.assertIn("FAIL m3_retro_docs: observed=0 target=1 deficit=1", result.stdout)
+
 
 def _write_config(workspace: Path, *, target: int) -> Path:
     config = {
@@ -89,6 +139,13 @@ def _write_config(workspace: Path, *, target: int) -> Path:
         },
     }
     path = workspace / "milestone.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    return path
+
+
+def _write_m3_config(workspace: Path) -> Path:
+    config = {"milestone": "M3"}
+    path = workspace / "m3.json"
     path.write_text(json.dumps(config), encoding="utf-8")
     return path
 
@@ -136,6 +193,61 @@ def _populate_workspace(
             f"issue-{index}",
             f"https://linear.app/eria/issue/ERI-{index}/ticket",
         )
+
+
+def _populate_m3_workspace(
+    workspace: Path,
+    *,
+    designers: int,
+    observation_sessions: int,
+    peer_artifacts: int,
+    retro_docs: int,
+) -> None:
+    metrics = MetricsStore(workspace / ".overture" / "metrics.sqlite")
+    for index in range(designers):
+        metrics.record_ticket(
+            TicketMetric(
+                ticket_id=f"ERI-M3-{index}",
+                author_id=f"designer-{index + 1}",
+                author_email=f"designer-{index + 1}@example.test",
+                sprint_label="m3-s7",
+                milestone="M3",
+            )
+        )
+
+    actor = AuthenticatedUser(user_id="observer@example.test", email="observer@example.test")
+    observations = ObservationLog(workspace / ".overture" / "observation.sqlite")
+    for index in range(observation_sessions):
+        observations.append(
+            session_id=f"designer-session-{index + 1}",
+            event_type="http",
+            route="/intake",
+            action="submit",
+            actor=actor,
+            request={"index": index},
+            response={"ok": True},
+        )
+
+    if peer_artifacts:
+        graph = SqliteGraphStore(workspace / ".overture" / "graph.sqlite")
+        for index, node_id in enumerate(
+            (
+                "component_designer_one_filled_artifact",
+                "component_designer_three_peer_onboarding_artifact",
+            )[:peer_artifacts]
+        ):
+            graph.upsert_record(
+                GraphRecord(
+                    kind="Component",
+                    key=node_id,
+                    properties={"label": f"M3 peer artifact {index + 1}", "viewer_route": "/peer-onboarding"},
+                )
+            )
+
+    for index in range(retro_docs):
+        retro = workspace / ".overture" / "retros" / f"m3-retro-{index + 1}.md"
+        retro.parent.mkdir(parents=True, exist_ok=True)
+        retro.write_text("# M3 Retro\n", encoding="utf-8")
 
 
 def _write_retro(workspace: Path) -> None:
