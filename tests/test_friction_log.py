@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+import sqlite3
 
 from overture.friction_log import FrictionLog
 from overture.metrics_store import MetricsStore, StageMetric
@@ -110,6 +111,62 @@ class FrictionLogTests(unittest.TestCase):
                     category="annoying",
                     note="too broad",
                 )
+
+    def test_append_accepts_designer_rollout_categories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = FrictionLog(Path(tmpdir) / "metrics.sqlite")
+
+            entry = store.append(
+                session_id="m3",
+                run_id="three-designer-rollout",
+                category="designer-experience",
+                note="source approval state is hard to scan",
+                confirmed=True,
+            )
+
+        self.assertEqual(entry.category, "designer-experience")
+        self.assertTrue(entry.confirmed)
+
+    def test_existing_legacy_category_check_is_migrated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "metrics.sqlite"
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE friction_entries (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        note TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        author_id TEXT,
+                        author_email TEXT,
+                        confirmed INTEGER NOT NULL DEFAULT 0,
+                        CHECK (category IN ('slow', 'confusing', 'broken', 'surprising'))
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO friction_entries (
+                        session_id, run_id, category, note, created_at, confirmed
+                    )
+                    VALUES ('m1', 'run-1', 'slow', 'legacy row', '2026-05-07T10:00:00.000000Z', 1)
+                    """
+                )
+
+            store = FrictionLog(db_path)
+            store.append(
+                session_id="m3",
+                run_id="three-designer-rollout",
+                category="onboarding",
+                note="first-run setup lacks enough context",
+                confirmed=True,
+            )
+            entries = list(store.iter_entries(confirmed=True))
+
+        self.assertEqual([entry.category for entry in entries], ["slow", "onboarding"])
 
 
 def _metric(run_id: str, started_at: str) -> StageMetric:

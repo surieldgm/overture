@@ -145,7 +145,7 @@ python -m overture friction list \
 python -m overture friction confirm <entry-id>
 ```
 
-Categories: `slow`, `confusing`, `broken`, `surprising`.
+Categories: `slow`, `confusing`, `broken`, `surprising`, `designer-experience`, `onboarding`, `performance`, `error-handling`, `uncategorized`.
 
 ### Milestone closing
 
@@ -161,6 +161,7 @@ python -m overture retro --milestone "Overture MVP" \
 
 # Seed the next milestone's intake records from confirmed frictions
 python -m overture backlog-seed --target-milestone M2
+python -m overture backlog-seed --target-milestone M4 --session-id m3
 ```
 
 ## Manual workflow (smoke testing changes)
