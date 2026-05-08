@@ -26,6 +26,10 @@ GraphRecordKind = Literal[
     "supports",
     "addresses",
     "depends_on",
+    "embeds",
+    "instantiates",
+    "references",
+    "requires",
     "suggests",
 ]
 

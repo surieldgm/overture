@@ -31,7 +31,19 @@ NODE_KINDS = {
     "TicketCandidate",
     "UserInput",
 }
-EDGE_KINDS = {"CITES", "HAS_CLAIM", "derived_from", "supports", "addresses", "depends_on", "suggests"}
+EDGE_KINDS = {
+    "CITES",
+    "HAS_CLAIM",
+    "derived_from",
+    "supports",
+    "addresses",
+    "depends_on",
+    "embeds",
+    "instantiates",
+    "references",
+    "requires",
+    "suggests",
+}
 
 
 class SqliteGraphStore:
