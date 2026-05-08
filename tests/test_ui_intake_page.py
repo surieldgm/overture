@@ -341,7 +341,7 @@ class IntakePageTests(unittest.TestCase):
 
         self.assertEqual(response.status, "400 Bad Request")
         self.assertNotIn("Location", response.headers)
-        self.assertIn("required sections must appear in canonical order", response.body)
+        self.assertIn("Use the required section order for this draft", response.body)
         self.assertIn('role="alert"', response.body)
         self.assertIn("## Acceptance notes", response.body)
 
