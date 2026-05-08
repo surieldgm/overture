@@ -1023,7 +1023,10 @@ def prepare_research_review(
         )
 
     next_session = dict(session)
+    next_session.pop(SESSION_CANDIDATES_KEY, None)
     candidates = _session_candidates(next_session, intake_id)
+    if not candidates:
+        candidates = _research_candidate_cache(store_dir, intake_id)
     if not candidates:
         try:
             intake = load_intake_record(Path(store_dir) / "intake" / f"{intake_id}.json")
@@ -1042,7 +1045,7 @@ def prepare_research_review(
             )
             for item in result.items
         )
-        next_session = _store_session_candidates(next_session, intake_id, candidates)
+        _cache_research_candidates(store_dir, intake_id, candidates)
         next_session = _store_session_approvals(next_session, intake_id, {_source_key(source) for source in candidates})
         if result.errors and not candidates:
             return ResearchReviewResult(next_session, candidates, result.errors[0].message)
@@ -1059,12 +1062,16 @@ def submit_research_approvals(
 ) -> ResearchReviewResult:
     intake_id = session.get("intake_id", "")
     candidates = _session_candidates(session, intake_id) if intake_id else ()
+    if not candidates and intake_id:
+        candidates = _research_candidate_cache(store_dir, intake_id)
     selected = {str(key) for key in approved_keys}
     next_session = _store_session_approvals(dict(session), intake_id, selected) if intake_id else dict(session)
 
     if not intake_id:
+        _clear_research_candidate_cache(store_dir, intake_id)
         return ResearchReviewResult(next_session, candidates, "No intake is stored in this session.")
     if not candidates:
+        _clear_research_candidate_cache(store_dir, intake_id)
         return ResearchReviewResult(next_session, candidates, "No suggested sources are available for this intake.")
     if not selected:
         return ResearchReviewResult(next_session, candidates, "Approve at least one source before continuing.")
@@ -1360,6 +1367,41 @@ def _session_candidates(session: Mapping[str, str], intake_id: str) -> tuple[Cur
             if source is not None:
                 sources.append(source)
     return tuple(sources)
+
+
+def _research_candidate_cache(store_dir: Path | str, intake_id: str) -> tuple[CuratedSource, ...]:
+    path = _research_candidate_cache_path(store_dir, intake_id)
+    if not path.exists():
+        return ()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return ()
+    if not isinstance(payload, list):
+        return ()
+    sources = []
+    for item in payload:
+        if isinstance(item, Mapping):
+            source = _normalize_source(item)
+            if source is not None:
+                sources.append(source)
+    return tuple(sources)
+
+
+def _cache_research_candidates(store_dir: Path | str, intake_id: str, candidates: Iterable[CuratedSource]) -> None:
+    path = _research_candidate_cache_path(store_dir, intake_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = [_source_to_jsonable(source) for source in candidates]
+    path.write_text(json.dumps(serialized, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _research_candidate_cache_path(store_dir: Path | str, intake_id: str) -> Path:
+    return Path(store_dir) / "session" / f"{intake_id}-candidates.json"
+
+
+def _clear_research_candidate_cache(store_dir: Path | str, intake_id: str) -> None:
+    path = _research_candidate_cache_path(store_dir, intake_id)
+    path.unlink(missing_ok=True)
 
 
 def _session_approval_keys(session: Mapping[str, str], intake_id: str) -> set[str]:
