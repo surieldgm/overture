@@ -27,6 +27,8 @@ class PeerOnboardingPageTests(unittest.TestCase):
 
         self.assertEqual(response.status, "200 OK")
         self.assertIn("Designer #1 + Designer #2 peer onboarding artifact for Designer #3", response.body)
+        self.assertIn("Designer #1", response.body)
+        self.assertIn("Designer #2", response.body)
         self.assertIn("Generation 2", response.body)
         self.assertIn("Generation 1", response.body)
         self.assertIn("Designer #1 peer onboarding artifact", response.body)

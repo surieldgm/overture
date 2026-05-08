@@ -43,6 +43,14 @@ class IntakePageTests(unittest.TestCase):
             self.assertEqual(response.headers["Location"], "/auth/login?next=/intake")
             self.assertEqual(list((Path(tmpdir) / "intake").glob("*.json")), [])
 
+    def test_login_page_uses_role_neutral_overture_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response = _request(OvertureUiApp(store_dir=tmpdir), "GET", "/auth/login", authenticated=False)
+
+        self.assertEqual(response.status, "200 OK")
+        self.assertIn("Sign in to Overture", response.body)
+        self.assertNotIn("Designer sign in", response.body)
+
     def test_magic_link_flow_establishes_refreshed_designer_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             app = OvertureUiApp(store_dir=tmpdir)
@@ -50,6 +58,8 @@ class IntakePageTests(unittest.TestCase):
 
             self.assertEqual(sent.status, "200 OK")
             self.assertIn("designer@example.com", sent.body)
+            self.assertIn("Open the magic link locally", sent.body)
+            self.assertNotIn("Open development magic link", sent.body)
             outbox = Path(tmpdir) / "magic-links.jsonl"
             payload = json.loads(outbox.read_text(encoding="utf-8").splitlines()[-1])
             link_path = urlparse(payload["link"]).path + "?" + urlparse(payload["link"]).query
@@ -84,13 +94,18 @@ class IntakePageTests(unittest.TestCase):
 
     def test_intake_page_renders_form_and_curated_examples_link(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            response = _request(OvertureUiApp(store_dir=tmpdir), "GET", "/intake")
+            app = OvertureUiApp(store_dir=tmpdir)
+            auth_cookie = _merge_cookie(None, AUTH_COOKIE_NAME, app.auth_manager.issue_session("operator@example.com"))
+            response = _request(app, "GET", "/intake", cookie=auth_cookie, authenticated=False)
 
         self.assertEqual(response.status, "200 OK")
         self.assertIn('<textarea id="idea" name="idea"', response.body)
+        self.assertIn("Describe your idea before starting research.", response.body)
         self.assertIn("Start research approval", response.body)
         self.assertIn('href="/examples/intake_examples/"', response.body)
         self.assertIn(f"{INTAKE_TEXT_MAX_CHARS:,}", response.body)
+        self.assertNotIn("Capture the designer idea before research starts.", response.body)
+        self.assertNotIn("designer", response.body.lower())
 
     def test_non_empty_submit_creates_intake_persists_session_and_advances(self) -> None:
         idea = "Build a page that starts Overture without opening a terminal"
@@ -242,6 +257,7 @@ class IntakePageTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status, "200 OK")
+        self.assertIn('<label for="ticket_markdown">Ticket draft</label>', response.body)
         self.assertIn('<textarea id="ticket_markdown" name="ticket_markdown"', response.body)
         self.assertIn("# Add ticket review surface", response.body)
         self.assertIn("## Acceptance criteria", response.body)

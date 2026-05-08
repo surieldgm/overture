@@ -84,7 +84,7 @@ WIZARD_ROUTES: tuple[WizardRoute, ...] = (
         path="/intake",
         label="Intake",
         title="Intake",
-        placeholder="Capture the designer idea before research starts.",
+        placeholder="Describe your idea before starting research.",
     ),
     WizardRoute(
         path="/research",
@@ -1408,11 +1408,11 @@ def render_login_page(*, email: str = "", error: str | None = None) -> str:
     escaped_email = html.escape(email)
     error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
     return render_layout(
-        title="Designer sign in",
+        title="Sign in to Overture",
         active_path="/intake",
         content=f"""
         <section class="workspace auth-panel">
-          <h2>Designer sign in</h2>
+          <h2>Sign in to Overture</h2>
           <p>Enter the email address you use for Overture. We will send a short-lived sign-in link.</p>
           <form method="post" action="{AUTH_MAGIC_LINK_ROUTE}" novalidate>
             <label for="email">Email</label>
@@ -1443,7 +1443,7 @@ def render_magic_link_sent_page(email: str, link: str, outbox_path: Path | None)
           <h2>Magic link sent</h2>
           <p>A sign-in link was sent to <code>{html.escape(email)}</code>. It expires in 15 minutes.</p>
           {outbox_markup}
-          <p class="session-note"><a href="{html.escape(link)}">Open development magic link</a></p>
+          <p class="session-note"><a href="{html.escape(link)}">Open the magic link locally</a></p>
         </section>
         """,
     )
@@ -1473,7 +1473,7 @@ def render_unauthorized_page() -> str:
         content=f"""
         <section class="workspace auth-panel">
           <h2>Authentication required</h2>
-          <p>This backend route requires a current designer session.</p>
+          <p>This backend route requires a current Overture session.</p>
           <p><a href="{AUTH_LOGIN_ROUTE}">Request a magic link</a></p>
         </section>
         """,
@@ -1676,7 +1676,7 @@ def render_ticket_review_page(session: dict[str, str], *, markdown: str = "", er
           <h2>Ticket</h2>
           <p>{html.escape(ROUTES_BY_PATH[TICKET_REVIEW_ROUTE].placeholder)}</p>
           <form method="post" action="{TICKET_REVIEW_ROUTE}" novalidate>
-            <label for="ticket_markdown">Ticket Markdown</label>
+            <label for="ticket_markdown">Ticket draft</label>
             <textarea id="ticket_markdown" name="ticket_markdown" autofocus>{escaped_markdown}</textarea>
             <div class="form-footer">
               <span>{len(markdown)} characters</span>
