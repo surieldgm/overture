@@ -1427,7 +1427,12 @@ def render_login_page(*, email: str = "", error: str | None = None) -> str:
 def render_magic_link_sent_page(email: str, link: str, outbox_path: Path | None) -> str:
     escaped_path = html.escape(str(outbox_path)) if outbox_path else ""
     outbox_markup = (
-        f'<p class="session-note">Development outbox: <code>{escaped_path}</code></p>'
+        f"""
+          <details class="session-note dev-details">
+            <summary>Local development details</summary>
+            <p>Development outbox: <code>{escaped_path}</code></p>
+          </details>
+        """
         if outbox_path
         else ""
     )
@@ -1438,8 +1443,8 @@ def render_magic_link_sent_page(email: str, link: str, outbox_path: Path | None)
         <section class="workspace auth-panel">
           <h2>Magic link sent</h2>
           <p>A sign-in link was sent to <code>{html.escape(email)}</code>. It expires in 15 minutes.</p>
-          {outbox_markup}
           <p class="session-note"><a href="{html.escape(link)}">Open the magic link locally</a></p>
+          {outbox_markup}
         </section>
         """,
     )
@@ -2038,6 +2043,9 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
     button.secondary {{ background: #edf2f7; color: var(--ink); }}
     .validation {{ color: var(--danger); margin: 12px 0 0; font-weight: 650; }}
     .session, .session-note {{ color: var(--muted); margin-bottom: 0; }}
+    .dev-details {{ margin-top: 16px; }}
+    .dev-details summary {{ cursor: pointer; font-weight: 650; }}
+    .dev-details p {{ margin: 8px 0 0; }}
     code {{ background: #edf2f7; padding: 2px 4px; border-radius: 4px; }}
     @media (max-width: 760px) {{
       .shell {{ grid-template-columns: minmax(0, 1fr); padding: 20px 12px; }}
