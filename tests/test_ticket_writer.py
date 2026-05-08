@@ -4,6 +4,7 @@ from overture.synthesis import GraphContext, synthesize_graph_context
 from overture.ticket_writer import (
     REQUIRED_SECTION_HEADINGS,
     generate_linear_issue_draft,
+    validation_error_hints,
     validate_linear_issue_payload,
 )
 
@@ -69,6 +70,43 @@ def test_validation_rejects_missing_required_ticket_sections() -> None:
 
     assert "required sections must appear in canonical order" in errors
     assert any("required sections cannot be empty" in error for error in errors)
+
+
+def test_validation_error_hints_translate_known_linear_schema_rules() -> None:
+    raw_errors = (
+        "title is required;"
+        "title must be 12 words or fewer;"
+        "title must start with a precise imperative verb;"
+        "required sections must appear in canonical order;"
+        "required sections cannot be empty: ## Acceptance criteria;"
+        "Acceptance criteria must include at least three checkboxes;"
+        "Validation plan must include executable commands or explicit run steps;"
+        "Graph provenance missing Nodes:;"
+        "Graph provenance missing Edges:;"
+        "Graph provenance missing Confidence:;"
+        "Graph provenance missing Conflicts:;"
+        "Dependencies must be explicit;"
+        "Out of scope must include at least one explicit non-goal;"
+    )
+    hints = validation_error_hints(raw_errors)
+
+    assert "Add a level-1 title line that starts with `# `." in hints
+    assert "Title should be 12 words or fewer." in hints
+    assert "Start the title with one of: Add, Define, Fix, Remove, Migrate, Expose, Validate, Document." in hints
+    assert "Use the required section order for this draft: Context, Problem, Proposed change, Acceptance criteria, Validation plan, Sources / evidence, Graph provenance, Dependencies, Out of scope, Risk / uncertainty, Follow-up candidates." in hints
+    assert "Add missing required sections before continuing." in hints
+    assert "Add at least three checkbox entries under Acceptance criteria." in hints
+    assert (
+        "Add executable checks in Validation plan (for example: `python -m unittest discover -s tests` or explicit pass/fail commands)."
+        in hints
+    )
+    assert "Include Graph provenance lines for Nodes, Edges, Confidence, and Conflicts." in hints
+    assert "List at least one explicit dependency item (or `None.` if intentionally no dependency)." in hints
+    assert "List at least one explicit out-of-scope item as a bullet." in hints
+
+
+def test_validation_error_hints_for_empty_inputs() -> None:
+    assert validation_error_hints(()) == ()
 
 
 class TicketWriterGraphProvenanceContractTests(unittest.TestCase):

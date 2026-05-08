@@ -41,7 +41,7 @@ from .research_llm import (
     write_research_result,
 )
 from .synthesis import GraphContext, SynthesisBrief, synthesize_graph_context
-from .ticket_writer import generate_linear_issue_draft
+from .ticket_writer import generate_linear_issue_draft, validation_error_hints
 
 INTAKE_TEXT_MAX_CHARS = 5000
 DEFAULT_UI_HOST = "127.0.0.1"
@@ -174,6 +174,7 @@ class TicketReviewResult:
     session: dict[str, str]
     markdown: str = ""
     error: str | None = None
+    validation_hints: tuple[str, ...] = ()
     empty_state: EmptyStateGuidance | None = None
 
 
@@ -651,6 +652,7 @@ class OvertureUiApp:
                 result.session,
                 markdown=result.markdown,
                 error=result.error,
+                validation_hints=result.validation_hints,
                 empty_state=result.empty_state,
             ),
             extra_headers=[("Set-Cookie", _session_cookie(result.session))],
@@ -674,7 +676,12 @@ class OvertureUiApp:
             )
             return self._render(
                 start_response,
-                render_ticket_review_page(result.session, markdown=result.markdown, error=result.error),
+                render_ticket_review_page(
+                    result.session,
+                    markdown=result.markdown,
+                    error=result.error,
+                    validation_hints=result.validation_hints,
+                ),
                 status="400 Bad Request",
                 extra_headers=[("Set-Cookie", _session_cookie(result.session))],
             )
@@ -1195,7 +1202,12 @@ def submit_ticket_review(
     try:
         parsed = parse_ticket_markdown(markdown)
     except ValueError as exc:
-        return TicketReviewResult(session=next_session, markdown=markdown, error=str(exc))
+        return TicketReviewResult(
+            session=next_session,
+            markdown=markdown,
+            error=str(exc),
+            validation_hints=validation_error_hints(str(exc)),
+        )
 
     next_session["ticket_title"] = parsed.title
     next_session["next_route"] = "/export"
@@ -1726,6 +1738,7 @@ def render_ticket_review_page(
     *,
     markdown: str = "",
     error: str | None = None,
+    validation_hints: tuple[str, ...] = (),
     empty_state: EmptyStateGuidance | None = None,
 ) -> str:
     if empty_state is not None:
@@ -1735,7 +1748,11 @@ def render_ticket_review_page(
             content=_empty_state_content("Ticket", empty_state),
         )
     escaped_markdown = html.escape(markdown)
-    error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
+    if validation_hints:
+        hint_items = "".join(f"<li>{html.escape(item)}</li>" for item in validation_hints)
+        error_markup = f'<div class="validation" role="alert"><ul>{hint_items}</ul></div>'
+    else:
+        error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
     session_note = (
         '<p class="session-note">Draft is stored in this browser session until export.</p>'
         if session.get(SESSION_TICKET_MARKDOWN_KEY)
