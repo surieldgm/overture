@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
 from overture.auth import AUTH_COOKIE_NAME, FileMagicLinkSender, MagicLinkAuth
-from overture.ui_host import RESEARCH_APPROVAL_ROUTE, SESSION_COOKIE_NAME
+from overture.ui_host import RESEARCH_APPROVAL_ROUTE, SESSION_CANDIDATES_KEY, SESSION_COOKIE_NAME
 from tests.test_ui_wizard_smoke import _running_server
 
 
@@ -16,6 +16,11 @@ BROWSER_COOKIE_LIMIT_BYTES = 4096
 
 
 class ResearchApprovalSessionReproTests(unittest.TestCase):
+    def test_research_approval_400_analysis_doc_exists(self) -> None:
+        path = Path("docs/user-tests/research-approval-400-analysis.md")
+        self.assertTrue(path.exists(), f"Missing analysis doc: {path}")
+        self.assertGreater(path.stat().st_size, 200, f"Analysis doc looks too small: {path}")
+
     def test_browser_like_cookie_storage_reproduces_research_approval_400(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store_dir = Path(tmpdir)
@@ -38,16 +43,16 @@ class ResearchApprovalSessionReproTests(unittest.TestCase):
 
             self.assertEqual(intake.status, 303)
             self.assertEqual(approval.status, 200)
+            intake_session = _session_cookie_payload(intake.header_map["Set-Cookie"])
+            intake_id = intake_session["intake_id"]
             self.assertGreater(evidence.rejected_cookie_sizes[SESSION_COOKIE_NAME], BROWSER_COOKIE_LIMIT_BYTES)
-            self.assertEqual(evidence.status, 400)
-            self.assertIn("No suggested sources are available for this intake.", evidence.response_body)
+            self.assertEqual(evidence.status, 303)
             self.assertIn("decision-0=approve%3Ahttps%3A%2F%2Fexample.test%2Fsource-0", evidence.request_body)
             self.assertIn(AUTH_COOKIE_NAME, evidence.cookie_state)
             self.assertIn(SESSION_COOKIE_NAME, evidence.cookie_state)
             self.assertNotIn("research_candidates", evidence.cookie_state[SESSION_COOKIE_NAME])
-            self.assertEqual(list((store_dir / "research").glob("*.json")), [])
+            self.assertTrue((store_dir / "research" / f"{intake_id}.json").exists())
 
-    @unittest.expectedFailure
     def test_browser_like_cookie_storage_can_submit_approval_after_session_fix(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store_dir = Path(tmpdir)
@@ -69,6 +74,37 @@ class ResearchApprovalSessionReproTests(unittest.TestCase):
                 )
 
             self.assertEqual(response.status, 303)
+            self.assertTrue(list((store_dir / "research").glob("*.json")))
+
+    def test_race_like_candidates_missing_from_session_cookie_can_retry_and_succeed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            browser = BrowserLikeClient(cookie_limit_bytes=999999)
+
+            auth = _test_auth(store_dir)
+            with _running_server(store_dir=store_dir, llm_client=_five_large_source_client, auth_manager=auth) as base_url:
+                _login_with_magic_link(browser, base_url, store_dir, "designer@example.test")
+                browser.post(
+                    base_url,
+                    "/intake",
+                    {"idea": "Add session metadata to the peer onboarding template"},
+                )
+                browser.get(base_url, RESEARCH_APPROVAL_ROUTE)
+                browser.cookies[SESSION_COOKIE_NAME] = _session_cookie_without_candidates(browser.cookies[SESSION_COOKIE_NAME])
+
+                first = browser.post(
+                    base_url,
+                    RESEARCH_APPROVAL_ROUTE,
+                    {"decision-0": "approve:https://example.test/source-0"},
+                )
+                second = browser.post(
+                    base_url,
+                    RESEARCH_APPROVAL_ROUTE,
+                    {"decision-1": "approve:https://example.test/source-1"},
+                )
+
+            self.assertEqual(first.status, 303)
+            self.assertEqual(second.status, 303)
             self.assertTrue(list((store_dir / "research").glob("*.json")))
 
 
@@ -150,6 +186,32 @@ class BrowserLikeClient:
                     self.rejected_cookie_sizes[cookie_name] = len(value.encode("utf-8"))
                     continue
                 self.cookies[cookie_name] = morsel.coded_value
+
+
+def _session_cookie_without_candidates(cookie_value: str) -> str:
+    jar = cookies.SimpleCookie()
+    jar.load(cookie_value)
+    morsel = jar.get(SESSION_COOKIE_NAME)
+    if morsel is None:
+        return cookie_value
+    session = json.loads(morsel.value)
+    if not isinstance(session, dict):
+        return cookie_value
+    session.pop(SESSION_CANDIDATES_KEY, None)
+    return json.dumps(session, sort_keys=True, separators=(",", ":"))
+
+
+def _session_cookie_payload(cookie_value: str) -> dict[str, object]:
+    jar = cookies.SimpleCookie()
+    jar.load(cookie_value)
+    morsel = jar.get(SESSION_COOKIE_NAME)
+    if morsel is None:
+        return {}
+    try:
+        payload = json.loads(morsel.value)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _login_with_magic_link(browser: BrowserLikeClient, base_url: str, store_dir: Path, email: str) -> None:
