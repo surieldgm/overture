@@ -31,6 +31,12 @@ class UIHostTests(unittest.TestCase):
                 self.assertIn(route.title, response.body)
                 if route.path == "/export":
                     self.assertIn("No export-ready ticket is available.", response.body)
+                elif route.path == "/synthesis":
+                    self.assertIn("Complete research approval first", response.body)
+                    self.assertIn('href="/research/approval"', response.body)
+                elif route.path == "/ticket":
+                    self.assertIn("Complete synthesis review first", response.body)
+                    self.assertIn('href="/synthesis"', response.body)
                 else:
                     self.assertIn(route.placeholder, response.body)
 
