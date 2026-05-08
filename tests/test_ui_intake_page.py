@@ -272,6 +272,7 @@ class IntakePageTests(unittest.TestCase):
         self.assertIn('<textarea id="ticket_markdown" name="ticket_markdown"', response.body)
         self.assertIn("# Add ticket review surface", response.body)
         self.assertIn("## Acceptance criteria", response.body)
+        self.assertIn(">Advance to export<", response.body)
         session = _session_from_set_cookie(response.headers["Set-Cookie"])
         self.assertIn(SESSION_TICKET_MARKDOWN_KEY, session)
 
@@ -324,6 +325,8 @@ class IntakePageTests(unittest.TestCase):
         self.assertEqual(session[SESSION_TICKET_MARKDOWN_KEY], edited)
         self.assertEqual(session["ticket_title"], "Add ticket review surface")
         self.assertEqual(session["next_route"], "/export")
+        self.assertIn('name="action" value="advance"', page.body)
+        self.assertNotIn('disabled="disabled"', page.body)
 
     def test_ticket_invalid_edit_blocks_advance_with_inline_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -344,6 +347,28 @@ class IntakePageTests(unittest.TestCase):
         self.assertIn("Use the required section order for this draft", response.body)
         self.assertIn('role="alert"', response.body)
         self.assertIn("## Acceptance notes", response.body)
+        self.assertIn('name="action" value="advance" disabled', response.body)
+
+    def test_ticket_invalid_draft_stays_disabled_and_hints_persist_on_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            page = _request(
+                app,
+                "GET",
+                "/ticket",
+                cookie=_session_cookie({SESSION_SYNTHESIS_BRIEF_KEY: json.dumps(_synthesis_brief())}),
+            )
+            draft = _session_from_set_cookie(page.headers["Set-Cookie"])[SESSION_TICKET_MARKDOWN_KEY]
+            broken = draft.replace("## Acceptance criteria", "## Acceptance notes")
+            invalid = _request(app, "POST", "/ticket", {"ticket_markdown": broken}, cookie=page.headers["Set-Cookie"])
+            refreshed = _request(app, "GET", "/ticket", cookie=invalid.headers["Set-Cookie"])
+
+        self.assertEqual(invalid.status, "400 Bad Request")
+        self.assertIn('name="action" value="advance" disabled', invalid.body)
+        self.assertIn("Use the required section order for this draft", invalid.body)
+        self.assertEqual(refreshed.status, "200 OK")
+        self.assertIn('name="action" value="advance" disabled', refreshed.body)
+        self.assertIn("Use the required section order for this draft", refreshed.body)
 
     def test_ticket_edits_persist_across_refreshes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
