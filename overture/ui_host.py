@@ -371,7 +371,11 @@ class OvertureUiApp:
                 render_login_page(error="This magic link is invalid or expired. Request a new link."),
                 status="401 Unauthorized",
             )
-        return self._redirect(start_response, "/intake", extra_headers=[("Set-Cookie", auth_cookie(session_token))])
+        return self._render(
+            start_response,
+            render_magic_link_consumed_page(),
+            extra_headers=[("Set-Cookie", auth_cookie(session_token))],
+        )
 
     def _unauthorized(self, start_response: StartResponse) -> list[bytes]:
         return self._render(
@@ -1445,6 +1449,23 @@ def render_magic_link_sent_page(email: str, link: str, outbox_path: Path | None)
     )
 
 
+def render_magic_link_consumed_page() -> str:
+    return render_layout(
+        title="Sign in confirmed",
+        active_path="/intake",
+        content="""
+        <section class="workspace auth-panel">
+          <h2>Sign in confirmed</h2>
+          <p>Your designer session is ready.</p>
+          <div class="form-footer">
+            <span>Continue the wizard from the first step.</span>
+            <a class="primary-action" href="/intake">Continue to intake</a>
+          </div>
+        </section>
+        """,
+    )
+
+
 def render_unauthorized_page() -> str:
     return render_layout(
         title="Authentication required",
@@ -1582,6 +1603,10 @@ def render_research_complete_page(session: dict[str, str]) -> str:
         <section class="workspace">
           <h2>Research saved</h2>
           <p>Saved {item_count} approved source{"s" if item_count != 1 else ""} for <code>{html.escape(intake_id)}</code>.</p>
+          <div class="form-footer">
+            <span>Approved evidence is ready for the next step.</span>
+            <a class="primary-action" href="{SYNTHESIS_ROUTE}">Continue to synthesis</a>
+          </div>
         </section>
         """,
     )
@@ -2036,6 +2061,7 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
     button, a {{ color: var(--accent); font-weight: 650; }}
     button {{ border: 0; border-radius: 6px; background: var(--accent); color: white; padding: 10px 14px; cursor: pointer; font: inherit; }}
     button.secondary {{ background: #edf2f7; color: var(--ink); }}
+    .primary-action {{ display: inline-block; border-radius: 6px; background: var(--accent); color: white; padding: 10px 14px; text-decoration: none; }}
     .validation {{ color: var(--danger); margin: 12px 0 0; font-weight: 650; }}
     .session, .session-note {{ color: var(--muted); margin-bottom: 0; }}
     code {{ background: #edf2f7; padding: 2px 4px; border-radius: 4px; }}
@@ -2045,7 +2071,7 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
       .form-footer {{ align-items: stretch; flex-direction: column; }}
       .source-option {{ grid-template-columns: minmax(0, 1fr); }}
       .peer-fields {{ grid-template-columns: minmax(0, 1fr); }}
-      button {{ width: 100%; }}
+      button, .primary-action {{ width: 100%; text-align: center; }}
     }}
   </style>
 </head>

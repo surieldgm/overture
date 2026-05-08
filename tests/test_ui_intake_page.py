@@ -65,9 +65,11 @@ class IntakePageTests(unittest.TestCase):
             link_path = urlparse(payload["link"]).path + "?" + urlparse(payload["link"]).query
 
             consumed = _request(app, "GET", link_path, authenticated=False)
-            self.assertEqual(consumed.status, "303 See Other")
-            self.assertEqual(consumed.headers["Location"], "/intake")
+            self.assertEqual(consumed.status, "200 OK")
+            self.assertNotIn("Location", consumed.headers)
             self.assertIn(AUTH_COOKIE_NAME, consumed.headers["Set-Cookie"])
+            self.assertIn("Continue to intake", consumed.body)
+            self.assertIn('href="/intake"', consumed.body)
 
             page = _request(app, "GET", "/intake", cookie=consumed.headers["Set-Cookie"], authenticated=False)
             self.assertEqual(page.status, "200 OK")
@@ -164,6 +166,14 @@ class IntakePageTests(unittest.TestCase):
             self.assertEqual(len(payload["items"]), 1)
             self.assertEqual(payload["items"][0]["source"]["title"], "Symphony-ready ticket evidence contract")
             self.assertIn("research_result", session)
+
+            complete = _request(app, "GET", RESEARCH_COMPLETE_ROUTE, cookie=response.headers["Set-Cookie"])
+            self.assertEqual(complete.status, "200 OK")
+            self.assertIn("Continue to synthesis", complete.body)
+            self.assertIn('href="/synthesis"', complete.body)
+            synthesis = _request(app, "GET", "/synthesis", cookie=response.headers["Set-Cookie"])
+            self.assertEqual(synthesis.status, "200 OK")
+            self.assertIn("Continue to ticket review", synthesis.body)
 
     def test_research_submit_with_zero_approvals_stays_on_page_with_inline_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
