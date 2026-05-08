@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 import overture.cli as cli
 from overture.auth import AUTH_COOKIE_NAME, MagicLinkAuth
 from overture.ui_host import (
+    SYNTHESIS_ROUTE,
+    TICKET_REVIEW_ROUTE,
     WIZARD_ROUTES,
     SessionStore,
     build_ui_server,
@@ -24,6 +26,10 @@ class UIHostTests(unittest.TestCase):
                 with self.subTest(route=route.path):
                     response = _get(base_url, route.path)
 
+                if route.path == TICKET_REVIEW_ROUTE:
+                    self.assertEqual(response.status, 303)
+                    self.assertEqual(response.headers["Location"], SYNTHESIS_ROUTE)
+                    continue
                 self.assertEqual(response.status, 200)
                 self.assertIn("<header>", response.body)
                 self.assertIn('aria-label="Breadcrumbs"', response.body)
