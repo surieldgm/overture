@@ -16,7 +16,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .backlog_seeder import seed_confirmed_friction_intakes
 from .export_runner import run_ticket_export
@@ -32,6 +32,7 @@ from .retro_generator import DEFAULT_RETRO_OUTPUT_PATH, generate_retro_document
 from .research_llm import (
     LLMSuggestedSourceAdapter,
     cli_approver,
+    codex_cli_available,
     codex_cli_client,
     fake_llm_client,
     write_research_result,
@@ -43,6 +44,18 @@ from .ticket_fixture_validation import (
     validate_ticket_fixture_paths,
 )
 from .ui_host import DEFAULT_STORE_DIR, DEFAULT_UI_HOST, DEFAULT_UI_PORT
+
+
+def _select_research_llm_client() -> Callable[[str], str]:
+    if os.environ.get("OVERTURE_LLM_CLIENT") == "fake":
+        return fake_llm_client
+    if not codex_cli_available():
+        print(
+            "warning: Codex CLI not found on PATH; falling back to deterministic local research.",
+            file=sys.stderr,
+        )
+        return fake_llm_client
+    return codex_cli_client
 
 
 def _linear_client_factory() -> LinearClient:
@@ -602,11 +615,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"invalid intake record {intake_path}: {exc}", file=sys.stderr)
             return 1
 
-        llm_client = (
-            fake_llm_client
-            if os.environ.get("OVERTURE_LLM_CLIENT") == "fake"
-            else codex_cli_client
-        )
+        llm_client = _select_research_llm_client()
         adapter = LLMSuggestedSourceAdapter(llm_client=llm_client, approver=cli_approver)
         result = adapter.research(intake)
         output_path = write_research_result(
@@ -687,7 +696,7 @@ def _run_single_shot(args: argparse.Namespace) -> int:
 def _ui(args: argparse.Namespace) -> int:
     from .ui_host import serve_ui_host
 
-    llm_client = fake_llm_client if os.environ.get("OVERTURE_LLM_CLIENT") == "fake" else codex_cli_client
+    llm_client = _select_research_llm_client()
     try:
         serve_ui_host(host=args.host, port=args.port, store_dir=args.store_dir, llm_client=llm_client)
     except ValueError as exc:

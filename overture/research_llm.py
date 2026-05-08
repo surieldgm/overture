@@ -191,6 +191,15 @@ def _resolve_codex_executable() -> str:
     )
 
 
+def codex_cli_available() -> bool:
+    """Return True when the Codex CLI executable is resolvable on this system."""
+
+    configured = os.environ.get(CODEX_EXECUTABLE_ENV)
+    if configured:
+        return shutil.which(configured) is not None
+    return shutil.which("codex") is not None
+
+
 def fake_llm_client(prompt: str) -> str:
     """Deterministic CLI/test hook enabled with `OVERTURE_LLM_CLIENT=fake`."""
 
