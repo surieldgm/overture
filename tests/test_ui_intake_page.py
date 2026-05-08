@@ -301,12 +301,8 @@ class IntakePageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             response = _request(OvertureUiApp(store_dir=tmpdir), "GET", "/ticket")
 
-        self.assertEqual(response.status, "200 OK")
-        self.assertIn("Complete synthesis review first", response.body)
-        self.assertIn('href="/synthesis"', response.body)
-        self.assertIn("Go to synthesis", response.body)
-        self.assertNotIn("No synthesis brief is stored in this session", response.body)
-        self.assertNotIn("Placeholder for Symphony ticket drafting.", response.body)
+        self.assertEqual(response.status, "303 See Other")
+        self.assertEqual(response.headers["Location"], "/synthesis")
 
     def test_ticket_valid_edit_advances_to_export_route(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
