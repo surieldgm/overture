@@ -61,6 +61,17 @@ class IntakePageTests(unittest.TestCase):
             self.assertIn("Open the magic link locally", sent.body)
             self.assertNotIn("Open development magic link", sent.body)
             outbox = Path(tmpdir) / "magic-links.jsonl"
+            self.assertIn("<summary>Local development details</summary>", sent.body)
+            self.assertNotIn("<details open", sent.body)
+            action_index = sent.body.index("Open the magic link locally")
+            details_index = sent.body.index("<details")
+            self.assertLess(action_index, details_index)
+            default_render = sent.body[:details_index]
+            self.assertNotIn("Development outbox", default_render)
+            self.assertNotIn(str(outbox), default_render)
+            details_markup = sent.body[details_index:]
+            self.assertIn("Development outbox", details_markup)
+            self.assertIn(str(outbox), details_markup)
             payload = json.loads(outbox.read_text(encoding="utf-8").splitlines()[-1])
             link_path = urlparse(payload["link"]).path + "?" + urlparse(payload["link"]).query
 
