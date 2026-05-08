@@ -13,12 +13,20 @@ from overture.peer_onboarding import (
     FILLED_ARTIFACT_NODE_ID,
     INTAKE_STAGE_NODE_ID,
     PEER_ONBOARDING_ROUTE,
+    SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID,
+    SECOND_GENERATION_TEMPLATE_NODE_ID,
+    SPRINT_FIVE_OBSERVATION_NODE_ID,
     TEMPLATE_NODE_ID,
     designer_one_peer_onboarding_artifact,
+    load_latest_peer_onboarding_artifact,
     load_designer_one_peer_onboarding_artifact,
+    load_peer_onboarding_artifacts,
+    second_generation_peer_onboarding_artifact,
+    seed_peer_onboarding_artifacts,
     seed_designer_one_peer_onboarding_artifact,
     ordered_peer_onboarding_sections,
     validate_designer_one_peer_onboarding_artifact,
+    validate_peer_onboarding_artifact,
 )
 from overture.ui_host import build_ui_server
 
@@ -61,12 +69,45 @@ class PeerOnboardingSmokeTests(unittest.TestCase):
             response = _get(base_url, PEER_ONBOARDING_ROUTE)
 
         self.assertEqual(response.status, 200)
+        self.assertIn("Designer #1 + Designer #2 peer onboarding artifact for Designer #3", response.body)
+        self.assertIn("Generation 2", response.body)
         self.assertIn("Designer #1 peer onboarding artifact", response.body)
-        self.assertIn("designer_1", response.body)
-        self.assertIn("component_peer_onboarding_template", response.body)
+        self.assertIn("designer_3", response.body)
+        self.assertIn("component_peer_template_v2", response.body)
         self.assertIn("examples/intake_examples/feature-idea-persistence.md", response.body)
         self.assertIn("examples/intake_examples/bug-research-approval-latency.md", response.body)
         self.assertIn("examples/intake_examples/integration-linear-export-dry-run.md", response.body)
+
+    def test_second_generation_artifact_is_jointly_authored_and_grounded_in_sprint5_observations(self) -> None:
+        artifact = second_generation_peer_onboarding_artifact()
+        errors = validate_peer_onboarding_artifact(artifact)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(artifact.id, SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID)
+        self.assertEqual(artifact.template_id, SECOND_GENERATION_TEMPLATE_NODE_ID)
+        self.assertEqual(artifact.generation, 2)
+        self.assertEqual(artifact.audience_id, "designer_3")
+        self.assertEqual(artifact.coauthor_ids, ("designer_1", "designer_2"))
+        self.assertIn(SPRINT_FIVE_OBSERVATION_NODE_ID, artifact.source_nodes)
+        section_ids = [section["id"] for section in ordered_peer_onboarding_sections(artifact.template)]
+        self.assertIn("sprint5_observation_patterns", section_ids)
+
+    def test_seeded_peer_onboarding_artifacts_coexist_and_latest_is_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SqliteGraphStore(Path(tmpdir) / "graph.sqlite")
+            artifacts = seed_peer_onboarding_artifacts(store)
+            latest = load_latest_peer_onboarding_artifact(store)
+            loaded = load_peer_onboarding_artifacts(store)
+            nodes = {node["id"]: node for node in store.list_nodes()}
+            edges = {(edge["from"], edge["kind"], edge["to"]) for edge in store.list_edges()}
+
+        self.assertEqual([artifact.generation for artifact in artifacts], [1, 2])
+        self.assertEqual([artifact.id for artifact in loaded], [FILLED_ARTIFACT_NODE_ID, SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID])
+        self.assertEqual(latest.id, SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID)
+        self.assertIn(FILLED_ARTIFACT_NODE_ID, nodes)
+        self.assertIn(SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID, nodes)
+        self.assertIn((SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID, "instantiates", SECOND_GENERATION_TEMPLATE_NODE_ID), edges)
+        self.assertIn((SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID, "references", SPRINT_FIVE_OBSERVATION_NODE_ID), edges)
 
 
 class _running_server:
