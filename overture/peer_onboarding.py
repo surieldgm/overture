@@ -13,12 +13,18 @@ from .graph_store import SqliteGraphStore
 PEER_ONBOARDING_SCHEMA_VERSION = "2026-05-07"
 
 TEMPLATE_NODE_ID = "component_peer_onboarding_template"
+SECOND_GENERATION_TEMPLATE_NODE_ID = "component_peer_template_v2"
 FILLED_ARTIFACT_NODE_ID = "component_designer_one_filled_artifact"
+SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID = "component_designer_three_peer_onboarding_artifact"
+SPRINT_FIVE_OBSERVATION_NODE_ID = "component_observation_log"
 FRICTION_LOG_NODE_ID = "m1_friction_log"
 INTAKE_STAGE_NODE_ID = "capability_intake_stage"
 TRANSFER_NEED_NODE_ID = "need_peer_transfer_artifact"
+TRANSFER_EVOLUTION_NEED_NODE_ID = "need_peer_transfer_evolves"
 DESIGNER_ONE_AUTHOR_ID = "designer_1"
 DESIGNER_ONE_AUTHOR_EMAIL = "designer1@overture.local"
+DESIGNER_TWO_AUTHOR_ID = "designer_2"
+DESIGNER_TWO_AUTHOR_EMAIL = "designer2@overture.local"
 PEER_ONBOARDING_ROUTE = "/peer-onboarding"
 
 PEER_ONBOARDING_SCHEMA: tuple[dict[str, object], ...] = (
@@ -77,6 +83,28 @@ PEER_ONBOARDING_SCHEMA: tuple[dict[str, object], ...] = (
             },
         ),
     },
+    {
+        "id": "sprint5_observation_patterns",
+        "order": 4,
+        "title": "Sprint 5 observation patterns to carry forward",
+        "description": "Ground the next handoff in observed Designer #2 friction so Designer #3 does not rediscover the same workflow gaps.",
+        "fields": (
+            {
+                "id": "pattern_summary",
+                "label": "Observation pattern summary",
+                "kind": "free_text",
+                "required": False,
+                "source_node": SPRINT_FIVE_OBSERVATION_NODE_ID,
+            },
+            {
+                "id": "handoff_adjustments",
+                "label": "Handoff adjustments",
+                "kind": "list_text",
+                "required": False,
+                "source_node": SPRINT_FIVE_OBSERVATION_NODE_ID,
+            },
+        ),
+    },
 )
 
 
@@ -91,6 +119,9 @@ class PeerOnboardingArtifact:
     template: dict[str, object]
     intake_examples: tuple[dict[str, str], ...]
     source_nodes: tuple[str, ...]
+    generation: int = 1
+    audience_id: str = "designer_2"
+    coauthor_ids: tuple[str, ...] = ()
 
     @property
     def sections(self) -> list[dict[str, object]]:
@@ -200,9 +231,20 @@ def designer_one_peer_onboarding_records() -> tuple[GraphRecord, ...]:
     )
 
 
+def peer_onboarding_records() -> tuple[GraphRecord, ...]:
+    """Return all seeded peer onboarding records across generations."""
+
+    return designer_one_peer_onboarding_records() + second_generation_peer_onboarding_records()
+
+
 def seed_designer_one_peer_onboarding_artifact(store: SqliteGraphStore) -> PeerOnboardingArtifact:
     store.upsert_records(designer_one_peer_onboarding_records())
     return load_designer_one_peer_onboarding_artifact(store)
+
+
+def seed_peer_onboarding_artifacts(store: SqliteGraphStore) -> tuple[PeerOnboardingArtifact, ...]:
+    store.upsert_records(peer_onboarding_records())
+    return load_peer_onboarding_artifacts(store)
 
 
 def load_designer_one_peer_onboarding_artifact(store: SqliteGraphStore) -> PeerOnboardingArtifact:
@@ -210,6 +252,24 @@ def load_designer_one_peer_onboarding_artifact(store: SqliteGraphStore) -> PeerO
     if node is None:
         return seed_designer_one_peer_onboarding_artifact(store)
     return _artifact_from_node(node)
+
+
+def load_peer_onboarding_artifacts(store: SqliteGraphStore) -> tuple[PeerOnboardingArtifact, ...]:
+    nodes = [
+        node
+        for node in store.list_nodes(kind="Component")
+        if _artifact_payload(node).get("viewer_route") == PEER_ONBOARDING_ROUTE
+        and _artifact_payload(node).get("template")
+    ]
+    if not nodes:
+        return seed_peer_onboarding_artifacts(store)
+    artifacts = tuple(_artifact_from_node(node) for node in nodes)
+    return tuple(sorted(artifacts, key=lambda artifact: (artifact.generation, artifact.title)))
+
+
+def load_latest_peer_onboarding_artifact(store: SqliteGraphStore) -> PeerOnboardingArtifact:
+    artifacts = load_peer_onboarding_artifacts(store)
+    return max(artifacts, key=lambda artifact: (artifact.generation, artifact.title))
 
 
 def validate_designer_one_peer_onboarding_artifact(artifact: PeerOnboardingArtifact) -> list[str]:
@@ -238,6 +298,42 @@ def validate_designer_one_peer_onboarding_artifact(artifact: PeerOnboardingArtif
     return errors
 
 
+def validate_peer_onboarding_artifact(artifact: PeerOnboardingArtifact) -> list[str]:
+    errors: list[str] = []
+    if artifact.template_id not in {TEMPLATE_NODE_ID, SECOND_GENERATION_TEMPLATE_NODE_ID}:
+        errors.append("filled artifact does not instantiate a peer onboarding template")
+    if artifact.generation < 1:
+        errors.append("filled artifact generation is invalid")
+    if not artifact.audience_id:
+        errors.append("filled artifact audience is missing")
+    if not artifact.author_id:
+        errors.append("filled artifact author is missing")
+    if artifact.generation >= 2 and len(artifact.coauthor_ids) < 2:
+        errors.append("second-generation artifact must list Designer #1 and Designer #2 as coauthors")
+    if len(artifact.intake_examples) < 3:
+        errors.append("filled artifact includes fewer than three intake examples")
+    for index, example in enumerate(artifact.intake_examples, start=1):
+        if not example.get("title") or not example.get("href") or not example.get("raw_intake"):
+            errors.append(f"intake example {index} is missing title, link, or raw intake")
+        elif not Path(example["href"]).exists():
+            errors.append(f"intake example {index} link does not exist: {example['href']}")
+    for section in ordered_peer_onboarding_sections(artifact.template):
+        section_id = str(section.get("id") or "<unknown>")
+        for field in section.get("fields", ()):
+            if not isinstance(field, Mapping):
+                errors.append(f"artifact section {section_id} has a malformed field")
+                continue
+            if not _value_is_non_empty(field.get("value")):
+                errors.append(f"artifact field is empty: {section_id}.{field.get('id', '<unknown>')}")
+    if artifact.generation >= 2:
+        section_ids = {str(section.get("id")) for section in ordered_peer_onboarding_sections(artifact.template)}
+        if "sprint5_observation_patterns" not in section_ids:
+            errors.append("second-generation artifact is missing Sprint 5 observation patterns")
+        if SPRINT_FIVE_OBSERVATION_NODE_ID not in artifact.source_nodes:
+            errors.append("second-generation artifact does not cite the observation log")
+    return errors
+
+
 def designer_one_peer_onboarding_artifact() -> PeerOnboardingArtifact:
     examples = (
         {
@@ -260,6 +356,11 @@ def designer_one_peer_onboarding_artifact() -> PeerOnboardingArtifact:
         },
     )
     template = initialize_peer_onboarding_template(DESIGNER_ONE_AUTHOR_ID, DESIGNER_ONE_AUTHOR_EMAIL)
+    template["sections"] = [
+        section
+        for section in template["sections"]
+        if isinstance(section, dict) and section.get("id") != "sprint5_observation_patterns"
+    ]
     _set_field(
         template,
         "intake_worked",
@@ -326,6 +427,183 @@ def designer_one_peer_onboarding_artifact() -> PeerOnboardingArtifact:
         template=template,
         intake_examples=examples,
         source_nodes=(TEMPLATE_NODE_ID, FRICTION_LOG_NODE_ID, INTAKE_STAGE_NODE_ID, TRANSFER_NEED_NODE_ID),
+        generation=1,
+        audience_id="designer_2",
+        coauthor_ids=(DESIGNER_ONE_AUTHOR_ID,),
+    )
+
+
+def second_generation_peer_onboarding_records() -> tuple[GraphRecord, ...]:
+    """Return graph records for the Designer #3 second-generation handoff."""
+
+    artifact = second_generation_peer_onboarding_artifact()
+    return (
+        GraphRecord(
+            kind="Component",
+            key=SECOND_GENERATION_TEMPLATE_NODE_ID,
+            properties={
+                "label": "Second-generation peer onboarding template",
+                "summary": "Extended peer onboarding template carrying Sprint 5 observation-log learnings into Designer #3 onboarding.",
+                "schema_version": PEER_ONBOARDING_SCHEMA_VERSION,
+                "extends": TEMPLATE_NODE_ID,
+                "section_ids": [section["id"] for section in PEER_ONBOARDING_SCHEMA],
+                "route_pattern": PEER_ONBOARDING_ROUTE,
+            },
+        ),
+        GraphRecord(
+            kind="Need",
+            key=TRANSFER_EVOLUTION_NEED_NODE_ID,
+            properties={
+                "label": "Peer transfer evolves",
+                "summary": "Each onboarding generation should absorb observed friction from the previous designer handoff.",
+            },
+        ),
+        GraphRecord(
+            kind="Component",
+            key=SPRINT_FIVE_OBSERVATION_NODE_ID,
+            properties={
+                "label": "Sprint 5 observation log",
+                "summary": "Designer #2 solo-session observations surfaced context loss at route transitions, unclear source approval expectations, and uncertainty about preserving intake wording.",
+                "source_refs": ["tests/test_ui_wizard_smoke.py", "overture/observation_log.py"],
+            },
+        ),
+        GraphRecord(
+            kind="Component",
+            key=SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID,
+            properties={
+                "label": artifact.title,
+                "summary": "Designer #1 and Designer #2's second-generation peer onboarding artifact for Designer #3.",
+                "author_id": artifact.author_id,
+                "author_email": artifact.author_email,
+                "coauthor_ids": list(artifact.coauthor_ids),
+                "generation": artifact.generation,
+                "audience_id": artifact.audience_id,
+                "template_id": artifact.template_id,
+                "viewer_route": artifact.route,
+                "template": artifact.template,
+                "intake_examples": list(artifact.intake_examples),
+                "source_nodes": list(artifact.source_nodes),
+            },
+        ),
+        GraphRecord(
+            kind="requires",
+            key=f"{TRANSFER_EVOLUTION_NEED_NODE_ID}:requires:{SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID}",
+            properties={"from": TRANSFER_EVOLUTION_NEED_NODE_ID, "to": SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID},
+        ),
+        GraphRecord(
+            kind="instantiates",
+            key=f"{SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID}:instantiates:{SECOND_GENERATION_TEMPLATE_NODE_ID}",
+            properties={"from": SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID, "to": SECOND_GENERATION_TEMPLATE_NODE_ID},
+        ),
+        GraphRecord(
+            kind="references",
+            key=f"{SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID}:references:{SPRINT_FIVE_OBSERVATION_NODE_ID}",
+            properties={"from": SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID, "to": SPRINT_FIVE_OBSERVATION_NODE_ID},
+        ),
+        GraphRecord(
+            kind="references",
+            key=f"{SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID}:references:{FILLED_ARTIFACT_NODE_ID}",
+            properties={"from": SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID, "to": FILLED_ARTIFACT_NODE_ID},
+        ),
+    )
+
+
+def second_generation_peer_onboarding_artifact() -> PeerOnboardingArtifact:
+    first_generation = designer_one_peer_onboarding_artifact()
+    coauthor_email = f"{DESIGNER_ONE_AUTHOR_EMAIL},{DESIGNER_TWO_AUTHOR_EMAIL}"
+    template = initialize_peer_onboarding_template("designer_1+designer_2", coauthor_email)
+
+    _set_field(
+        template,
+        "intake_worked",
+        "summary",
+        "Designer #1's verb-led intake pattern still works, but Designer #2 added a handoff rule: keep the original wording visible beside any refined brief so Designer #3 can recover intent after navigation or review delays.",
+    )
+    _set_field(
+        template,
+        "intake_worked",
+        "example_prompts",
+        [f"{example['raw_intake']} ({example['href']})" for example in first_generation.intake_examples],
+    )
+    _set_field(
+        template,
+        "research_approval",
+        "approval_summary",
+        "Designer #2's Sprint 5 observation log showed that source approval expectations must be stated before review. Designer #3 should approve sources only when the source directly sharpens acceptance criteria, validation, or graph provenance.",
+    )
+    _set_field(
+        template,
+        "research_approval",
+        "approved_source_traits",
+        [
+            "Names the ticket behavior or artifact it proves.",
+            "Keeps enough path, URL, or citation detail for a reviewer to reopen it.",
+            "Separates evidence from inference so synthesis does not overclaim.",
+            "Makes the next manual approval decision obvious.",
+        ],
+    )
+    _set_field(
+        template,
+        "wizard_watchouts",
+        "step_notes",
+        [
+            {
+                "step": "Intake",
+                "note": "Preserve Designer #3's first sentence and add constraints after it; Designer #2 lost confidence when the raw ask disappeared too early.",
+            },
+            {
+                "step": "Research",
+                "note": "Review candidate sources against acceptance criteria before reading generated summaries, then record rejected-source rationale while context is fresh.",
+            },
+            {
+                "step": "Synthesis",
+                "note": "Check that every synthesized claim traces back to an approved source or graph node, especially after a route transition.",
+            },
+            {
+                "step": "Ticket",
+                "note": "Include a validation command and one UI path when the behavior is app-facing; Designer #2 needed both to hand work off cleanly.",
+            },
+            {
+                "step": "Export",
+                "note": "Use dry-run payload review first, then export only after the ticket has explicit acceptance criteria and no missing source links.",
+            },
+        ],
+    )
+    _set_field(
+        template,
+        "sprint5_observation_patterns",
+        "pattern_summary",
+        "Sprint 5 observations from Designer #2's solo flow clustered around three frictions: losing the raw intake wording across transitions, delayed source approval decisions, and unclear proof expectations when the ticket became app-facing.",
+    )
+    _set_field(
+        template,
+        "sprint5_observation_patterns",
+        "handoff_adjustments",
+        [
+            "Carry a short source-of-truth note into each wizard stage: raw ask, current decision, and next proof.",
+            "Name the approval rule before reviewing sources so Designer #3 can reject weak evidence quickly.",
+            "Turn every app-facing recommendation into a visible route check plus a unittest command.",
+        ],
+    )
+    return PeerOnboardingArtifact(
+        id=SECOND_GENERATION_FILLED_ARTIFACT_NODE_ID,
+        title="Designer #1 + Designer #2 peer onboarding artifact for Designer #3",
+        author_id="designer_1+designer_2",
+        author_email=coauthor_email,
+        template_id=SECOND_GENERATION_TEMPLATE_NODE_ID,
+        route=PEER_ONBOARDING_ROUTE,
+        template=template,
+        intake_examples=first_generation.intake_examples,
+        source_nodes=(
+            SECOND_GENERATION_TEMPLATE_NODE_ID,
+            TEMPLATE_NODE_ID,
+            SPRINT_FIVE_OBSERVATION_NODE_ID,
+            FILLED_ARTIFACT_NODE_ID,
+            TRANSFER_EVOLUTION_NEED_NODE_ID,
+        ),
+        generation=2,
+        audience_id="designer_3",
+        coauthor_ids=(DESIGNER_ONE_AUTHOR_ID, DESIGNER_TWO_AUTHOR_ID),
     )
 
 
@@ -402,13 +680,18 @@ def _node_by_id(store: SqliteGraphStore, node_id: str) -> Mapping[str, Any] | No
     return None
 
 
-def _artifact_from_node(node: Mapping[str, Any]) -> PeerOnboardingArtifact:
+def _artifact_payload(node: Mapping[str, Any]) -> Mapping[str, Any]:
     properties = node.get("properties")
-    payload = properties if isinstance(properties, Mapping) else node
+    return properties if isinstance(properties, Mapping) else node
+
+
+def _artifact_from_node(node: Mapping[str, Any]) -> PeerOnboardingArtifact:
+    payload = _artifact_payload(node)
     template = payload.get("template")
     template_payload = template if isinstance(template, dict) else initialize_peer_onboarding_template("", "")
     examples = tuple(item for item in payload.get("intake_examples", ()) if isinstance(item, dict))
     source_nodes = tuple(str(item) for item in payload.get("source_nodes", ()))
+    coauthor_ids = tuple(str(item) for item in payload.get("coauthor_ids", ()))
     return PeerOnboardingArtifact(
         id=str(node.get("id") or FILLED_ARTIFACT_NODE_ID),
         title=str(payload.get("label") or payload.get("title") or "Designer #1 peer onboarding artifact"),
@@ -419,4 +702,7 @@ def _artifact_from_node(node: Mapping[str, Any]) -> PeerOnboardingArtifact:
         template=template_payload,
         intake_examples=examples,
         source_nodes=source_nodes,
+        generation=int(payload.get("generation") or 1),
+        audience_id=str(payload.get("audience_id") or "designer_2"),
+        coauthor_ids=coauthor_ids,
     )
