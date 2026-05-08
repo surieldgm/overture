@@ -639,6 +639,12 @@ class OvertureUiApp:
             response={"status": 200, "has_markdown": bool(result.markdown)},
             error=result.error,
         )
+        if result.empty_state is not None:
+            return self._redirect(
+                start_response,
+                SYNTHESIS_ROUTE,
+                extra_headers=[("Set-Cookie", _session_cookie(result.session))],
+            )
         return self._render(
             start_response,
             render_ticket_review_page(
@@ -1171,8 +1177,9 @@ def prepare_ticket_review(session: dict[str, str], *, user: AuthenticatedUser | 
     except (TypeError, ValueError, IndexError, json.JSONDecodeError) as exc:
         return TicketReviewResult(session=next_session, error=f"Could not generate ticket draft: {exc}")
 
-    next_session[SESSION_TICKET_MARKDOWN_KEY] = _ticket_markdown_with_author(draft.description, next_session)
-    return TicketReviewResult(session=next_session, markdown=draft.description)
+    markdown = _ticket_markdown_with_author(draft.description, next_session)
+    next_session[SESSION_TICKET_MARKDOWN_KEY] = markdown
+    return TicketReviewResult(session=next_session, markdown=markdown)
 
 
 def submit_ticket_review(
