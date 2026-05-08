@@ -61,13 +61,26 @@ class IntakePageTests(unittest.TestCase):
             self.assertIn("Open the magic link locally", sent.body)
             self.assertNotIn("Open development magic link", sent.body)
             outbox = Path(tmpdir) / "magic-links.jsonl"
+            self.assertIn("<summary>Local development details</summary>", sent.body)
+            self.assertNotIn("<details open", sent.body)
+            action_index = sent.body.index("Open the magic link locally")
+            details_index = sent.body.index("<details")
+            self.assertLess(action_index, details_index)
+            default_render = sent.body[:details_index]
+            self.assertNotIn("Development outbox", default_render)
+            self.assertNotIn(str(outbox), default_render)
+            details_markup = sent.body[details_index:]
+            self.assertIn("Development outbox", details_markup)
+            self.assertIn(str(outbox), details_markup)
             payload = json.loads(outbox.read_text(encoding="utf-8").splitlines()[-1])
             link_path = urlparse(payload["link"]).path + "?" + urlparse(payload["link"]).query
 
             consumed = _request(app, "GET", link_path, authenticated=False)
-            self.assertEqual(consumed.status, "303 See Other")
-            self.assertEqual(consumed.headers["Location"], "/intake")
+            self.assertEqual(consumed.status, "200 OK")
+            self.assertNotIn("Location", consumed.headers)
             self.assertIn(AUTH_COOKIE_NAME, consumed.headers["Set-Cookie"])
+            self.assertIn("Continue to intake", consumed.body)
+            self.assertIn('href="/intake"', consumed.body)
 
             page = _request(app, "GET", "/intake", cookie=consumed.headers["Set-Cookie"], authenticated=False)
             self.assertEqual(page.status, "200 OK")
@@ -164,6 +177,14 @@ class IntakePageTests(unittest.TestCase):
             self.assertEqual(len(payload["items"]), 1)
             self.assertEqual(payload["items"][0]["source"]["title"], "Symphony-ready ticket evidence contract")
             self.assertIn("research_result", session)
+
+            complete = _request(app, "GET", RESEARCH_COMPLETE_ROUTE, cookie=response.headers["Set-Cookie"])
+            self.assertEqual(complete.status, "200 OK")
+            self.assertIn("Continue to synthesis", complete.body)
+            self.assertIn('href="/synthesis"', complete.body)
+            synthesis = _request(app, "GET", "/synthesis", cookie=response.headers["Set-Cookie"])
+            self.assertEqual(synthesis.status, "200 OK")
+            self.assertIn("Continue to ticket review", synthesis.body)
 
     def test_research_submit_with_zero_approvals_stays_on_page_with_inline_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
