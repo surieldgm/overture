@@ -160,7 +160,9 @@ def codex_cli_client(prompt: str) -> str:
 
     codex_executable = _resolve_codex_executable()
     completed = subprocess.run(
-        [codex_executable, "exec", "--non-interactive"],
+        # `codex exec` is already non-interactive; older docs/tools used
+        # `--non-interactive`, but current Codex CLI versions reject it.
+        [codex_executable, "exec"],
         input=prompt,
         capture_output=True,
         check=True,
