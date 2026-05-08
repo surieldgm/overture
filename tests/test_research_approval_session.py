@@ -16,6 +16,11 @@ BROWSER_COOKIE_LIMIT_BYTES = 4096
 
 
 class ResearchApprovalSessionReproTests(unittest.TestCase):
+    def test_research_approval_400_analysis_doc_exists(self) -> None:
+        path = Path("docs/user-tests/research-approval-400-analysis.md")
+        self.assertTrue(path.exists(), f"Missing analysis doc: {path}")
+        self.assertGreater(path.stat().st_size, 200, f"Analysis doc looks too small: {path}")
+
     def test_browser_like_cookie_storage_reproduces_research_approval_400(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store_dir = Path(tmpdir)
