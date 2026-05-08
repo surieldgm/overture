@@ -96,6 +96,11 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
                     self.assertEqual(research_response.status, 303)
                     self.assertEqual(research_response.headers["Location"], RESEARCH_COMPLETE_ROUTE)
 
+                    research_complete = _get(base_url, RESEARCH_COMPLETE_ROUTE, headers={"Cookie": research_response.headers["Set-Cookie"]})
+                    self.assertEqual(research_complete.status, 200)
+                    self.assertIn("Continue to synthesis", research_complete.body)
+                    self.assertIn('href="/synthesis"', research_complete.body)
+
                     synthesis_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": research_response.headers["Set-Cookie"]})
                     self.assertEqual(synthesis_page.status, 200)
                     self.assertIn("Continue to ticket review", synthesis_page.body)
@@ -204,6 +209,12 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
             self.assertEqual(final_session["intake_id"], intake_id)
             self.assertEqual(final_session["research_id"], intake_id)
             self.assertEqual(final_session["next_route"], "/synthesis")
+
+            with _running_server(store_dir=store_dir, llm_client=stub_llm_client) as base_url:
+                complete_page = _get(base_url, RESEARCH_COMPLETE_ROUTE, headers={"Cookie": research_response.headers["Set-Cookie"]})
+                self.assertEqual(complete_page.status, 200)
+                self.assertIn("Continue to synthesis", complete_page.body)
+                self.assertIn('href="/synthesis"', complete_page.body)
 
             intake_path = store_dir / "intake" / f"{intake_id}.json"
             research_path = store_dir / "research" / f"{intake_id}.json"
