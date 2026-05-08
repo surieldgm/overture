@@ -13,7 +13,7 @@ from pathlib import Path
 import secrets
 from socketserver import ThreadingMixIn
 from typing import Callable, Iterable, Mapping
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from .auth import AuthenticatedUser, DesignerSession, MagicLinkAuth, auth_cookie, authenticated_user_from_session, sender_from_env
@@ -29,6 +29,7 @@ from .peer_onboarding import (
     PEER_ONBOARDING_ROUTE,
     PeerOnboardingArtifact,
     initialize_peer_onboarding_template,
+    peer_onboarding_timestamp,
     load_latest_peer_onboarding_artifact,
     load_peer_onboarding_artifacts,
     ordered_peer_onboarding_sections,
@@ -342,11 +343,22 @@ class OvertureUiApp:
             store = SqliteGraphStore(Path(self.store_dir) / "graph.sqlite")
             artifacts = load_peer_onboarding_artifacts(store)
             artifact = load_latest_peer_onboarding_artifact(store)
+            query = parse_qs(str(environ.get("QUERY_STRING") or ""), keep_blank_values=True)
+            show_save_confirmation = query.get("saved", ["0"])[0] == "1"
+            confirmation_timestamp = query.get("ts", [artifact.last_edited_at])[0]
+            can_edit = _can_edit_peer_onboarding_artifact(artifact, user)
             errors = validate_peer_onboarding_artifact(artifact)
             status = "500 Internal Server Error" if errors else "200 OK"
             return self._render(
                 start_response,
-                render_peer_onboarding_artifact_page(artifact, artifacts=artifacts, errors=errors),
+                render_peer_onboarding_artifact_page(
+                    artifact,
+                    artifacts=artifacts,
+                    errors=errors,
+                    can_edit=can_edit,
+                    show_save_confirmation=show_save_confirmation,
+                    confirmation_timestamp=confirmation_timestamp,
+                ),
                 status=status,
             )
         if path == PEER_ONBOARDING_EDITOR_ROUTE and method == "GET":
@@ -863,6 +875,12 @@ class OvertureUiApp:
         session_id, server_session, is_new = self._server_session(environ, user)
         store = SqliteGraphStore(Path(self.store_dir) / "graph.sqlite")
         artifact = load_latest_peer_onboarding_artifact(store)
+        if not _can_edit_peer_onboarding_artifact(artifact, user):
+            return self._render(
+                start_response,
+                render_peer_onboarding_editor_forbidden_page(),
+                status="403 Forbidden",
+            )
         editable_template = _peer_onboarding_template_from_session(server_session) or artifact.template
         return self._render(
             start_response,
@@ -876,6 +894,12 @@ class OvertureUiApp:
         session_id, server_session, is_new = self._server_session(environ, user)
         store = SqliteGraphStore(Path(self.store_dir) / "graph.sqlite")
         artifact = load_latest_peer_onboarding_artifact(store)
+        if not _can_edit_peer_onboarding_artifact(artifact, user):
+            return self._render(
+                start_response,
+                render_peer_onboarding_editor_forbidden_page(),
+                status="403 Forbidden",
+            )
         editable_template = _parse_peer_onboarding_template_from_form(fields, artifact.template)
         if editable_template is None:
             error = "Unable to rebuild peer onboarding template from form fields."
@@ -909,6 +933,7 @@ class OvertureUiApp:
             generation=artifact.generation,
             audience_id=artifact.audience_id,
             coauthor_ids=artifact.coauthor_ids,
+            last_edited_at=peer_onboarding_timestamp(),
         )
         errors = validate_peer_onboarding_artifact(editable_artifact)
         if errors:
@@ -945,11 +970,15 @@ class OvertureUiApp:
             action="submit",
             user=user,
             request={"fields": _flatten_form_fields(fields)},
-            response={"status": 303, "location": PEER_ONBOARDING_ROUTE, "artifact_id": artifact.id},
+            response={
+                "status": 303,
+                "location": f"{PEER_ONBOARDING_ROUTE}?saved=1&{urlencode({'ts': editable_artifact.last_edited_at})}",
+                "artifact_id": artifact.id,
+            },
         )
         return self._redirect(
             start_response,
-            PEER_ONBOARDING_ROUTE,
+            f"{PEER_ONBOARDING_ROUTE}?saved=1&{urlencode({'ts': editable_artifact.last_edited_at})}",
             extra_headers=[("Set-Cookie", _session_cookie(session))],
         )
 
@@ -1525,6 +1554,7 @@ def _peer_onboarding_artifact_record(artifact: PeerOnboardingArtifact) -> GraphR
             "template": artifact.template,
             "intake_examples": list(artifact.intake_examples),
             "source_nodes": list(artifact.source_nodes),
+            "last_edited_at": artifact.last_edited_at,
         },
     )
 
@@ -2284,6 +2314,9 @@ def render_peer_onboarding_artifact_page(
     *,
     artifacts: Iterable[PeerOnboardingArtifact] = (),
     errors: Iterable[str] = (),
+    can_edit: bool = False,
+    show_save_confirmation: bool = False,
+    confirmation_timestamp: str | None = None,
 ) -> str:
     error_items = "".join(f"<li>{html.escape(error)}</li>" for error in errors)
     error_markup = f'<div class="validation" role="alert"><ul>{error_items}</ul></div>' if error_items else ""
@@ -2308,14 +2341,32 @@ def render_peer_onboarding_artifact_page(
         _peer_example_markup(example) for example in artifact.intake_examples
     ) + "</ol>"
     source_nodes = ", ".join(f"<code>{html.escape(node)}</code>" for node in artifact.source_nodes)
+    action_markup = (
+        f'<p><a class="button" href="{PEER_ONBOARDING_EDITOR_ROUTE}">Edit this artifact</a></p>'
+        if can_edit
+        else ""
+    )
+    confirmation_markup = (
+        f'<div class="validation" role="alert">Saved successfully at {html.escape(confirmation_timestamp or artifact.last_edited_at)}.</div>'
+        if show_save_confirmation
+        else ""
+    )
+    last_edited_markup = (
+        f"<p><strong>Last edited:</strong> <time>{html.escape(artifact.last_edited_at)}</time></p>"
+        if artifact.last_edited_at
+        else ""
+    )
     return render_layout(
         title=artifact.title,
         active_path=PEER_ONBOARDING_ROUTE,
         content=f"""
         <section class="workspace peer-onboarding">
           <h2>{html.escape(artifact.title)}</h2>
+          {action_markup}
+          {confirmation_markup}
           <p>{html.escape(ROUTES_BY_PATH[PEER_ONBOARDING_ROUTE].placeholder)}</p>
           <p>Showing generation {artifact.generation} for <code>{html.escape(artifact.audience_id)}</code>.</p>
+          {last_edited_markup}
           <p>Author: <code>{html.escape(artifact.author_id)}</code> &lt;{html.escape(artifact.author_email)}&gt;</p>
           <p>Template: <code>{html.escape(artifact.template_id)}</code></p>
           {error_markup}
@@ -2391,6 +2442,50 @@ def render_peer_onboarding_editor_page(
         """,
         shell_class="shell",
     )
+
+
+def render_peer_onboarding_editor_forbidden_page() -> str:
+    return render_layout(
+        title="Peer onboarding editor forbidden",
+        active_path=PEER_ONBOARDING_ROUTE,
+        content=f"""
+        <section class="workspace peer-onboarding">
+          <h2>Editor unavailable</h2>
+          <p class="validation">You are not authorized to edit this peer onboarding artifact.</p>
+          <p><a class="button" href="{PEER_ONBOARDING_ROUTE}">Return to artifact</a></p>
+        </section>
+        """,
+        shell_class="shell",
+    )
+
+
+def _can_edit_peer_onboarding_artifact(artifact: PeerOnboardingArtifact, user: AuthenticatedUser) -> bool:
+    users = {_normalize_peer_author_id(user.user_id), _normalize_peer_author_id(user.email)}
+    artifact_users = _parse_peer_author_id_set(artifact.author_id, artifact.coauthor_ids, artifact.author_email)
+    return bool(users & artifact_users)
+
+
+def _parse_peer_author_id_set(*raw_values: object) -> set[str]:
+    values: set[str] = set()
+    for value in raw_values:
+        if isinstance(value, str):
+            values.update(_parse_peer_author_ids(value))
+        elif isinstance(value, tuple):
+            for item in value:
+                if isinstance(item, str):
+                    values.update(_parse_peer_author_ids(item))
+    return values
+
+
+def _parse_peer_author_ids(raw: str) -> set[str]:
+    if not raw.strip():
+        return set()
+    chunks = raw.replace(";", ",").split(",")
+    return {_normalize_peer_author_id(chunk) for chunk in chunks if _normalize_peer_author_id(chunk)}
+
+
+def _normalize_peer_author_id(value: str) -> str:
+    return str(value).strip().lower()
 
 
 def _peer_example_markup(example: object) -> str:

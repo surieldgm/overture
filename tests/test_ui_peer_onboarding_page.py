@@ -6,7 +6,11 @@ from html.parser import HTMLParser
 from overture.auth import AUTH_COOKIE_NAME
 from overture.graph_store import SqliteGraphStore
 from overture.intake import load_intake_record
-from overture.peer_onboarding import load_latest_peer_onboarding_artifact, ordered_peer_onboarding_sections
+from overture.peer_onboarding import (
+    DESIGNER_ONE_AUTHOR_EMAIL,
+    load_latest_peer_onboarding_artifact,
+    ordered_peer_onboarding_sections,
+)
 from overture.ui_host import (
     PEER_ONBOARDING_EDITOR_ROUTE,
     PEER_ONBOARDING_ROUTE,
@@ -114,7 +118,14 @@ class PeerOnboardingPageTests(unittest.TestCase):
 
     def test_peer_onboarding_editor_page_renders_all_sections(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            response = _request(OvertureUiApp(store_dir=tmpdir), "GET", PEER_ONBOARDING_EDITOR_ROUTE)
+            app = OvertureUiApp(store_dir=tmpdir)
+            response = _request(
+                app,
+                "GET",
+                PEER_ONBOARDING_EDITOR_ROUTE,
+                cookie=_merge_cookie(None, AUTH_COOKIE_NAME, app.auth_manager.issue_session(DESIGNER_ONE_AUTHOR_EMAIL)),
+                authenticated=False,
+            )
 
         self.assertEqual(response.status, "200 OK")
         self.assertIn("Edit peer onboarding artifact", response.body)
@@ -128,6 +139,7 @@ class PeerOnboardingPageTests(unittest.TestCase):
     def test_peer_onboarding_editor_fill_and_save_persists_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             app = OvertureUiApp(store_dir=tmpdir)
+            auth_cookie = _merge_cookie(None, AUTH_COOKIE_NAME, app.auth_manager.issue_session(DESIGNER_ONE_AUTHOR_EMAIL))
             store = SqliteGraphStore(Path(tmpdir) / "graph.sqlite")
             artifact = load_latest_peer_onboarding_artifact(store)
             payload = _peer_onboarding_editor_payload(
@@ -138,24 +150,47 @@ class PeerOnboardingPageTests(unittest.TestCase):
                     "wizard_watchouts.step_notes.0": "Keep initial raw wording visible before summarization.",
                 },
             )
-            response = _request(app, "POST", PEER_ONBOARDING_EDITOR_ROUTE, payload)
+            response = _request(
+                app,
+                "POST",
+                PEER_ONBOARDING_EDITOR_ROUTE,
+                payload,
+                cookie=auth_cookie,
+                authenticated=False,
+            )
 
             self.assertEqual(response.status, "303 See Other")
-            self.assertEqual(response.headers["Location"], PEER_ONBOARDING_ROUTE)
+            self.assertTrue(response.headers["Location"].startswith(f"{PEER_ONBOARDING_ROUTE}?saved=1"))
 
-            viewer = _request(app, "GET", PEER_ONBOARDING_ROUTE, cookie=response.headers["Set-Cookie"])
+            viewer = _request(
+                app,
+                "GET",
+                response.headers["Location"],
+                cookie=auth_cookie,
+                authenticated=False,
+            )
             self.assertEqual(viewer.status, "200 OK")
+            self.assertIn("Saved successfully at", viewer.body)
+            self.assertIn("Last edited", viewer.body)
             self.assertIn("Designer #1 can now draft richer handoff summaries.", viewer.body)
             self.assertIn("Keep initial raw wording visible before summarization.", viewer.body)
             self.assertIn("<li>Prompt A</li>", viewer.body)
             self.assertIn("<li>Prompt B</li>", viewer.body)
+            self.assertIn('href="/peer-onboarding/edit">Edit this artifact', viewer.body)
 
     def test_peer_onboarding_editor_loads_existing_artifact_and_allows_edits(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             app = OvertureUiApp(store_dir=tmpdir)
+            auth_cookie = _merge_cookie(None, AUTH_COOKIE_NAME, app.auth_manager.issue_session(DESIGNER_ONE_AUTHOR_EMAIL))
             store = SqliteGraphStore(Path(tmpdir) / "graph.sqlite")
             artifact = load_latest_peer_onboarding_artifact(store)
-            edit_page = _request(app, "GET", PEER_ONBOARDING_EDITOR_ROUTE)
+            edit_page = _request(
+                app,
+                "GET",
+                PEER_ONBOARDING_EDITOR_ROUTE,
+                cookie=auth_cookie,
+                authenticated=False,
+            )
 
             self.assertEqual(edit_page.status, "200 OK")
             self.assertIn("Designer #1&#x27;s verb-led intake pattern still works", edit_page.body)
@@ -164,14 +199,57 @@ class PeerOnboardingPageTests(unittest.TestCase):
                 artifact,
                 {"research_approval.approval_summary": "Designer #3 can now validate evidence before any approval path."},
             )
-            saved = _request(app, "POST", PEER_ONBOARDING_EDITOR_ROUTE, payload, cookie=edit_page.headers["Set-Cookie"])
+            saved = _request(
+                app,
+                "POST",
+                PEER_ONBOARDING_EDITOR_ROUTE,
+                payload,
+                cookie=auth_cookie,
+                authenticated=False,
+            )
 
             self.assertEqual(saved.status, "303 See Other")
-            self.assertEqual(saved.headers["Location"], PEER_ONBOARDING_ROUTE)
+            self.assertTrue(saved.headers["Location"].startswith(f"{PEER_ONBOARDING_ROUTE}?saved=1"))
 
-            viewer = _request(app, "GET", PEER_ONBOARDING_ROUTE, cookie=saved.headers["Set-Cookie"])
+            viewer = _request(
+                app,
+                "GET",
+                saved.headers["Location"],
+                cookie=auth_cookie,
+                authenticated=False,
+            )
             self.assertEqual(viewer.status, "200 OK")
             self.assertIn("Designer #3 can now validate evidence before any approval path.", viewer.body)
+
+    def test_peer_onboarding_editor_route_is_authorized_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            unauthorized_cookie = _merge_cookie(None, AUTH_COOKIE_NAME, app.auth_manager.issue_session("unauthorized@example.test"))
+            unauthorized_editor = _request(app, "GET", PEER_ONBOARDING_EDITOR_ROUTE, cookie=unauthorized_cookie, authenticated=False)
+
+            self.assertEqual(unauthorized_editor.status, "403 Forbidden")
+            self.assertIn("Editor unavailable", unauthorized_editor.body)
+
+    def test_peer_onboarding_viewer_hides_edit_for_unauthorized_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            unauthorized_cookie = _merge_cookie(None, AUTH_COOKIE_NAME, app.auth_manager.issue_session("unauthorized@example.test"))
+            viewer = _request(app, "GET", PEER_ONBOARDING_ROUTE, cookie=unauthorized_cookie, authenticated=False)
+
+            self.assertEqual(viewer.status, "200 OK")
+            self.assertIn("Designer #1 + Designer #2 peer onboarding artifact for Designer #3", viewer.body)
+            self.assertNotIn("Edit this artifact", viewer.body)
+            self.assertNotIn("/peer-onboarding/edit", viewer.body)
+
+    def test_peer_onboarding_viewer_shows_edit_for_authorized_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            auth_cookie = _merge_cookie(None, AUTH_COOKIE_NAME, app.auth_manager.issue_session(DESIGNER_ONE_AUTHOR_EMAIL))
+            viewer = _request(app, "GET", PEER_ONBOARDING_ROUTE, cookie=auth_cookie, authenticated=False)
+
+            self.assertEqual(viewer.status, "200 OK")
+            self.assertIn("Edit this artifact", viewer.body)
+            self.assertIn('href="/peer-onboarding/edit"', viewer.body)
 
 
 def _synthetic_intake_from_peer_artifact(body: str) -> str:

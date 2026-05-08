@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,6 +123,7 @@ class PeerOnboardingArtifact:
     generation: int = 1
     audience_id: str = "designer_2"
     coauthor_ids: tuple[str, ...] = ()
+    last_edited_at: str = ""
 
     @property
     def sections(self) -> list[dict[str, object]]:
@@ -705,4 +707,11 @@ def _artifact_from_node(node: Mapping[str, Any]) -> PeerOnboardingArtifact:
         generation=int(payload.get("generation") or 1),
         audience_id=str(payload.get("audience_id") or "designer_2"),
         coauthor_ids=coauthor_ids,
+        last_edited_at=str(payload.get("last_edited_at") or node.get("created_at") or ""),
     )
+
+
+def peer_onboarding_timestamp() -> str:
+    """Return an ISO-8601 UTC timestamp used for artifact edit tracking."""
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
