@@ -127,6 +127,19 @@ class ObservationLog:
             raise PermissionError("observation log is only readable by the session author or founder")
         return events
 
+    def iter_events(self) -> tuple[ObservationEvent, ...]:
+        """Return raw observation events for local retrospective generation."""
+
+        with self._connect() as connection:
+            self._ensure_schema(connection)
+            rows = connection.execute(
+                """
+                SELECT * FROM observation_events
+                ORDER BY occurred_at, id
+                """
+            ).fetchall()
+        return tuple(_event_from_row(row) for row in rows)
+
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.db_path)
