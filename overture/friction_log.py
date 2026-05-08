@@ -10,7 +10,20 @@ from typing import Iterator
 
 from .metrics_store import DEFAULT_METRICS_DB_PATH
 
-FRICTION_CATEGORIES = ("slow", "confusing", "broken", "surprising")
+FRICTION_CATEGORIES = (
+    "slow",
+    "confusing",
+    "broken",
+    "surprising",
+)
+DESIGNER_ROLLOUT_FRICTION_CATEGORIES = (
+    "designer-experience",
+    "onboarding",
+    "performance",
+    "error-handling",
+    "uncategorized",
+)
+ACCEPTED_FRICTION_CATEGORIES = FRICTION_CATEGORIES + DESIGNER_ROLLOUT_FRICTION_CATEGORIES
 
 
 @dataclass(frozen=True)
@@ -49,8 +62,8 @@ class FrictionLog:
         session_id = _require_text(session_id, "session_id")
         run_id = _require_text(run_id, "run_id")
         note = _require_text(note, "note")
-        if category not in FRICTION_CATEGORIES:
-            raise ValueError(f"category must be one of: {', '.join(FRICTION_CATEGORIES)}")
+        if category not in ACCEPTED_FRICTION_CATEGORIES:
+            raise ValueError(f"category must be one of: {', '.join(ACCEPTED_FRICTION_CATEGORIES)}")
 
         timestamp = created_at or _utc_now_iso()
         with self._connect() as connection:
@@ -172,8 +185,7 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             note TEXT NOT NULL,
             created_at TEXT NOT NULL,
             author_id TEXT,
-            author_email TEXT,
-            CHECK (category IN ('slow', 'confusing', 'broken', 'surprising'))
+            author_email TEXT
         )
         """
     )
@@ -187,6 +199,7 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE friction_entries ADD COLUMN author_id TEXT")
     if "author_email" not in columns:
         connection.execute("ALTER TABLE friction_entries ADD COLUMN author_email TEXT")
+    _remove_legacy_category_check(connection)
     connection.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_friction_entries_session_run
@@ -205,6 +218,45 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         ON friction_entries (confirmed, created_at)
         """
     )
+
+
+def _remove_legacy_category_check(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        """
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'friction_entries'
+        """
+    ).fetchone()
+    if row is None or "CHECK (category IN" not in str(row["sql"]):
+        return
+
+    connection.execute("ALTER TABLE friction_entries RENAME TO friction_entries_legacy")
+    connection.execute(
+        """
+        CREATE TABLE friction_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            note TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            author_id TEXT,
+            author_email TEXT,
+            confirmed INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO friction_entries (
+            id, session_id, run_id, category, note, created_at, author_id, author_email, confirmed
+        )
+        SELECT id, session_id, run_id, category, note, created_at, author_id, author_email, confirmed
+        FROM friction_entries_legacy
+        """
+    )
+    connection.execute("DROP TABLE friction_entries_legacy")
 
 
 def _entry_from_row(row: sqlite3.Row) -> FrictionEntry:

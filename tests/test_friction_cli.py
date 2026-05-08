@@ -163,6 +163,52 @@ class FrictionCliTests(unittest.TestCase):
         self.assertIn("research approval took too long", intake_payloads[0]["raw_text"])
         self.assertIn("handoff instructions were unclear", intake_payloads[1]["raw_text"])
 
+    def test_seed_m4_backlog_intakes_from_confirmed_designer_friction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            db_path = base_dir / "metrics.sqlite"
+            intake_dir = base_dir / "intake"
+            append = _run_cli(
+                [
+                    "friction",
+                    "append",
+                    "--db-path",
+                    str(db_path),
+                    "--session-id",
+                    "m3",
+                    "--run-id",
+                    "three-designer-rollout",
+                    "--category",
+                    "performance",
+                    "--note",
+                    "approval page feels slow with real notes",
+                    "--confirmed",
+                ]
+            )
+            seeded = _run_cli(
+                [
+                    "backlog-seed",
+                    "--target-milestone",
+                    "M4",
+                    "--db-path",
+                    str(db_path),
+                    "--store-dir",
+                    str(intake_dir),
+                    "--session-id",
+                    "m3",
+                    "--format=json",
+                ]
+            )
+
+            payload = json.loads(seeded.stdout)
+            intake_payload = json.loads(Path(payload[0]["path"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(append.exit_code, 0)
+        self.assertEqual(seeded.exit_code, 0)
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(intake_payload["source_type"], "m4-friction")
+        self.assertIn("Sprint hint: M4-S2 performance", intake_payload["raw_text"])
+
 
 def _append(db_path: Path, session_id: str, run_id: str, category: str, note: str) -> None:
     result = _run_cli(

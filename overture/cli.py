@@ -18,10 +18,10 @@ import sys
 from pathlib import Path
 from typing import Callable, Sequence
 
-from .backlog_seeder import seed_confirmed_friction_intakes
+from .backlog_seeder import seed_confirmed_friction_intakes, seed_m4_designer_experience_intakes
 from .export_runner import run_ticket_export
 from .fixture import PIPELINE_STAGES, PipelineStageError, run_overture_fixture
-from .friction_log import FRICTION_CATEGORIES, FrictionLog
+from .friction_log import ACCEPTED_FRICTION_CATEGORIES, FrictionLog
 from .graph_http import create_graph_http_server, migrate_graph_store
 from .graph_store import DEFAULT_GRAPH_DB_PATH
 from .intake import create_intake_record, load_intake_record
@@ -375,7 +375,7 @@ def build_parser() -> argparse.ArgumentParser:
     friction_append.add_argument(
         "--category",
         required=True,
-        choices=FRICTION_CATEGORIES,
+        choices=ACCEPTED_FRICTION_CATEGORIES,
         help="Operator-selected friction category.",
     )
     friction_append.add_argument(
@@ -452,6 +452,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(".overture") / "intake",
         help="Directory where seeded intake records are stored.",
+    )
+    backlog_seed.add_argument(
+        "--target-milestone",
+        choices=("M2", "M4"),
+        default="M2",
+        help="Milestone intake shape to seed. Defaults to M2 for legacy confirmed operator friction.",
     )
     backlog_seed.add_argument(
         "--session-id",
@@ -830,7 +836,12 @@ def _backlog_seed(args: argparse.Namespace) -> int:
             print("no metrics runs recorded yet", file=sys.stderr)
             return 1
 
-    seeded = seed_confirmed_friction_intakes(
+    seeder = (
+        seed_m4_designer_experience_intakes
+        if args.target_milestone == "M4"
+        else seed_confirmed_friction_intakes
+    )
+    seeded = seeder(
         friction_log=log,
         intake_store_dir=args.store_dir,
         session_id=args.session_id,
