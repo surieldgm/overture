@@ -7,7 +7,7 @@ import glob
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 
 DEFAULT_CRITERION_PATHS = {
@@ -16,7 +16,25 @@ DEFAULT_CRITERION_PATHS = {
     "metric_runs": {"metrics_db": ".overture/metrics.sqlite"},
     "friction_entries": {"metrics_db": ".overture/metrics.sqlite"},
     "generated_retro": {"paths": [".overture/retro/*.md"]},
+    "m3_designers_shipped": {"metrics_db": ".overture/metrics.sqlite", "milestone": "M3"},
+    "m3_peer_onboarding_artifacts": {"graph_db": ".overture/graph.sqlite"},
+    "m3_observation_sessions": {"observation_db": ".overture/observation.sqlite"},
+    "m3_retro_docs": {"paths": [".overture/retro/m3*.md", ".overture/retros/m3*.md"]},
 }
+
+MILESTONE_RULE_REGISTRY = {
+    "m3": (
+        {"name": "m3_designers_shipped", "kind": "m3_designers_shipped", "target": 3},
+        {"name": "m3_peer_onboarding_artifacts", "kind": "m3_peer_onboarding_artifacts", "target": 1},
+        {"name": "m3_observation_sessions", "kind": "m3_observation_sessions", "target": 3},
+        {"name": "m3_retro_docs", "kind": "m3_retro_docs", "target": 1},
+    ),
+}
+
+PEER_ONBOARDING_ARTIFACT_NODE_IDS = (
+    "component_designer_one_filled_artifact",
+    "component_designer_three_peer_onboarding_artifact",
+)
 
 
 @dataclass(frozen=True)
@@ -56,7 +74,7 @@ def verify_milestone_config(config_path: Path | str, *, workspace: Path | str = 
     milestone = _require_text(config.get("milestone", config_file.stem), "milestone")
     criteria = tuple(
         _verify_criterion(criterion, workspace=Path(workspace))
-        for criterion in _normalize_criteria(config)
+        for criterion in _criteria_for_milestone(config, milestone)
     )
     if not criteria:
         raise ValueError("milestone config must declare at least one criterion")
@@ -94,6 +112,25 @@ def _normalize_criteria(config: dict[str, Any]) -> list[dict[str, Any]]:
     raise ValueError("milestone config must include criteria as an object or list")
 
 
+def _criteria_for_milestone(config: dict[str, Any], milestone: str) -> list[dict[str, Any]]:
+    registry_criteria = MILESTONE_RULE_REGISTRY.get(_milestone_key(milestone))
+    if registry_criteria is None:
+        return _normalize_criteria(config)
+
+    overrides = {criterion["name"]: criterion for criterion in _normalize_criteria_if_present(config)}
+    criteria: list[dict[str, Any]] = []
+    for criterion in registry_criteria:
+        configured = overrides.get(str(criterion["name"]), {})
+        criteria.append({**criterion, **configured})
+    return criteria
+
+
+def _normalize_criteria_if_present(config: dict[str, Any]) -> list[dict[str, Any]]:
+    if "criteria" not in config:
+        return []
+    return _normalize_criteria(config)
+
+
 def _verify_criterion(raw_criterion: dict[str, Any], *, workspace: Path) -> CriterionResult:
     name = _require_text(raw_criterion.get("name"), "criterion.name")
     kind = _require_text(raw_criterion.get("kind", name), f"{name}.kind")
@@ -117,6 +154,40 @@ def _verify_criterion(raw_criterion: dict[str, Any], *, workspace: Path) -> Crit
         paths = _require_string_list(criterion.get("paths"), f"{name}.paths")
         source = ",".join(paths)
         observed = _count_existing_nonempty_matches(workspace, paths)
+    elif kind == "m3_designers_shipped":
+        source = _resolve(workspace, _require_text(criterion.get("metrics_db"), f"{name}.metrics_db"))
+        milestone = _require_text(criterion.get("milestone"), f"{name}.milestone")
+        observed = _count_sqlite(
+            source,
+            """
+            SELECT count(DISTINCT author_id)
+            FROM ticket_rework_counters
+            WHERE milestone = ?
+              AND author_id IS NOT NULL
+              AND trim(author_id) != ''
+            """,
+            (milestone,),
+        )
+    elif kind == "m3_peer_onboarding_artifacts":
+        source = _resolve(workspace, _require_text(criterion.get("graph_db"), f"{name}.graph_db"))
+        placeholders = ",".join("?" for _ in PEER_ONBOARDING_ARTIFACT_NODE_IDS)
+        observed = _count_sqlite(
+            source,
+            f"""
+            SELECT count(*)
+            FROM nodes
+            WHERE kind = 'Component'
+              AND id IN ({placeholders})
+            """,
+            PEER_ONBOARDING_ARTIFACT_NODE_IDS,
+        )
+    elif kind == "m3_observation_sessions":
+        source = _resolve(workspace, _require_text(criterion.get("observation_db"), f"{name}.observation_db"))
+        observed = _count_sqlite(source, "SELECT count(DISTINCT session_id) FROM observation_events")
+    elif kind == "m3_retro_docs":
+        paths = _require_string_list(criterion.get("paths"), f"{name}.paths")
+        source = ",".join(paths)
+        observed = _count_existing_nonempty_matches(workspace, paths)
     else:
         raise ValueError(f"unsupported criterion kind: {kind}")
 
@@ -132,7 +203,7 @@ def _verify_criterion(raw_criterion: dict[str, Any], *, workspace: Path) -> Crit
     )
 
 
-def _count_sqlite(db_path: Path, query: str) -> int:
+def _count_sqlite(db_path: Path, query: str, parameters: Sequence[Any] = ()) -> int:
     if not db_path.exists():
         return 0
     try:
@@ -140,9 +211,9 @@ def _count_sqlite(db_path: Path, query: str) -> int:
     except sqlite3.OperationalError:
         return 0
     try:
-        row = connection.execute(query).fetchone()
+        row = connection.execute(query, tuple(parameters)).fetchone()
     except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc):
+        if "no such table" in str(exc) or "no such column" in str(exc):
             return 0
         raise
     finally:
@@ -166,6 +237,10 @@ def _resolve(workspace: Path, raw_path: str) -> Path:
     if path.is_absolute():
         return path
     return workspace / path
+
+
+def _milestone_key(milestone: str) -> str:
+    return milestone.strip().lower().replace(" ", "")
 
 
 def _require_mapping(value: Any, field_name: str) -> dict[str, Any]:
