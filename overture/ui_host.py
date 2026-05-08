@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 from http import cookies
 import html
 from ipaddress import ip_address
@@ -53,6 +54,7 @@ RESEARCH_APPROVAL_ROUTE = "/research/approval"
 RESEARCH_COMPLETE_ROUTE = "/research/complete"
 SYNTHESIS_ROUTE = "/synthesis"
 TICKET_REVIEW_ROUTE = "/ticket"
+PEER_ONBOARDING_EDITOR_ROUTE = "/peer-onboarding/edit"
 SESSION_CANDIDATES_KEY = "research_candidates"
 SESSION_APPROVALS_KEY = "research_approvals"
 SESSION_SYNTHESIS_BRIEF_KEY = "synthesis_brief"
@@ -133,6 +135,7 @@ AUTHENTICATED_WIZARD_PATHS = {
     TICKET_REVIEW_ROUTE,
     "/export",
     PEER_ONBOARDING_ROUTE,
+    PEER_ONBOARDING_EDITOR_ROUTE,
 }
 
 
@@ -346,6 +349,10 @@ class OvertureUiApp:
                 render_peer_onboarding_artifact_page(artifact, artifacts=artifacts, errors=errors),
                 status=status,
             )
+        if path == PEER_ONBOARDING_EDITOR_ROUTE and method == "GET":
+            return self._handle_peer_onboarding_editor_get(environ, start_response)
+        if path == PEER_ONBOARDING_EDITOR_ROUTE and method == "POST":
+            return self._handle_peer_onboarding_editor_post(environ, start_response)
         observation_session_id = _observation_session_id_from_path(path)
         if observation_session_id and method == "GET":
             return self._handle_observation_log_get(observation_session_id, start_response, user)
@@ -849,6 +856,101 @@ class OvertureUiApp:
             render_export_page(review),
             status=status,
             extra_headers=[("Set-Cookie", _session_cookie(review.session))],
+        )
+
+    def _handle_peer_onboarding_editor_get(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        user = _require_user(environ)
+        session_id, server_session, is_new = self._server_session(environ, user)
+        store = SqliteGraphStore(Path(self.store_dir) / "graph.sqlite")
+        artifact = load_latest_peer_onboarding_artifact(store)
+        editable_template = _peer_onboarding_template_from_session(server_session) or artifact.template
+        return self._render(
+            start_response,
+            render_peer_onboarding_editor_page(artifact, template=editable_template),
+            extra_headers=[("Set-Cookie", _opaque_session_cookie(session_id))] if is_new else [("Set-Cookie", _session_cookie(server_session))],
+        )
+
+    def _handle_peer_onboarding_editor_post(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
+        fields = _form_fields(environ)
+        user = _require_user(environ)
+        session_id, server_session, is_new = self._server_session(environ, user)
+        store = SqliteGraphStore(Path(self.store_dir) / "graph.sqlite")
+        artifact = load_latest_peer_onboarding_artifact(store)
+        editable_template = _parse_peer_onboarding_template_from_form(fields, artifact.template)
+        if editable_template is None:
+            error = "Unable to rebuild peer onboarding template from form fields."
+            self._record_observation(
+                server_session,
+                event_type="validation_error",
+                route=PEER_ONBOARDING_EDITOR_ROUTE,
+                action="submit",
+                user=user,
+                request={"fields": _flatten_form_fields(fields)},
+                response={"status": 400, "message": error},
+                error=error,
+            )
+            return self._render(
+                start_response,
+                render_peer_onboarding_editor_page(artifact, template=artifact.template, errors=[error]),
+                status="400 Bad Request",
+                extra_headers=[("Set-Cookie", _session_cookie(server_session))],
+            )
+
+        editable_artifact = PeerOnboardingArtifact(
+            id=artifact.id,
+            title=artifact.title,
+            author_id=artifact.author_id or user.user_id,
+            author_email=artifact.author_email or user.email,
+            template_id=artifact.template_id,
+            route=artifact.route,
+            template=editable_template,
+            intake_examples=artifact.intake_examples,
+            source_nodes=artifact.source_nodes,
+            generation=artifact.generation,
+            audience_id=artifact.audience_id,
+            coauthor_ids=artifact.coauthor_ids,
+        )
+        errors = validate_peer_onboarding_artifact(editable_artifact)
+        if errors:
+            session = dict(server_session)
+            session[SESSION_PEER_ONBOARDING_TEMPLATE_KEY] = json.dumps(editable_template, sort_keys=True, separators=(",", ":"))
+            self._record_observation(
+                session,
+                event_type="validation_error",
+                route=PEER_ONBOARDING_EDITOR_ROUTE,
+                action="submit",
+                user=user,
+                request={"fields": _flatten_form_fields(fields)},
+                response={"status": 400, "message": " ".join(errors)},
+                error="; ".join(errors),
+            )
+            return self._render(
+                start_response,
+                render_peer_onboarding_editor_page(
+                    artifact,
+                    template=editable_template,
+                    errors=errors,
+                ),
+                status="400 Bad Request",
+                extra_headers=[("Set-Cookie", _session_cookie(session))],
+            )
+
+        store.upsert_records((_peer_onboarding_artifact_record(editable_artifact),))
+        session = dict(server_session)
+        session.pop(SESSION_PEER_ONBOARDING_TEMPLATE_KEY, None)
+        self._record_observation(
+            session,
+            event_type="form_submission",
+            route=PEER_ONBOARDING_EDITOR_ROUTE,
+            action="submit",
+            user=user,
+            request={"fields": _flatten_form_fields(fields)},
+            response={"status": 303, "location": PEER_ONBOARDING_ROUTE, "artifact_id": artifact.id},
+        )
+        return self._redirect(
+            start_response,
+            PEER_ONBOARDING_ROUTE,
+            extra_headers=[("Set-Cookie", _session_cookie(session))],
         )
 
     def _render(
@@ -1358,6 +1460,76 @@ def _safe_session_key(value: str) -> str:
     return safe.strip("-") or "session"
 
 
+def _parse_peer_onboarding_template_from_form(
+    fields: Mapping[str, list[str]],
+    template: Mapping[str, object],
+) -> dict[str, object] | None:
+    parsed = deepcopy(template)
+    sections = parsed.get("sections")
+    if not isinstance(sections, list):
+        return None
+
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        section_id = str(section.get("id", "")).strip()
+        if not section_id:
+            continue
+        section_fields = section.get("fields")
+        if not isinstance(section_fields, list):
+            continue
+
+        for field in section_fields:
+            if not isinstance(field, dict):
+                continue
+            field_id = str(field.get("id", "")).strip()
+            if not field_id:
+                continue
+            key = f"{section_id}.{field_id}"
+            kind = str(field.get("kind", "")).strip()
+
+            if kind == "free_text":
+                field["value"] = fields.get(key, [""])[0]
+                continue
+            if kind == "list_text":
+                raw = fields.get(key, [""])[0]
+                field["value"] = [line.strip() for line in str(raw).splitlines() if line.strip()]
+                continue
+            if kind == "wizard_step_notes":
+                steps = field.get("steps", ())
+                step_names = tuple(step for step in steps if isinstance(step, str))
+                notes: list[dict[str, str]] = []
+                for index, step_name in enumerate(step_names):
+                    step_note = fields.get(f"{key}.{index}", [""])[0]
+                    notes.append({"step": str(step_name), "note": str(step_note)})
+                field["value"] = notes
+                continue
+            field["value"] = fields.get(key, [""])[0]
+
+    return parsed
+
+
+def _peer_onboarding_artifact_record(artifact: PeerOnboardingArtifact) -> GraphRecord:
+    return GraphRecord(
+        kind="Component",
+        key=artifact.id,
+        properties={
+            "label": artifact.title,
+            "summary": f"Peer onboarding artifact for {artifact.audience_id}.",
+            "author_id": artifact.author_id,
+            "author_email": artifact.author_email,
+            "coauthor_ids": list(artifact.coauthor_ids),
+            "generation": artifact.generation,
+            "audience_id": artifact.audience_id,
+            "template_id": artifact.template_id,
+            "viewer_route": artifact.route,
+            "template": artifact.template,
+            "intake_examples": list(artifact.intake_examples),
+            "source_nodes": list(artifact.source_nodes),
+        },
+    )
+
+
 def _linear_client_from_env() -> LinearClient:
     api_key = os.environ.get("LINEAR_API_KEY")
     if not api_key:
@@ -1519,6 +1691,76 @@ def _peer_onboarding_value_markup(value: object) -> str:
         )
         return f"<ul>{items}</ul>" if items else '<span class="empty-state">Not filled yet.</span>'
     return html.escape(str(value)) if value is not None else '<span class="empty-state">Not filled yet.</span>'
+
+
+def _peer_onboarding_editor_field_markup(section_id: str, field: Mapping[str, object]) -> str:
+    field_id = str(field.get("id", "field"))
+    label = html.escape(str(field.get("label", field_id)))
+    kind = str(field.get("kind", "free_text"))
+    name = f"{html.escape(section_id)}.{html.escape(field_id)}"
+
+    if kind == "list_text":
+        values = field.get("value", ())
+        if not isinstance(values, list):
+            values = []
+        value_text = "\n".join(str(item) for item in values if str(item).strip())
+        return f"""
+        <label for="{name}">{label}</label>
+        <textarea id="{name}" name="{name}">{html.escape(value_text)}</textarea>
+        """
+
+    if kind == "wizard_step_notes":
+        steps = field.get("steps", ())
+        if not isinstance(steps, tuple) and not isinstance(steps, list):
+            steps = ()
+        values = field.get("value", ())
+        if not isinstance(values, list):
+            values = []
+        value_by_step = {str(item.get("step", "")): str(item.get("note", "")) for item in values if isinstance(item, Mapping)}
+        step_inputs = []
+        for index, step in enumerate(steps):
+            step_name = str(step)
+            step_value = value_by_step.get(step_name, "")
+            step_name_escaped = html.escape(step_name)
+            step_input_name = f"{name}.{index}"
+            step_inputs.append(
+                f"""
+                <div class="peer-step-notes">
+                  <label for="{step_input_name}">{step_name_escaped}</label>
+                  <textarea id="{step_input_name}" name="{step_input_name}">{html.escape(step_value)}</textarea>
+                </div>
+                """
+            )
+        return f"""
+        <label>{label}</label>
+        {''.join(step_inputs)}
+        """
+
+    value = str(field.get("value", "")).strip()
+    return f"""
+        <label for="{name}">{label}</label>
+        <textarea id="{name}" name="{name}">{html.escape(value)}</textarea>
+    """
+
+
+def _peer_onboarding_editor_section_markup(section: Mapping[str, object]) -> str:
+    section_id = str(section.get("id", "Untitled section"))
+    title = html.escape(str(section.get("title", section_id)))
+    description = str(section.get("description", ""))
+    description_markup = f"<p>{html.escape(description)}</p>" if description else ""
+    fields = section.get("fields", ())
+    field_markup = "\n".join(
+        _peer_onboarding_editor_field_markup(section_id, field) for field in fields if isinstance(field, Mapping)
+    ) if isinstance(fields, list) else ""
+    if not field_markup:
+        field_markup = '<p class="empty-state">No fields are available in this section.</p>'
+    return f"""
+        <details class="brief-section" open>
+          <summary>{title}</summary>
+          {description_markup}
+          {field_markup}
+        </details>
+    """
 
 
 def render_login_page(*, email: str = "", error: str | None = None) -> str:
@@ -2052,12 +2294,16 @@ def render_peer_onboarding_artifact_page(
         f"<span>for <code>{html.escape(item.audience_id)}</code></span></li>"
         for item in artifact_list
     )
-    generation_markup = f"""
-          <section class="brief-section">
-            <h3>Available generations</h3>
-            <ol class="source-list">{generation_items}</ol>
-          </section>
-    """
+    generation_markup = (
+        f"""
+        <section class="brief-section">
+          <h3>Available generations</h3>
+          <ol class="source-list">{generation_items}</ol>
+        </section>
+        """
+        if generation_items
+        else ""
+    )
     section_markup = "\n".join(_peer_onboarding_section_markup(section) for section in artifact.sections)
     example_markup = '<ol class="source-list">' + "".join(
         _peer_example_markup(example) for example in artifact.intake_examples
@@ -2086,6 +2332,52 @@ def render_peer_onboarding_artifact_page(
             <h3>Graph sources</h3>
             <p>{source_nodes}</p>
           </section>
+        </section>
+        <aside class="side-panel" aria-label="Wizard context">
+          <h3>Wizard context</h3>
+          <ol class="wizard-context">
+            <li><a href="/intake">Intake</a></li>
+            <li><a href="{RESEARCH_APPROVAL_ROUTE}">Research approval</a></li>
+            <li><a href="{SYNTHESIS_ROUTE}">Synthesis</a></li>
+            <li><a href="{TICKET_REVIEW_ROUTE}">Ticket</a></li>
+            <li><a href="/export">Export</a></li>
+          </ol>
+        </aside>
+        """,
+        shell_class="shell",
+    )
+
+
+def render_peer_onboarding_editor_page(
+    artifact: PeerOnboardingArtifact,
+    *,
+    template: Mapping[str, object],
+    errors: Iterable[str] = (),
+) -> str:
+    hint_items = "".join(f"<li>{html.escape(error)}</li>" for error in errors)
+    error_markup = f'<div class="validation" role="alert"><ul>{hint_items}</ul></div>' if hint_items else ""
+    section_markup = "\n".join(
+        _peer_onboarding_editor_section_markup(section) for section in ordered_peer_onboarding_sections(template)
+    )
+    if not section_markup:
+        section_markup = '<p class="empty-state">No peer onboarding sections are available.</p>'
+    return render_layout(
+        title="Edit peer onboarding",
+        active_path=PEER_ONBOARDING_EDITOR_ROUTE,
+        content=f"""
+        <section class="workspace peer-onboarding">
+          <h2>Edit peer onboarding artifact</h2>
+          <p>{html.escape(ROUTES_BY_PATH[PEER_ONBOARDING_ROUTE].placeholder)}</p>
+          <p class="session-note">Saving updates the stored artifact for <code>{html.escape(artifact.audience_id)}</code>.</p>
+          {error_markup}
+          <form method="post" action="{PEER_ONBOARDING_EDITOR_ROUTE}" novalidate>
+            {section_markup}
+            <div class="form-footer">
+              <span>Designer #1 draft path</span>
+              <button type="submit">Save artifact</button>
+            </div>
+          </form>
+          <p><a class="button" href="{PEER_ONBOARDING_ROUTE}">View published artifact</a></p>
         </section>
         <aside class="side-panel" aria-label="Wizard context">
           <h3>Wizard context</h3>
