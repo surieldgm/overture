@@ -208,6 +208,18 @@ class IntakePageTests(unittest.TestCase):
             self.assertNotIn("Location", response.headers)
             self.assertEqual(list((Path(tmpdir) / "research").glob("*.json")), [])
 
+    def test_research_approval_shows_zero_default_approvals_on_first_visit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            intake = _request(app, "POST", "/intake", {"idea": "Keep source approvals intentional"})
+            approval = _request(app, "GET", RESEARCH_APPROVAL_ROUTE, cookie=intake.headers["Set-Cookie"])
+
+            self.assertEqual(approval.status, "200 OK")
+            self.assertIn('value="approve:https://example.test/symphony-ticket-evidence"', approval.body)
+            self.assertIn('value="approve:https://example.test/designer-intake-research"', approval.body)
+            self.assertNotIn('value="approve:https://example.test/symphony-ticket-evidence" checked', approval.body)
+            self.assertNotIn('value="approve:https://example.test/designer-intake-research" checked', approval.body)
+
     def test_research_revisit_shows_previously_approved_selection_for_same_intake(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             app = OvertureUiApp(store_dir=tmpdir)

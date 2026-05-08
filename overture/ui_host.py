@@ -1046,7 +1046,6 @@ def prepare_research_review(
             for item in result.items
         )
         _cache_research_candidates(store_dir, intake_id, candidates)
-        next_session = _store_session_approvals(next_session, intake_id, {_source_key(source) for source in candidates})
         if result.errors and not candidates:
             return ResearchReviewResult(next_session, candidates, result.errors[0].message)
 
