@@ -43,11 +43,20 @@ class WizardSkipStepSmokeTests(unittest.TestCase):
             self.assertIn("Go to research approval", synthesis.body)
             _assert_technical_errors_absent(self, synthesis.body)
 
-            ticket = _request(app, "GET", TICKET_REVIEW_ROUTE, cookie=intake_cookie)
+            ticket_redirect = _request(app, "GET", TICKET_REVIEW_ROUTE, cookie=intake_cookie)
+            self.assertEqual(ticket_redirect.status, "303 See Other")
+            self.assertEqual(ticket_redirect.headers["Location"], SYNTHESIS_ROUTE)
+            ticket = _request(
+                app,
+                "GET",
+                ticket_redirect.headers["Location"],
+                cookie=ticket_redirect.headers["Set-Cookie"],
+            )
             self.assertEqual(ticket.status, "200 OK")
-            self.assertIn("Complete synthesis review first", ticket.body)
-            self.assertIn(f'href="{SYNTHESIS_ROUTE}"', ticket.body)
-            self.assertIn("Go to synthesis", ticket.body)
+            self.assertIn("Complete research approval first", ticket.body)
+            self.assertIn(f'href="{RESEARCH_APPROVAL_ROUTE}"', ticket.body)
+            self.assertIn("Go to research approval", ticket.body)
+            self.assertIn("Complete research approval first", ticket.body)
             _assert_technical_errors_absent(self, ticket.body)
 
             research_cookie = _session_cookie(
@@ -80,15 +89,19 @@ class WizardSkipStepSmokeTests(unittest.TestCase):
             self.assertIn(f'href="{SYNTHESIS_ROUTE}"', research_complete.body)
             _assert_technical_errors_absent(self, research_complete.body)
 
+            top_nav_ticket_redirect = _request(app, "GET", TICKET_REVIEW_ROUTE, cookie=research_complete.headers["Set-Cookie"])
+            self.assertEqual(top_nav_ticket_redirect.status, "303 See Other")
+            self.assertEqual(top_nav_ticket_redirect.headers["Location"], SYNTHESIS_ROUTE)
             top_nav_ticket = _request(
                 app,
                 "GET",
-                TICKET_REVIEW_ROUTE,
-                cookie=research_complete.headers["Set-Cookie"],
+                top_nav_ticket_redirect.headers["Location"],
+                cookie=top_nav_ticket_redirect.headers["Set-Cookie"],
             )
             self.assertEqual(top_nav_ticket.status, "200 OK")
-            self.assertIn("Complete synthesis review first", top_nav_ticket.body)
-            self.assertIn(f'href="{SYNTHESIS_ROUTE}"', top_nav_ticket.body)
+            self.assertIn("Complete research approval first", top_nav_ticket.body)
+            self.assertIn(f'href="{RESEARCH_APPROVAL_ROUTE}"', top_nav_ticket.body)
+            self.assertIn("Complete research approval first", top_nav_ticket.body)
             _assert_technical_errors_absent(self, top_nav_ticket.body)
 
 
@@ -147,4 +160,3 @@ class _Response:
         self.all_headers = headers
         self.headers = dict(headers)
         self.body = body
-
