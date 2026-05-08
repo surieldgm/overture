@@ -34,6 +34,10 @@ class DocLinkTests(unittest.TestCase):
             "Disabled",
             "Human approval is not required by branch protection.",
             "green CI result",
+            "End-to-End CI Smoke Test",
+            "Within 5 minutes",
+            "Linear-GitHub integration",
+            "Close the smoke-test PR without merging.",
         )
         for fragment in required_fragments:
             with self.subTest(fragment=fragment):
