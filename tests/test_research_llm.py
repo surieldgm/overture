@@ -8,7 +8,12 @@ from pathlib import Path
 from unittest import mock
 
 from overture.intake import create_intake_record
-from overture.research_llm import CODEX_EXECUTABLE_ENV, LLMSuggestedSourceAdapter, codex_cli_client
+from overture.research_llm import (
+    CODEX_EXECUTABLE_ENV,
+    LLMSuggestedSourceAdapter,
+    codex_cli_available,
+    codex_cli_client,
+)
 
 
 def _intake() -> dict[str, str]:
@@ -148,6 +153,22 @@ class LLMSuggestedSourceAdapterTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {CODEX_EXECUTABLE_ENV: str(executable)}):
                 self.assertEqual(codex_cli_client("Suggest sources"), '[{"title":"Configured Codex"}]\n')
 
+    def test_codex_cli_available_false_when_missing_from_path(self) -> None:
+        with mock.patch.dict(os.environ, {"PATH": "", CODEX_EXECUTABLE_ENV: ""}):
+            self.assertFalse(codex_cli_available())
+
+    def test_codex_cli_available_true_when_configured_executable_resolves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executable = Path(tmpdir) / "fake-codex"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+            with mock.patch.dict(os.environ, {CODEX_EXECUTABLE_ENV: str(executable)}):
+                self.assertTrue(codex_cli_available())
+
+    def test_codex_cli_available_false_when_configured_path_missing(self) -> None:
+        with mock.patch.dict(os.environ, {CODEX_EXECUTABLE_ENV: "/nonexistent/codex-binary"}):
+            self.assertFalse(codex_cli_available())
+
 
 class ResearchCliTests(unittest.TestCase):
     def test_research_command_with_fake_client_writes_json(self) -> None:
@@ -186,6 +207,47 @@ class ResearchCliTests(unittest.TestCase):
             for item in payload["items"]:
                 self.assertTrue(item["claims"])
                 self.assertGreater(item["confidence"], 0)
+
+    def test_research_command_falls_back_when_codex_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            intake, _ = create_intake_record(
+                "Help designers turn Overture intake into research-backed Symphony tickets",
+                base_dir / "intake",
+            )
+
+            sandbox_path = Path(tmpdir) / "empty-bin"
+            sandbox_path.mkdir()
+            child_env = {
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"OVERTURE_LLM_CLIENT", CODEX_EXECUTABLE_ENV}
+            }
+            child_env["PATH"] = str(sandbox_path)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "overture",
+                    "research",
+                    intake.id,
+                    "--store-dir",
+                    str(base_dir),
+                ],
+                check=True,
+                capture_output=True,
+                input="y\ny\n",
+                text=True,
+                env=child_env,
+            )
+
+            self.assertIn("Codex CLI not found on PATH", result.stderr)
+            output_path = Path(result.stdout.splitlines()[-1])
+            self.assertTrue(output_path.exists())
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["intake_id"], intake.id)
+            self.assertEqual(len(payload["items"]), 2)
 
 
 if __name__ == "__main__":
