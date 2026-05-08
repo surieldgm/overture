@@ -9,14 +9,14 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlencode, urlparse
 
-from overture.auth import AUTH_COOKIE_NAME, MagicLinkAuth
+from overture.auth import AUTH_COOKIE_NAME, AuthenticatedUser, MagicLinkAuth
 from overture.graph_http import SharedGraphBackend
 from overture.graph import GraphRecord
 from overture.graph_store import SqliteGraphStore
 from overture.intake import load_intake_record
+from overture.observation_log import ObservationLog
 from overture.export import parse_ticket_file
 from overture.linear_client import CreatedIssue
-from overture.observation_log import OBSERVATION_LOG_FILENAME, load_observation_events
 from overture.synthesis import synthesize_graph_context
 from overture.ui_host import (
     RESEARCH_APPROVAL_ROUTE,
@@ -319,8 +319,8 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
             self.assertIn("Cached brief", revisit_page.body)
             self.assertEqual(calls, 1)
 
-    def test_concurrent_authenticated_users_complete_wizard_against_shared_backend(self) -> None:
-        """Smoke the full two-user wizard path against the shared backend.
+    def test_three_concurrent_authenticated_users_complete_wizard_with_scoped_observation_logs(self) -> None:
+        """Smoke the full three-user wizard path against the shared backend.
 
         This boots the shared graph backend in-process and injects it into the
         socket-backed UI server. The same scenario can be run as an
@@ -372,17 +372,22 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
                     url="https://example.test/avery-research",
                     summary="Avery needs isolated research evidence for a concurrent wizard run.",
                 )
-            if "Blake" in prompt:
-                return _stub_llm_payload(
-                    title="Blake synthesis workflow",
-                    url="https://example.test/blake-synthesis",
-                    summary="Blake needs isolated synthesis evidence for a concurrent wizard run.",
-                )
+            for name, workflow in (
+                ("Blake", "synthesis"),
+                ("Casey", "observation"),
+            ):
+                if name in prompt:
+                    return _stub_llm_payload(
+                        title=f"{name} {workflow} workflow",
+                        url=f"https://example.test/{name.lower()}-{workflow}",
+                        summary=f"{name} needs isolated {workflow} evidence for a concurrent wizard run.",
+                    )
             raise AssertionError(f"unexpected prompt: {prompt}")
 
         users = (
             {"email": "avery@example.test", "name": "Avery", "source": "https://example.test/avery-research"},
             {"email": "blake@example.test", "name": "Blake", "source": "https://example.test/blake-synthesis"},
+            {"email": "casey@example.test", "name": "Casey", "source": "https://example.test/casey-observation"},
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -399,12 +404,13 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
                     auth_manager=auth,
                     graph_backend=graph_backend,
                 ) as base_url:
-                    with ThreadPoolExecutor(max_workers=2) as executor:
+                    with ThreadPoolExecutor(max_workers=3) as executor:
                         results = tuple(executor.map(lambda user: _complete_authenticated_wizard(base_url, auth, user), users))
 
             by_email = {result["author_email"]: result for result in results}
             self.assertEqual(set(by_email), {user["email"] for user in users})
-            self.assertEqual(len({result["intake_id"] for result in results}), 2)
+            self.assertEqual(len({result["intake_id"] for result in results}), 3)
+            observation_log = ObservationLog(store_dir / "observation.sqlite")
 
             for user in users:
                 result = by_email[user["email"]]
@@ -424,14 +430,33 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
                 self.assertIn(f"<!-- author_id: {author_id} -->", ticket)
                 self.assertIn(f"<!-- author_email: {user['email']} -->", ticket)
                 self.assertIn(user["name"], intake.raw_text)
-                self.assertNotIn("Blake" if user["name"] == "Avery" else "Avery", intake.raw_text)
+                for other in users:
+                    if other is not user:
+                        self.assertNotIn(other["name"], intake.raw_text)
+
+                events = observation_log.iter_session_events(
+                    intake_id,
+                    user=AuthenticatedUser(user_id=author_id, email=user["email"]),
+                )
+                self.assertGreaterEqual(len(events), 8)
+                self.assertTrue(all(event.session_id == intake_id for event in events))
+                self.assertTrue(all(event.actor_id == author_id for event in events))
+                self.assertTrue(all(event.actor_email == user["email"] for event in events))
+                self.assertTrue(all(event.author_id == author_id for event in events))
+                self.assertTrue(all(event.author_email == user["email"] for event in events))
+                event_routes = {event.route for event in events}
+                self.assertIn("/intake", event_routes)
+                self.assertIn(RESEARCH_APPROVAL_ROUTE, event_routes)
+                self.assertIn(SYNTHESIS_ROUTE, event_routes)
+                self.assertIn(TICKET_REVIEW_ROUTE, event_routes)
+                self.assertIn("/export", event_routes)
 
             nodes = graph_backend.list_nodes()
             edges = graph_backend.list_edges()
             counts = graph_backend.table_counts()
             self.assertEqual(counts, {"nodes": len(nodes), "edges": len(edges)})
-            self.assertEqual(counts["nodes"], 14)
-            self.assertEqual(counts["edges"], 14)
+            self.assertEqual(counts["nodes"], 21)
+            self.assertEqual(counts["edges"], 21)
             authors_by_email = {user["email"]: by_email[user["email"]]["author_id"] for user in users}
             for user in users:
                 author_nodes = [node for node in nodes if node.get("author_email") == user["email"]]
@@ -441,7 +466,7 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
                 self.assertTrue(all(node.get("author_id") == authors_by_email[user["email"]] for node in author_nodes))
                 self.assertTrue(all(edge.get("author_id") == authors_by_email[user["email"]] for edge in author_edges))
 
-        self.assertEqual(len(linear_calls), 2)
+        self.assertEqual(len(linear_calls), 3)
         self.assertEqual({call["team_id"] for call in linear_calls}, {"stubbed-ui-team"})
 
     def test_synthesis_persists_graph_records_with_authenticated_author(self) -> None:
@@ -465,191 +490,84 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
         self.assertTrue(all(node["author_id"] == "designer-2@example.test" for node in nodes))
         self.assertTrue(all(edge["author_id"] == "designer-2@example.test" for edge in edges))
 
-    def test_observation_log_captures_complete_designer_two_solo_session(self) -> None:
-        auth = MagicLinkAuth(secret="designer-two-observation-smoke")
-        linear_calls: list[dict[str, object]] = []
-
-        class StubLinearClient:
-            def create_issue(
-                self,
-                *,
-                team_id,
-                title,
-                description,
-                project_id=None,
-                priority=None,
-                sprint_label=None,
-                milestone=None,
-            ):
-                linear_calls.append(
-                    {
-                        "team_id": team_id,
-                        "title": title,
-                        "description": description,
-                        "project_id": project_id,
-                        "priority": priority,
-                        "sprint_label": sprint_label,
-                        "milestone": milestone,
-                    }
-                )
-                return CreatedIssue(
-                    id="designer-two-observation-id",
-                    identifier="ERI-732",
-                    url="https://linear.app/eria/issue/ERI-732/designer-two-observation",
-                )
-
+    def test_observation_log_captures_transitions_submissions_and_validation_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store_dir = Path(tmpdir)
-            auth_cookie_header = _merge_cookie(None, AUTH_COOKIE_NAME, auth.issue_session("designer-2@example.test"))
-            with mock.patch.dict(
-                "os.environ",
-                {"LINEAR_API_KEY": "stubbed-key", "LINEAR_TEAM_ID": "stubbed-ui-team"},
-            ):
-                with _running_server(
-                    store_dir=store_dir,
-                    llm_client=_stub_llm_client,
-                    linear_client_factory=StubLinearClient,
-                    auth_manager=auth,
-                ) as base_url:
-                    intake_page = _get(base_url, "/intake", headers={"Cookie": auth_cookie_header})
-                    self.assertEqual(intake_page.status, 200)
-                    intake_cookie = _merge_cookie(intake_page.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth.issue_session("designer-2@example.test"))
+            with _running_server(store_dir=store_dir, llm_client=_stub_llm_client) as base_url:
+                intake_response = _post(base_url, "/intake", {"idea": "Observe a founder-absent wizard run"})
+                self.assertEqual(intake_response.status, 303)
+                intake_session = _session_from_set_cookie(intake_response.headers["Set-Cookie"])
+                intake_id = intake_session["intake_id"]
 
-                    invalid_intake = _post(base_url, "/intake", {"idea": ""}, headers={"Cookie": intake_cookie})
-                    self.assertEqual(invalid_intake.status, 400)
+                approval_page = _get(base_url, RESEARCH_APPROVAL_ROUTE, headers={"Cookie": intake_response.headers["Set-Cookie"]})
+                self.assertEqual(approval_page.status, 200)
+                error_response = _post(
+                    base_url,
+                    RESEARCH_APPROVAL_ROUTE,
+                    {"decision-0": "reject:https://example.test/designer-synthesis"},
+                    headers={"Cookie": approval_page.headers["Set-Cookie"]},
+                )
+                self.assertEqual(error_response.status, 400)
+                research_response = _post(
+                    base_url,
+                    RESEARCH_APPROVAL_ROUTE,
+                    {"decision-0": "approve:https://example.test/designer-synthesis"},
+                    headers={"Cookie": error_response.headers["Set-Cookie"]},
+                )
+                self.assertEqual(research_response.status, 303)
 
+                synthesis_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": research_response.headers["Set-Cookie"]})
+                self.assertEqual(synthesis_page.status, 200)
+                synthesis_response = _post(base_url, SYNTHESIS_ROUTE, {}, headers={"Cookie": synthesis_page.headers["Set-Cookie"]})
+                self.assertEqual(synthesis_response.status, 303)
+
+            events = ObservationLog(store_dir / "observation.sqlite").iter_session_events(
+                intake_id,
+                user=AuthenticatedUser(user_id="designer-1@example.test", email="designer-1@example.test"),
+            )
+
+        event_types = [event.event_type for event in events]
+        routes = [event.route for event in events]
+        self.assertIn("form_submission", event_types)
+        self.assertIn("validation_error", event_types)
+        self.assertIn("page_transition", event_types)
+        self.assertIn(RESEARCH_APPROVAL_ROUTE, routes)
+        self.assertIn(SYNTHESIS_ROUTE, routes)
+        self.assertIn(TICKET_REVIEW_ROUTE, routes)
+        validation_event = next(event for event in events if event.event_type == "validation_error")
+        self.assertEqual(validation_event.request["approved_keys"], [])
+        self.assertIn("Approve at least one source", validation_event.error or "")
+        self.assertRegex(events[0].occurred_at, r"\.\d{3}Z$")
+
+    def test_observation_log_route_is_scoped_to_author_and_founder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store_dir = Path(tmpdir)
+            with mock.patch.dict("os.environ", {"OVERTURE_FOUNDER_EMAILS": "founder@example.test"}):
+                with _running_server(store_dir=store_dir, llm_client=_stub_llm_client) as base_url:
+                    author_token = TEST_AUTH.issue_session("designer-1@example.test")
+                    author_header = _merge_cookie(None, AUTH_COOKIE_NAME, author_token)
                     intake_response = _post(
                         base_url,
                         "/intake",
-                        {"idea": "Designer two validates the solo observation log"},
-                        headers={"Cookie": intake_cookie},
+                        {"idea": "Founder can inspect this session after the fact"},
+                        headers={"Cookie": author_header},
                     )
                     self.assertEqual(intake_response.status, 303)
-                    self.assertEqual(intake_response.headers["Location"], RESEARCH_APPROVAL_ROUTE)
-                    research_cookie = _merge_cookie(intake_response.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth.issue_session("designer-2@example.test"))
+                    intake_id = _session_from_set_cookie(intake_response.headers["Set-Cookie"])["intake_id"]
 
-                    approval_page = _get(base_url, RESEARCH_APPROVAL_ROUTE, headers={"Cookie": research_cookie})
-                    self.assertEqual(approval_page.status, 200)
-                    approval_cookie = _merge_cookie(approval_page.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth.issue_session("designer-2@example.test"))
-                    research_response = _post(
-                        base_url,
-                        RESEARCH_APPROVAL_ROUTE,
-                        {"decision-0": "approve:https://example.test/designer-synthesis"},
-                        headers={"Cookie": approval_cookie},
-                    )
-                    self.assertEqual(research_response.status, 303)
-                    self.assertEqual(research_response.headers["Location"], RESEARCH_COMPLETE_ROUTE)
-                    completed_research_cookie = _merge_cookie(
-                        research_response.headers["Set-Cookie"],
-                        AUTH_COOKIE_NAME,
-                        auth.issue_session("designer-2@example.test"),
-                    )
+                    author_cookie = _merge_cookie(intake_response.headers["Set-Cookie"], AUTH_COOKIE_NAME, author_token)
+                    author_view = _get(base_url, f"/sessions/{intake_id}/observation", headers={"Cookie": author_cookie})
+                    self.assertEqual(author_view.status, 200)
+                    self.assertIn("Observation log", author_view.body)
 
-                    research_complete = _get(base_url, RESEARCH_COMPLETE_ROUTE, headers={"Cookie": completed_research_cookie})
-                    self.assertEqual(research_complete.status, 200)
-                    synthesis_page = _get(base_url, SYNTHESIS_ROUTE, headers={"Cookie": completed_research_cookie})
-                    self.assertEqual(synthesis_page.status, 200)
-                    synthesis_cookie = _merge_cookie(synthesis_page.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth.issue_session("designer-2@example.test"))
-                    synthesis_response = _post(base_url, SYNTHESIS_ROUTE, {}, headers={"Cookie": synthesis_cookie})
-                    self.assertEqual(synthesis_response.status, 303)
-                    self.assertEqual(synthesis_response.headers["Location"], TICKET_REVIEW_ROUTE)
-                    ticket_cookie = _merge_cookie(synthesis_response.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth.issue_session("designer-2@example.test"))
+                    founder_header = _merge_cookie(None, AUTH_COOKIE_NAME, TEST_AUTH.issue_session("founder@example.test"))
+                    founder_view = _get(base_url, f"/sessions/{intake_id}/observation", headers={"Cookie": founder_header})
+                    self.assertEqual(founder_view.status, 200)
+                    self.assertIn("form_submission", founder_view.body)
 
-                    ticket_page = _get(base_url, TICKET_REVIEW_ROUTE, headers={"Cookie": ticket_cookie})
-                    self.assertEqual(ticket_page.status, 200)
-                    ticket_session = _session_from_set_cookie(ticket_page.headers["Set-Cookie"])
-                    reviewed_ticket_cookie = _merge_cookie(ticket_page.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth.issue_session("designer-2@example.test"))
-                    ticket_response = _post(
-                        base_url,
-                        TICKET_REVIEW_ROUTE,
-                        {"ticket_markdown": ticket_session["ticket_markdown"]},
-                        headers={"Cookie": reviewed_ticket_cookie},
-                    )
-                    self.assertEqual(ticket_response.status, 303)
-                    self.assertEqual(ticket_response.headers["Location"], "/export")
-                    export_cookie = _merge_cookie(ticket_response.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth.issue_session("designer-2@example.test"))
-
-                    export_page = _get(base_url, "/export", headers={"Cookie": export_cookie})
-                    self.assertEqual(export_page.status, 200)
-                    export_page_cookie = _merge_cookie(export_page.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth.issue_session("designer-2@example.test"))
-                    retreat_response = _post(base_url, "/export", {"action": "back"}, headers={"Cookie": export_page_cookie})
-                    self.assertEqual(retreat_response.status, 303)
-                    self.assertEqual(retreat_response.headers["Location"], TICKET_REVIEW_ROUTE)
-                    retreated_ticket_cookie = _merge_cookie(retreat_response.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth.issue_session("designer-2@example.test"))
-
-                    ticket_page_after_retreat = _get(base_url, TICKET_REVIEW_ROUTE, headers={"Cookie": retreated_ticket_cookie})
-                    self.assertEqual(ticket_page_after_retreat.status, 200)
-                    ticket_after_retreat_cookie = _merge_cookie(
-                        ticket_page_after_retreat.headers["Set-Cookie"],
-                        AUTH_COOKIE_NAME,
-                        auth.issue_session("designer-2@example.test"),
-                    )
-                    final_ticket = _post(
-                        base_url,
-                        TICKET_REVIEW_ROUTE,
-                        {"ticket_markdown": ticket_session["ticket_markdown"]},
-                        headers={"Cookie": ticket_after_retreat_cookie},
-                    )
-                    self.assertEqual(final_ticket.status, 303)
-                    final_export_cookie = _merge_cookie(final_ticket.headers["Set-Cookie"], AUTH_COOKIE_NAME, auth.issue_session("designer-2@example.test"))
-                    final_export = _post(base_url, "/export", {"action": "export"}, headers={"Cookie": final_export_cookie})
-                    self.assertEqual(final_export.status, 200)
-
-            events = load_observation_events(store_dir / OBSERVATION_LOG_FILENAME)
-
-        event_types = [event["event_type"] for event in events]
-        transitions = {(event.get("from_route"), event.get("to_route")) for event in events if event["event_type"] == "page_transition"}
-        form_submissions = [event for event in events if event["event_type"] == "form_submission"]
-        errors = [event for event in events if event["event_type"] == "error"]
-        advances = {(event.get("from_route"), event.get("to_route")) for event in events if event["event_type"] == "advance"}
-        retreats = {(event.get("from_route"), event.get("to_route")) for event in events if event["event_type"] == "retreat"}
-
-        self.assertIn("page_transition", event_types)
-        self.assertEqual(
-            {
-                ("/intake", RESEARCH_APPROVAL_ROUTE),
-                (RESEARCH_APPROVAL_ROUTE, RESEARCH_COMPLETE_ROUTE),
-                (SYNTHESIS_ROUTE, TICKET_REVIEW_ROUTE),
-                (TICKET_REVIEW_ROUTE, "/export"),
-                ("/export", TICKET_REVIEW_ROUTE),
-            },
-            {
-                ("/intake", RESEARCH_APPROVAL_ROUTE),
-                (RESEARCH_APPROVAL_ROUTE, RESEARCH_COMPLETE_ROUTE),
-                (SYNTHESIS_ROUTE, TICKET_REVIEW_ROUTE),
-                (TICKET_REVIEW_ROUTE, "/export"),
-                ("/export", TICKET_REVIEW_ROUTE),
-            }
-            & transitions,
-        )
-        self.assertEqual(
-            [event["path"] for event in form_submissions],
-            [
-                "/intake",
-                "/intake",
-                RESEARCH_APPROVAL_ROUTE,
-                SYNTHESIS_ROUTE,
-                TICKET_REVIEW_ROUTE,
-                "/export",
-                TICKET_REVIEW_ROUTE,
-                "/export",
-            ],
-        )
-        self.assertEqual([event["path"] for event in errors], ["/intake"])
-        self.assertTrue(
-            {
-                ("/intake", RESEARCH_APPROVAL_ROUTE),
-                (RESEARCH_APPROVAL_ROUTE, RESEARCH_COMPLETE_ROUTE),
-                (SYNTHESIS_ROUTE, TICKET_REVIEW_ROUTE),
-                (TICKET_REVIEW_ROUTE, "/export"),
-            }.issubset(advances)
-        )
-        self.assertEqual(retreats, {("/export", TICKET_REVIEW_ROUTE)})
-        self.assertTrue(events)
-        self.assertTrue(all(event["user_id"] == "designer-2@example.test" for event in events))
-        self.assertTrue(all(event["user_email"] == "designer-2@example.test" for event in events))
-        self.assertFalse(any("founder" in json.dumps(event, sort_keys=True).lower() for event in events))
-        self.assertEqual(len(linear_calls), 1)
+                    other_header = _merge_cookie(None, AUTH_COOKIE_NAME, TEST_AUTH.issue_session("other@example.test"))
+                    other_view = _get(base_url, f"/sessions/{intake_id}/observation", headers={"Cookie": other_header})
+                    self.assertEqual(other_view.status, 403)
 
 
 def _running_server(

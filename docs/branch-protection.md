@@ -74,3 +74,52 @@ Confirm that:
 - `Python 3.11 unittest` is the only required CI status check for this workflow.
 - PRs with failing required checks cannot be merged.
 - Force-pushes to `main` are rejected by GitHub.
+
+## End-to-End CI Smoke Test
+
+Run this smoke test whenever the workflow, validator, branch protection rule, or
+Linear-GitHub integration is re-applied. The smoke PR must be closed without
+merging after validation.
+
+1. Start from a clean `main` branch updated to `origin/main`.
+2. Create a disposable branch whose name includes the Linear issue identifier,
+   for example:
+
+   ```text
+   <user>/ERI-83-ci-smoke
+   ```
+
+3. Commit one passing change, such as a temporary note under `docs/`, and one
+   deliberately failing unittest. The failing test should be obvious and
+   isolated, for example:
+
+   ```python
+   self.assertTrue(False, "deliberate CI smoke failure")
+   ```
+
+4. Push the branch and open a pull request against `main`. Include the Linear
+   issue identifier in the PR title or body so the native Linear-GitHub
+   integration links the PR to the issue.
+5. Within 5 minutes, verify the PR shows the required `Python 3.11 unittest`
+   check as failed. Record the failed check URL or screenshot in the ticket
+   workpad.
+6. Verify GitHub blocks the merge while CI is red. In the GitHub PR UI, the
+   merge control must be disabled or replaced by the branch-protection failure
+   message for the required check.
+7. Open the linked Linear issue and verify the PR card or GitHub activity shows
+   the failed status for the same PR. If the issue does not show a native
+   GitHub-linked PR status, treat the integration as failed even if the PR URL
+   was manually attached.
+8. Fix the deliberately failing test on the same branch and push the fix commit.
+9. Verify the same PR transitions to a successful `Python 3.11 unittest` check.
+10. Verify GitHub now reports the PR as mergeable. In the GitHub PR UI, the merge
+    control should become enabled once the required check is green and the
+    branch is up to date.
+11. Re-open the linked Linear issue and verify the PR card or GitHub activity
+    reflects the successful status transition.
+12. Close the smoke-test PR without merging. Delete the disposable remote branch
+    and record the closure in the ticket workpad.
+
+The rollback step is mandatory: never merge the smoke-test PR, even after it
+turns green. The PR exists only to prove that red CI blocks merge and that the
+GitHub-to-Linear status chain reports both red and green states.
