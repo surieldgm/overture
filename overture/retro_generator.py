@@ -56,6 +56,7 @@ def render_retro_markdown(
     metrics_summary: dict[str, dict[str, float | int]],
 ) -> str:
     entries = list(frictions)
+    designer_summaries = _designer_summaries(entries)
     lines: list[str] = [
         f"# {window.milestone} Retrospective",
         "",
@@ -112,6 +113,33 @@ def render_retro_markdown(
             f"- Captured friction categories with entries: {_format_category_counts(by_category)}.",
             f"- Captured metric stage rows: {sum(int(stats['count']) for stats in metrics_summary.values())}.",
             "",
+            "## Team Summary",
+            "",
+            f"- Designers represented: {len(designer_summaries)}.",
+            f"- Confirmed friction entries: {len(entries)}.",
+            f"- Captured friction categories with entries: {_format_category_counts(by_category)}.",
+            "",
+            "## Designer Summaries",
+            "",
+        ]
+    )
+    if designer_summaries:
+        for designer in designer_summaries:
+            lines.extend(
+                [
+                    f"### {designer['label']}",
+                    "",
+                    f"- Confirmed friction entries: {designer['count']}.",
+                    f"- Categories: {designer['categories']}.",
+                    f"- Sessions: {designer['sessions']}.",
+                    "",
+                ]
+            )
+    else:
+        lines.extend(["_No designer-authored friction entries recorded._", ""])
+
+    lines.extend(
+        [
             "## M2 Implications",
             "",
             "- No generated interpretation is included.",
@@ -163,9 +191,52 @@ def _group_frictions(entries: Iterable[FrictionEntry]) -> dict[str, list[Frictio
     return grouped
 
 
+def _designer_summaries(entries: Iterable[FrictionEntry]) -> list[dict[str, str | int]]:
+    grouped: dict[str, list[FrictionEntry]] = {}
+    labels: dict[str, str] = {}
+    for entry in entries:
+        key = entry.author_id or entry.author_email or entry.session_id
+        label = entry.author_email or entry.author_id or entry.session_id
+        grouped.setdefault(key, []).append(entry)
+        labels.setdefault(key, label)
+
+    summaries: list[dict[str, str | int]] = []
+    for key in sorted(grouped, key=lambda value: labels[value]):
+        designer_entries = grouped[key]
+        summaries.append(
+            {
+                "label": labels[key],
+                "count": len(designer_entries),
+                "categories": _format_nonempty_counts(entry.category for entry in designer_entries),
+                "sessions": ", ".join(
+                    f"`{session}`" for session in _ordered_unique(entry.session_id for entry in designer_entries)
+                ),
+            }
+        )
+    return summaries
+
+
 def _format_category_counts(by_category: dict[str, list[FrictionEntry]]) -> str:
     counts = [f"{category}={len(by_category.get(category, []))}" for category in FRICTION_CATEGORIES]
     return ", ".join(counts)
+
+
+def _format_nonempty_counts(values: Iterable[str]) -> str:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return ", ".join(f"{value}={counts[value]}" for value in sorted(counts))
+
+
+def _ordered_unique(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
 
 
 def _validate_window(window: RetroWindow) -> None:
