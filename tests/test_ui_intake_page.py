@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 from urllib.parse import urlparse
 
 from overture.auth import AUTH_COOKIE_NAME
-from overture.intake import load_intake_record
+from overture.intake import create_intake_record, load_intake_record
 from overture.ui_host import (
     INTAKE_TEXT_MAX_CHARS,
     RESEARCH_COMPLETE_ROUTE,
@@ -274,6 +274,39 @@ class IntakePageTests(unittest.TestCase):
         self.assertIn("## Acceptance criteria", response.body)
         session = _session_from_set_cookie(response.headers["Set-Cookie"])
         self.assertIn(SESSION_TICKET_MARKDOWN_KEY, session)
+
+    def test_synthesis_without_research_result_renders_prerequisite_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            record, _path = create_intake_record(
+                "Build useful wizard empty states",
+                Path(tmpdir) / "intake",
+                author_email="designer@example.com",
+            )
+
+            response = _request(
+                OvertureUiApp(store_dir=tmpdir),
+                "GET",
+                "/synthesis",
+                cookie=_session_cookie({"intake_id": record.id, "author_email": "designer@example.com"}),
+            )
+
+        self.assertEqual(response.status, "200 OK")
+        self.assertIn("Complete research approval first", response.body)
+        self.assertIn(f'href="{RESEARCH_APPROVAL_ROUTE}"', response.body)
+        self.assertIn("Go to research approval", response.body)
+        self.assertNotIn("Research result not found", response.body)
+        self.assertNotIn("Placeholder for synthesis brief review.", response.body)
+
+    def test_ticket_without_synthesis_brief_renders_prerequisite_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            response = _request(OvertureUiApp(store_dir=tmpdir), "GET", "/ticket")
+
+        self.assertEqual(response.status, "200 OK")
+        self.assertIn("Complete synthesis review first", response.body)
+        self.assertIn('href="/synthesis"', response.body)
+        self.assertIn("Go to synthesis", response.body)
+        self.assertNotIn("No synthesis brief is stored in this session", response.body)
+        self.assertNotIn("Placeholder for Symphony ticket drafting.", response.body)
 
     def test_ticket_valid_edit_advances_to_export_route(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

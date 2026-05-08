@@ -79,6 +79,13 @@ class WizardRoute:
     placeholder: str
 
 
+@dataclass(frozen=True)
+class EmptyStateGuidance:
+    title: str
+    action_label: str
+    action_href: str
+
+
 WIZARD_ROUTES: tuple[WizardRoute, ...] = (
     WizardRoute(
         path="/intake",
@@ -129,6 +136,26 @@ AUTHENTICATED_WIZARD_PATHS = {
 }
 
 
+def _prerequisite_guidance(path: str) -> EmptyStateGuidance:
+    route_paths = [route.path for route in WIZARD_ROUTES]
+    index = route_paths.index(path)
+    previous = WIZARD_ROUTES[index - 1]
+    title_label = previous.title.lower()
+    action_label = title_label
+    href = previous.path
+    if previous.path == "/research":
+        title_label = "research approval"
+        action_label = title_label
+        href = RESEARCH_APPROVAL_ROUTE
+    elif previous.path == SYNTHESIS_ROUTE:
+        title_label = "synthesis review"
+    return EmptyStateGuidance(
+        title=f"Complete {title_label} first",
+        action_label=f"Go to {action_label}",
+        action_href=href,
+    )
+
+
 @dataclass(frozen=True)
 class IntakeSubmissionResult:
     record: IntakeRecord
@@ -147,6 +174,7 @@ class TicketReviewResult:
     session: dict[str, str]
     markdown: str = ""
     error: str | None = None
+    empty_state: EmptyStateGuidance | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +183,7 @@ class SynthesisReviewResult:
     brief: Mapping[str, object] | None = None
     error: str | None = None
     cached: bool = False
+    empty_state: EmptyStateGuidance | None = None
 
 
 @dataclass(frozen=True)
@@ -536,7 +565,13 @@ class OvertureUiApp:
         )
         return self._render(
             start_response,
-            render_synthesis_review_page(result.session, brief=result.brief, error=result.error, cached=result.cached),
+            render_synthesis_review_page(
+                result.session,
+                brief=result.brief,
+                error=result.error,
+                cached=result.cached,
+                empty_state=result.empty_state,
+            ),
             extra_headers=[("Set-Cookie", _session_cookie(result.session))],
         )
 
@@ -557,7 +592,13 @@ class OvertureUiApp:
             )
             return self._render(
                 start_response,
-                render_synthesis_review_page(result.session, brief=result.brief, error=result.error, cached=result.cached),
+                render_synthesis_review_page(
+                    result.session,
+                    brief=result.brief,
+                    error=result.error,
+                    cached=result.cached,
+                    empty_state=result.empty_state,
+                ),
                 status="400 Bad Request",
                 extra_headers=[("Set-Cookie", _session_cookie(result.session))],
             )
@@ -606,7 +647,12 @@ class OvertureUiApp:
             )
         return self._render(
             start_response,
-            render_ticket_review_page(result.session, markdown=result.markdown, error=result.error),
+            render_ticket_review_page(
+                result.session,
+                markdown=result.markdown,
+                error=result.error,
+                empty_state=result.empty_state,
+            ),
             extra_headers=[("Set-Cookie", _session_cookie(result.session))],
         )
 
@@ -1052,7 +1098,7 @@ def prepare_synthesis_review(
     if not intake_id:
         return SynthesisReviewResult(
             session=dict(session),
-            error="No intake is stored in this session. Return to intake before reviewing synthesis.",
+            empty_state=_prerequisite_guidance(SYNTHESIS_ROUTE),
         )
 
     cache_path = _synthesis_cache_path(store_dir, intake_id)
@@ -1065,13 +1111,13 @@ def prepare_synthesis_review(
     try:
         intake = load_intake_record(Path(store_dir) / "intake" / f"{intake_id}.json")
     except FileNotFoundError:
-        return SynthesisReviewResult(dict(session), error=f"Intake record not found for {intake_id}.")
+        return SynthesisReviewResult(dict(session), empty_state=_prerequisite_guidance(SYNTHESIS_ROUTE))
 
     research = _research_result_from_session(session)
     if research is None:
         research_path = Path(store_dir) / "research" / f"{intake_id}.json"
         if not research_path.exists():
-            return SynthesisReviewResult(dict(session), error=f"Research result not found for {intake_id}.")
+            return SynthesisReviewResult(dict(session), empty_state=_prerequisite_guidance(SYNTHESIS_ROUTE))
         research = _research_result_from_json(_read_json(research_path))
     if not research.items:
         return SynthesisReviewResult(dict(session), error="No approved research result is available for synthesis.")
@@ -1103,7 +1149,7 @@ def advance_synthesis_review(
     user: AuthenticatedUser | None = None,
 ) -> SynthesisReviewResult:
     result = prepare_synthesis_review(session, store_dir, user=user)
-    if result.error:
+    if result.error or result.empty_state:
         return result
     next_session = dict(result.session)
     next_session["synthesis_id"] = next_session.get("intake_id", "")
@@ -1123,7 +1169,7 @@ def prepare_ticket_review(session: dict[str, str], *, user: AuthenticatedUser | 
     if not brief_json:
         return TicketReviewResult(
             session=next_session,
-            error="No synthesis brief is stored in this session. Return to synthesis before reviewing a ticket.",
+            empty_state=_prerequisite_guidance(TICKET_REVIEW_ROUTE),
         )
     try:
         brief = json.loads(brief_json)
@@ -1630,10 +1676,13 @@ def render_synthesis_review_page(
     brief: Mapping[str, object] | None = None,
     error: str | None = None,
     cached: bool = False,
+    empty_state: EmptyStateGuidance | None = None,
 ) -> str:
     intake_id = session.get("intake_id", "")
     error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
-    if brief is None:
+    if empty_state is not None:
+        content = _empty_state_content("Synthesis", empty_state, active_id=intake_id)
+    elif brief is None:
         content = f"""
         <section class="workspace">
           <h2>Synthesis</h2>
@@ -1672,7 +1721,19 @@ def render_synthesis_review_page(
     return render_layout(title="Synthesis", active_path=SYNTHESIS_ROUTE, content=content)
 
 
-def render_ticket_review_page(session: dict[str, str], *, markdown: str = "", error: str | None = None) -> str:
+def render_ticket_review_page(
+    session: dict[str, str],
+    *,
+    markdown: str = "",
+    error: str | None = None,
+    empty_state: EmptyStateGuidance | None = None,
+) -> str:
+    if empty_state is not None:
+        return render_layout(
+            title="Ticket",
+            active_path=TICKET_REVIEW_ROUTE,
+            content=_empty_state_content("Ticket", empty_state),
+        )
     escaped_markdown = html.escape(markdown)
     error_markup = f'<p class="validation" role="alert">{html.escape(error)}</p>' if error else ""
     session_note = (
@@ -1700,6 +1761,20 @@ def render_ticket_review_page(session: dict[str, str], *, markdown: str = "", er
         </section>
         """,
     )
+
+
+def _empty_state_content(title: str, guidance: EmptyStateGuidance, *, active_id: str = "") -> str:
+    active_markup = f'<p>Current intake: <code>{html.escape(active_id)}</code></p>' if active_id else ""
+    return f"""
+        <section class="workspace">
+          <h2>{html.escape(title)}</h2>
+          <p class="empty-state">{html.escape(guidance.title)}</p>
+          {active_markup}
+          <div class="form-footer">
+            <a class="button" href="{html.escape(guidance.action_href)}">{html.escape(guidance.action_label)}</a>
+          </div>
+        </section>
+        """
 
 
 def render_export_page(review: ExportReviewResult) -> str:
@@ -2071,7 +2146,7 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
     th, td {{ border-top: 1px solid var(--line); padding: 8px; text-align: left; vertical-align: top; }}
     td code {{ display: block; max-width: 260px; overflow-wrap: anywhere; white-space: normal; }}
     button, a {{ color: var(--accent); font-weight: 650; }}
-    button {{ border: 0; border-radius: 6px; background: var(--accent); color: white; padding: 10px 14px; cursor: pointer; font: inherit; }}
+    button, a.button {{ border: 0; border-radius: 6px; background: var(--accent); color: white; padding: 10px 14px; cursor: pointer; font: inherit; text-decoration: none; }}
     button.secondary {{ background: #edf2f7; color: var(--ink); }}
     .primary-action {{ display: inline-block; border-radius: 6px; background: var(--accent); color: white; padding: 10px 14px; text-decoration: none; }}
     .validation {{ color: var(--danger); margin: 12px 0 0; font-weight: 650; }}
@@ -2086,7 +2161,7 @@ def render_layout(*, title: str, active_path: str | None, content: str, shell_cl
       .form-footer {{ align-items: stretch; flex-direction: column; }}
       .source-option {{ grid-template-columns: minmax(0, 1fr); }}
       .peer-fields {{ grid-template-columns: minmax(0, 1fr); }}
-      button, .primary-action {{ width: 100%; text-align: center; }}
+      button, a.button, .primary-action {{ width: 100%; text-align: center; }}
     }}
   </style>
 </head>
