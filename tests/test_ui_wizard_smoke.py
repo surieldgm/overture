@@ -319,8 +319,8 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
             self.assertIn("Cached brief", revisit_page.body)
             self.assertEqual(calls, 1)
 
-    def test_concurrent_authenticated_users_complete_wizard_against_shared_backend(self) -> None:
-        """Smoke the full two-user wizard path against the shared backend.
+    def test_three_concurrent_authenticated_users_complete_wizard_with_scoped_observation_logs(self) -> None:
+        """Smoke the full three-user wizard path against the shared backend.
 
         This boots the shared graph backend in-process and injects it into the
         socket-backed UI server. The same scenario can be run as an
@@ -372,17 +372,22 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
                     url="https://example.test/avery-research",
                     summary="Avery needs isolated research evidence for a concurrent wizard run.",
                 )
-            if "Blake" in prompt:
-                return _stub_llm_payload(
-                    title="Blake synthesis workflow",
-                    url="https://example.test/blake-synthesis",
-                    summary="Blake needs isolated synthesis evidence for a concurrent wizard run.",
-                )
+            for name, workflow in (
+                ("Blake", "synthesis"),
+                ("Casey", "observation"),
+            ):
+                if name in prompt:
+                    return _stub_llm_payload(
+                        title=f"{name} {workflow} workflow",
+                        url=f"https://example.test/{name.lower()}-{workflow}",
+                        summary=f"{name} needs isolated {workflow} evidence for a concurrent wizard run.",
+                    )
             raise AssertionError(f"unexpected prompt: {prompt}")
 
         users = (
             {"email": "avery@example.test", "name": "Avery", "source": "https://example.test/avery-research"},
             {"email": "blake@example.test", "name": "Blake", "source": "https://example.test/blake-synthesis"},
+            {"email": "casey@example.test", "name": "Casey", "source": "https://example.test/casey-observation"},
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -399,12 +404,13 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
                     auth_manager=auth,
                     graph_backend=graph_backend,
                 ) as base_url:
-                    with ThreadPoolExecutor(max_workers=2) as executor:
+                    with ThreadPoolExecutor(max_workers=3) as executor:
                         results = tuple(executor.map(lambda user: _complete_authenticated_wizard(base_url, auth, user), users))
 
             by_email = {result["author_email"]: result for result in results}
             self.assertEqual(set(by_email), {user["email"] for user in users})
-            self.assertEqual(len({result["intake_id"] for result in results}), 2)
+            self.assertEqual(len({result["intake_id"] for result in results}), 3)
+            observation_log = ObservationLog(store_dir / "observation.sqlite")
 
             for user in users:
                 result = by_email[user["email"]]
@@ -424,14 +430,33 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
                 self.assertIn(f"<!-- author_id: {author_id} -->", ticket)
                 self.assertIn(f"<!-- author_email: {user['email']} -->", ticket)
                 self.assertIn(user["name"], intake.raw_text)
-                self.assertNotIn("Blake" if user["name"] == "Avery" else "Avery", intake.raw_text)
+                for other in users:
+                    if other is not user:
+                        self.assertNotIn(other["name"], intake.raw_text)
+
+                events = observation_log.iter_session_events(
+                    intake_id,
+                    user=AuthenticatedUser(user_id=author_id, email=user["email"]),
+                )
+                self.assertGreaterEqual(len(events), 8)
+                self.assertTrue(all(event.session_id == intake_id for event in events))
+                self.assertTrue(all(event.actor_id == author_id for event in events))
+                self.assertTrue(all(event.actor_email == user["email"] for event in events))
+                self.assertTrue(all(event.author_id == author_id for event in events))
+                self.assertTrue(all(event.author_email == user["email"] for event in events))
+                event_routes = {event.route for event in events}
+                self.assertIn("/intake", event_routes)
+                self.assertIn(RESEARCH_APPROVAL_ROUTE, event_routes)
+                self.assertIn(SYNTHESIS_ROUTE, event_routes)
+                self.assertIn(TICKET_REVIEW_ROUTE, event_routes)
+                self.assertIn("/export", event_routes)
 
             nodes = graph_backend.list_nodes()
             edges = graph_backend.list_edges()
             counts = graph_backend.table_counts()
             self.assertEqual(counts, {"nodes": len(nodes), "edges": len(edges)})
-            self.assertEqual(counts["nodes"], 14)
-            self.assertEqual(counts["edges"], 14)
+            self.assertEqual(counts["nodes"], 21)
+            self.assertEqual(counts["edges"], 21)
             authors_by_email = {user["email"]: by_email[user["email"]]["author_id"] for user in users}
             for user in users:
                 author_nodes = [node for node in nodes if node.get("author_email") == user["email"]]
@@ -441,7 +466,7 @@ class WizardPhaseOneSmokeTests(unittest.TestCase):
                 self.assertTrue(all(node.get("author_id") == authors_by_email[user["email"]] for node in author_nodes))
                 self.assertTrue(all(edge.get("author_id") == authors_by_email[user["email"]] for edge in author_edges))
 
-        self.assertEqual(len(linear_calls), 2)
+        self.assertEqual(len(linear_calls), 3)
         self.assertEqual({call["team_id"] for call in linear_calls}, {"stubbed-ui-team"})
 
     def test_synthesis_persists_graph_records_with_authenticated_author(self) -> None:
