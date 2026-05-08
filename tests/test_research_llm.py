@@ -142,8 +142,10 @@ class LLMSuggestedSourceAdapterTests(unittest.TestCase):
     def test_codex_cli_client_uses_configured_executable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             executable = Path(tmpdir) / "fake-codex"
+            argv_log = Path(tmpdir) / "argv.log"
             executable.write_text(
                 "#!/bin/sh\n"
+                f'printf "%s\\n" "$@" > "{argv_log}"\n'
                 "cat >/dev/null\n"
                 "printf '[{\"title\":\"Configured Codex\"}]\\n'\n",
                 encoding="utf-8",
@@ -152,6 +154,10 @@ class LLMSuggestedSourceAdapterTests(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {CODEX_EXECUTABLE_ENV: str(executable)}):
                 self.assertEqual(codex_cli_client("Suggest sources"), '[{"title":"Configured Codex"}]\n')
+
+            argv = argv_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(argv, ["exec"])
+            self.assertNotIn("--non-interactive", argv)
 
     def test_codex_cli_available_false_when_missing_from_path(self) -> None:
         with mock.patch.dict(os.environ, {"PATH": "", CODEX_EXECUTABLE_ENV: ""}):
