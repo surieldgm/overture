@@ -29,9 +29,10 @@ from .peer_onboarding import (
     PEER_ONBOARDING_ROUTE,
     PeerOnboardingArtifact,
     initialize_peer_onboarding_template,
-    load_designer_one_peer_onboarding_artifact,
+    load_latest_peer_onboarding_artifact,
+    load_peer_onboarding_artifacts,
     ordered_peer_onboarding_sections,
-    validate_designer_one_peer_onboarding_artifact,
+    validate_peer_onboarding_artifact,
 )
 from .research import CuratedSource, ResearchClaim, ResearchError, ResearchItem, ResearchResult, SourceReference, _normalize_source
 from .research_llm import (
@@ -341,12 +342,13 @@ class OvertureUiApp:
             return self._handle_export_post(environ, start_response)
         if path == PEER_ONBOARDING_ROUTE and method == "GET":
             store = SqliteGraphStore(Path(self.store_dir) / "graph.sqlite")
-            artifact = load_designer_one_peer_onboarding_artifact(store)
-            errors = validate_designer_one_peer_onboarding_artifact(artifact)
+            artifacts = load_peer_onboarding_artifacts(store)
+            artifact = load_latest_peer_onboarding_artifact(store)
+            errors = validate_peer_onboarding_artifact(artifact)
             status = "500 Internal Server Error" if errors else "200 OK"
             return self._render(
                 start_response,
-                render_peer_onboarding_artifact_page(artifact, errors=errors),
+                render_peer_onboarding_artifact_page(artifact, artifacts=artifacts, errors=errors),
                 status=status,
             )
         if path == "/examples/intake_examples" and method == "GET":
@@ -1559,9 +1561,26 @@ def render_examples_library() -> str:
     )
 
 
-def render_peer_onboarding_artifact_page(artifact: PeerOnboardingArtifact, *, errors: Iterable[str] = ()) -> str:
+def render_peer_onboarding_artifact_page(
+    artifact: PeerOnboardingArtifact,
+    *,
+    artifacts: Iterable[PeerOnboardingArtifact] = (),
+    errors: Iterable[str] = (),
+) -> str:
     error_items = "".join(f"<li>{html.escape(error)}</li>" for error in errors)
     error_markup = f'<div class="validation" role="alert"><ul>{error_items}</ul></div>' if error_items else ""
+    artifact_list = tuple(sorted(artifacts or (artifact,), key=lambda item: item.generation, reverse=True))
+    generation_items = "".join(
+        f"<li><strong>Generation {item.generation}</strong>: {html.escape(item.title)} "
+        f"<span>for <code>{html.escape(item.audience_id)}</code></span></li>"
+        for item in artifact_list
+    )
+    generation_markup = f"""
+          <section class="brief-section">
+            <h3>Available generations</h3>
+            <ol class="source-list">{generation_items}</ol>
+          </section>
+    """
     section_markup = "\n".join(_peer_onboarding_section_markup(section) for section in artifact.sections)
     example_markup = '<ol class="source-list">' + "".join(
         _peer_example_markup(example) for example in artifact.intake_examples
@@ -1574,9 +1593,11 @@ def render_peer_onboarding_artifact_page(artifact: PeerOnboardingArtifact, *, er
         <section class="workspace peer-onboarding">
           <h2>{html.escape(artifact.title)}</h2>
           <p>{html.escape(ROUTES_BY_PATH[PEER_ONBOARDING_ROUTE].placeholder)}</p>
+          <p>Showing generation {artifact.generation} for <code>{html.escape(artifact.audience_id)}</code>.</p>
           <p>Author: <code>{html.escape(artifact.author_id)}</code> &lt;{html.escape(artifact.author_email)}&gt;</p>
           <p>Template: <code>{html.escape(artifact.template_id)}</code></p>
           {error_markup}
+          {generation_markup}
           <article aria-label="Peer onboarding template">
             {section_markup}
           </article>
