@@ -219,6 +219,7 @@ class OvertureUiApp:
         self.linear_client_factory = linear_client_factory or _linear_client_from_env
         self.graph_backend = graph_backend
         self.auth_manager = auth_manager or MagicLinkAuth(sender=sender_from_env(self.store_dir))
+        self.observation_log = ObservationLog(self.store_dir)
         self._active_auth_session: DesignerSession | None = None
 
     def __call__(self, environ: dict[str, object], start_response: StartResponse) -> Iterable[bytes]:
