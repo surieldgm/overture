@@ -370,6 +370,35 @@ class IntakePageTests(unittest.TestCase):
         self.assertIn('name="action" value="advance" disabled', refreshed.body)
         self.assertIn("Use the required section order for this draft", refreshed.body)
 
+    def test_ticket_valid_edit_round_trips_to_export_with_prefilled_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = OvertureUiApp(store_dir=tmpdir)
+            page = _request(
+                app,
+                "GET",
+                "/ticket",
+                cookie=_session_cookie({SESSION_SYNTHESIS_BRIEF_KEY: json.dumps(_synthesis_brief())}),
+            )
+            draft = _session_from_set_cookie(page.headers["Set-Cookie"])[SESSION_TICKET_MARKDOWN_KEY]
+            edited = draft.replace(
+                "Designers need to review generated ticket Markdown before export.",
+                "Designers need to validate a manual edit before export.",
+            )
+
+            posted = _request(
+                app,
+                "POST",
+                "/ticket",
+                {"ticket_markdown": edited},
+                cookie=page.headers["Set-Cookie"],
+            )
+            export_page = _request(app, "GET", "/export", cookie=posted.headers["Set-Cookie"])
+
+        self.assertEqual(posted.status, "303 See Other")
+        self.assertEqual(posted.headers["Location"], "/export")
+        self.assertEqual(export_page.status, "200 OK")
+        self.assertIn("validate a manual edit before export", export_page.body)
+
     def test_ticket_edits_persist_across_refreshes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             app = OvertureUiApp(store_dir=tmpdir)
