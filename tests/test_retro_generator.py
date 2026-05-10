@@ -270,6 +270,120 @@ class RetroGeneratorTests(unittest.TestCase):
         self.assertIn("_No metrics were recorded for this designer._", text)
         self.assertIn("confirmed friction without matching metrics", text)
 
+    def test_mw_retro_from_persona_report_all_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "persona-report.md"
+            report_path.write_text(
+                _persona_report_content(
+                    headline="- **3 of 3 personas completed idea→ticket via wizard without manual session repair.**",
+                    baseline_rows=_persona_baseline_rows(
+                        [
+                            ("#1", "High", "Codex workflow stabilized", "Closed", "verified"),
+                            ("#2", "Medium", "Session context persists", "Closed", "verified"),
+                        ]
+                    ),
+                    new_findings_rows=_persona_new_rows([]),
+                    residuals=[],
+                ),
+                encoding="utf-8",
+            )
+            output_path = Path(tmpdir) / "retro.md"
+
+            generate_retro_document(
+                db_path=Path(tmpdir) / "metrics.sqlite",
+                output_path=output_path,
+                persona_report_path=report_path,
+                milestone="M-WIZ",
+                started_at="2026-05-01T00:00:00.000000Z",
+                completed_at="2026-05-02T00:00:00.000000Z",
+            )
+            text = output_path.read_text(encoding="utf-8")
+
+        self.assertIn("- 3 of 3 personas completed idea→ticket via wizard without manual session repair.", text)
+        self.assertIn("## Closed baseline findings", text)
+        self.assertIn("- #1 (High): Codex workflow stabilized", text)
+        self.assertIn("_No residual findings were carried forward._", text)
+        self.assertIn("#1, #2", text)
+
+    def test_mw_retro_from_persona_report_mixed_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "persona-report.md"
+            report_path.write_text(
+                _persona_report_content(
+                    headline="- **1 of 3 personas completed idea→ticket via wizard without manual session repair.**",
+                    baseline_rows=_persona_baseline_rows(
+                        [
+                            ("#3", "High", "Cookie replay workaround removed", "Closed", "verified"),
+                            ("#4", "Medium", "Synthesis refresh path unstable", "Residual", "evidence"),
+                            ("#5", "Low", "Copy still appears technical", "Residual (Carryover)", "evidence"),
+                        ]
+                    ),
+                    new_findings_rows=_persona_new_rows(
+                        [
+                            ("A", "P1", "/research/approval loses intake state"),
+                        ]
+                    ),
+                    residuals=[
+                        "- #4 baseline residual carried forward.",
+                        "- #5 copy remains technical.",
+                    ],
+                ),
+                encoding="utf-8",
+            )
+            output_path = Path(tmpdir) / "retro.md"
+
+            generate_retro_document(
+                db_path=Path(tmpdir) / "metrics.sqlite",
+                output_path=output_path,
+                persona_report_path=report_path,
+                milestone="M-WIZ",
+                started_at="2026-05-01T00:00:00.000000Z",
+                completed_at="2026-05-02T00:00:00.000000Z",
+            )
+            text = output_path.read_text(encoding="utf-8")
+
+        self.assertIn("### Medium", text)
+        self.assertIn("- #4: Synthesis refresh path unstable", text)
+        self.assertIn("- #5: Copy still appears technical", text)
+        self.assertIn("- A (P1): /research/approval loses intake state", text)
+        self.assertIn('Carla: "I reached research approval but still had to restart."', text)
+
+    def test_mw_retro_from_persona_report_all_new(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "persona-report.md"
+            report_path.write_text(
+                _persona_report_content(
+                    headline="- **0 of 3 personas completed idea→ticket via wizard without manual session repair.**",
+                    baseline_rows=_persona_baseline_rows([]),
+                    new_findings_rows=_persona_new_rows(
+                        [
+                            ("A", "P0", "/research/approval drops intake_id"),
+                            ("B", "P1", "/ticket route requires cookie replay"),
+                        ]
+                    ),
+                    residuals=[],
+                    include_quotes=False,
+                ),
+                encoding="utf-8",
+            )
+            output_path = Path(tmpdir) / "retro.md"
+
+            generate_retro_document(
+                db_path=Path(tmpdir) / "metrics.sqlite",
+                output_path=output_path,
+                persona_report_path=report_path,
+                milestone="M-WIZ",
+                started_at="2026-05-01T00:00:00.000000Z",
+                completed_at="2026-05-02T00:00:00.000000Z",
+            )
+            text = output_path.read_text(encoding="utf-8")
+
+        self.assertIn("## New findings discovered during M-WIZ", text)
+        self.assertIn("- A (P0): /research/approval drops intake_id", text)
+        self.assertIn("- B (P1): /ticket route requires cookie replay", text)
+        self.assertIn("No baseline findings were confirmed as closed", text)
+        self.assertIn("The report did not include explicit quoted monologues", text)
+
 
 def _metric(
     *,
@@ -353,6 +467,64 @@ def _seed_designer_activity(
         actor=actor,
         request={"designer": author_id},
         response={"status": 200},
+    )
+
+
+def _persona_baseline_rows(rows: list[tuple[str, str, str, str, str]]) -> str:
+    rendered = [
+        "| Baseline finding | Severity | Baseline description | Post-MWIZ status | Evidence / notes |",
+        "|---|---|---|---|---|",
+    ]
+    for finding_number, severity, description, status, evidence in rows:
+        rendered.append(
+            f"| {finding_number} | {severity} | {description} | {status} | {evidence} |"
+        )
+    return "\n".join(rendered)
+
+
+def _persona_new_rows(rows: list[tuple[str, str, str]]) -> str:
+    rendered = [
+        "| New finding | Severity | Description |",
+        "|---|---|---|",
+    ]
+    for number, severity, description in rows:
+        rendered.append(f"| {number} | {severity} | {description} |")
+    return "\n".join(rendered)
+
+
+def _persona_report_content(
+    *,
+    headline: str,
+    baseline_rows: str,
+    new_findings_rows: str,
+    residuals: list[str],
+    include_quotes: bool = True,
+) -> str:
+    residual_text = "\n".join(residuals) if residuals else "_No residual findings were reported as open._"
+    quote_block = (
+        "- Persona: Carla\n"
+        'Outcome: "I reached research approval but still had to restart."\n'
+        "- Persona: Tomas\n"
+        'Outcome: "Synthesis briefly worked, then rerouted unexpectedly."\n'
+    )
+    return "\n".join(
+        [
+            "# Persona re-test report",
+            "",
+            "## Headline metric",
+            headline,
+            "",
+            "## Baseline comparison table",
+            baseline_rows,
+            "### New findings introduced post-MWIZ",
+            new_findings_rows,
+            "## Persona section: Carla (source `/tmp/carla.md`)",
+            quote_block
+            if include_quotes
+            else "Persona: Carla\nOutcome: The report did not include explicit quoted monologues.",
+            "## Residuals",
+            residual_text,
+        ]
     )
 
 
