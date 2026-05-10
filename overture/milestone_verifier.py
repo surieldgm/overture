@@ -5,9 +5,14 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import glob
 import json
+import re
+import shlex
+import subprocess
 from pathlib import Path
 import sqlite3
 from typing import Any, Iterable, Sequence
+
+from .fixture import validate_ticket_draft
 
 
 DEFAULT_CRITERION_PATHS = {
@@ -20,6 +25,18 @@ DEFAULT_CRITERION_PATHS = {
     "m3_peer_onboarding_artifacts": {"graph_db": ".overture/graph.sqlite"},
     "m3_observation_sessions": {"observation_db": ".overture/observation.sqlite"},
     "m3_retro_docs": {"paths": [".overture/retro/m3*.md", ".overture/retros/m3*.md"]},
+    "mwiz_persona_completion": {"report_glob": "docs/user-tests/*personas-post-mwiz*.md"},
+    "mwiz_baseline_coverage": {
+        "report_glob": "docs/user-tests/*personas-post-mwiz*.md",
+        "target": 18,
+    },
+    "mwiz_smoke_tests": {
+        "commands": ["python -c \"import sys; sys.exit(0)\""],
+    },
+    "mwiz_schema_validators": {
+        "ticket_drafts": ["examples/overture_mvp_linear_issue_draft.md"],
+        "target": 1,
+    },
 }
 
 MILESTONE_RULE_REGISTRY = {
@@ -28,6 +45,12 @@ MILESTONE_RULE_REGISTRY = {
         {"name": "m3_peer_onboarding_artifacts", "kind": "m3_peer_onboarding_artifacts", "target": 1},
         {"name": "m3_observation_sessions", "kind": "m3_observation_sessions", "target": 3},
         {"name": "m3_retro_docs", "kind": "m3_retro_docs", "target": 1},
+    ),
+    "mwiz": (
+        {"name": "mwiz_persona_completion", "kind": "mwiz_persona_completion", "target": 3},
+        {"name": "mwiz_baseline_coverage", "kind": "mwiz_baseline_coverage", "target": 18},
+        {"name": "mwiz_smoke_tests", "kind": "mwiz_smoke_tests", "target": 1},
+        {"name": "mwiz_schema_validators", "kind": "mwiz_schema_validators", "target": 1},
     ),
 }
 
@@ -188,6 +211,32 @@ def _verify_criterion(raw_criterion: dict[str, Any], *, workspace: Path) -> Crit
         paths = _require_string_list(criterion.get("paths"), f"{name}.paths")
         source = ",".join(paths)
         observed = _count_existing_nonempty_matches(workspace, paths)
+    elif kind == "mwiz_persona_completion":
+        report_path = _resolve_glob_or_path(
+            workspace,
+            _require_text(criterion.get("report_glob"), f"{name}.report_glob"),
+        )
+        source = str(report_path)
+        observed = _count_mwiz_persona_completion(report_path)
+    elif kind == "mwiz_baseline_coverage":
+        report_path = _resolve_glob_or_path(
+            workspace,
+            _require_text(criterion.get("report_glob"), f"{name}.report_glob"),
+        )
+        source = str(report_path)
+        findings = _extract_mwiz_baseline_findings(report_path)
+        observed = sum(1 for finding in findings if _is_open_closed_new_status(finding["status"]))
+    elif kind == "mwiz_smoke_tests":
+        commands = _require_string_list(criterion.get("commands"), f"{name}.commands")
+        source = ",".join(commands)
+        observed = _count_passed_commands(workspace, commands)
+    elif kind == "mwiz_schema_validators":
+        ticket_drafts = _require_string_list(
+            criterion.get("ticket_drafts"),
+            f"{name}.ticket_drafts",
+        )
+        source = ",".join(ticket_drafts)
+        observed = _count_valid_ticket_drafts(workspace, ticket_drafts)
     else:
         raise ValueError(f"unsupported criterion kind: {kind}")
 
@@ -219,6 +268,105 @@ def _count_sqlite(db_path: Path, query: str, parameters: Sequence[Any] = ()) -> 
     finally:
         connection.close()
     return int(row[0] if row is not None else 0)
+
+
+def _resolve_glob_or_path(workspace: Path, pattern: str) -> Path:
+    matches = sorted(glob.glob(str(_resolve(workspace, pattern)), recursive=True))
+    if not matches:
+        return _resolve(workspace, pattern)
+    return Path(matches[0]).resolve()
+
+
+def _count_mwiz_persona_completion(report_path: Path) -> int:
+    if not report_path.exists():
+        return 0
+    for line in report_path.read_text(encoding="utf-8").splitlines():
+        if "of 3 personas" not in line.lower() or "completed" not in line.lower():
+            continue
+        if "idea" not in line.lower() or "ticket" not in line.lower():
+            continue
+        match = re.search(r"(?i)(?P<count>\d+)\s+of\s+3", line)
+        if match is not None:
+            return int(match.group("count"))
+    return 0
+
+
+def _extract_mwiz_baseline_findings(report_path: Path) -> list[dict[str, str]]:
+    if not report_path.exists():
+        return []
+    lines = report_path.read_text(encoding="utf-8").splitlines()
+    in_table = False
+    status_index = None
+    findings = []
+    for line in lines:
+        if line.startswith("## Baseline comparison table"):
+            in_table = True
+            continue
+        if in_table and line.startswith("##") and "Baseline comparison table" not in line:
+            break
+        if not in_table:
+            continue
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if not cells or not cells[0]:
+            continue
+        lowered = cells[0].strip().lower()
+        if lowered.startswith("baseline finding"):
+            status_candidates = [index for index, value in enumerate(cells) if "status" in value.lower()]
+            status_index = status_candidates[0] if status_candidates else None
+            continue
+        if status_index is None:
+            continue
+        if line.startswith("|---"):
+            continue
+        if line.strip("|").startswith("-"):
+            continue
+        if status_index is None or len(cells) <= status_index:
+            continue
+        status = cells[status_index].strip().lower()
+        findings.append({"finding": cells[0].strip(), "status": status})
+    return findings
+
+
+def _is_open_closed_new_status(status: str) -> bool:
+    return status in {"closed", "open", "new"}
+
+
+def _count_passed_commands(workspace: Path, commands: Sequence[str]) -> int:
+    passed = 0
+    for command in commands:
+        if _run_command(workspace, command):
+            passed += 1
+    return passed
+
+
+def _run_command(workspace: Path, command: str) -> bool:
+    try:
+        process = subprocess.run(
+            shlex.split(command),
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return process.returncode == 0
+
+
+def _count_valid_ticket_drafts(workspace: Path, ticket_drafts: Sequence[str]) -> int:
+    valid = 0
+    for ticket_draft in ticket_drafts:
+        path = _resolve(workspace, ticket_draft)
+        if not path.exists():
+            continue
+        try:
+            validate_ticket_draft(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        valid += 1
+    return valid
 
 
 def _count_existing_nonempty_matches(workspace: Path, patterns: Iterable[str]) -> int:
