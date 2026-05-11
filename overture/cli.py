@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .backlog_seeder import seed_confirmed_friction_intakes, seed_m4_designer_experience_intakes
+from .backlog_seeder import seed_mwiz_residual_intakes
 from .export_runner import run_ticket_export
 from .fixture import PIPELINE_STAGES, PipelineStageError, run_overture_fixture
 from .friction_log import ACCEPTED_FRICTION_CATEGORIES, FrictionLog
@@ -470,6 +471,12 @@ def build_parser() -> argparse.ArgumentParser:
         help='Only seed entries for this run. Use "latest" for the most recent metrics run.',
     )
     backlog_seed.add_argument(
+        "--persona-report-path",
+        type=Path,
+        default=None,
+        help="Seed residual findings from an M-WIZ persona report path.",
+    )
+    backlog_seed.add_argument(
         "--format",
         choices=("table", "json"),
         default="table",
@@ -833,6 +840,35 @@ def _milestone(args: argparse.Namespace) -> int:
 
 
 def _backlog_seed(args: argparse.Namespace) -> int:
+    if args.persona_report_path is not None:
+        seeded = seed_mwiz_residual_intakes(
+            persona_report_path=args.persona_report_path,
+            intake_store_dir=args.store_dir,
+        )
+        if args.format == "json":
+            print(
+                json.dumps(
+                    [
+                        {
+                            "finding_number": item.finding.number,
+                            "intake_id": item.intake.id,
+                            "path": str(item.path),
+                        }
+                        for item in seeded
+                    ],
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        if not seeded:
+            print("no open M-WIZ residual findings")
+            return 0
+
+        for item in seeded:
+            print(f"{item.finding.number}: {item.intake.id} {item.path}")
+        return 0
+
     log = FrictionLog(args.db_path)
     run_id = None
     if args.run_id is not None:
