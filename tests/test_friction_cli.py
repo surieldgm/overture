@@ -209,6 +209,51 @@ class FrictionCliTests(unittest.TestCase):
         self.assertEqual(intake_payload["source_type"], "m4-friction")
         self.assertIn("Sprint hint: M4-S2 performance", intake_payload["raw_text"])
 
+    def test_seed_mwiz_backlog_intakes_from_persona_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            report = base_dir / "personas-post-mwiz.md"
+            intake_dir = base_dir / "intake"
+            report.write_text(
+                _mwiz_report(
+                    headline="- Residual coverage sample",
+                    baseline_rows=_mwiz_baseline_rows(
+                        [
+                            ("#1", "High", "Closed residual", "Closed", "verified"),
+                            ("#2", "Medium", "Cookie replay is flaky", "Residual", "/tmp/m-wiz-test-rocio.md"),
+                            ("#3", "Low", "Copy remains technical", "Residual", "notes"),
+                        ]
+                    ),
+                    residuals=[
+                        "- #3: copy remains technical.",
+                    ],
+                ),
+                encoding="utf-8",
+            )
+            seeded = _run_cli(
+                [
+                    "backlog-seed",
+                    "--store-dir",
+                    str(intake_dir),
+                    "--persona-report-path",
+                    str(report),
+                    "--format=json",
+                ]
+            )
+            payload = json.loads(seeded.stdout)
+
+            intake_payloads = [
+                json.loads(Path(item["path"]).read_text(encoding="utf-8"))
+                for item in payload
+            ]
+
+        self.assertEqual(seeded.exit_code, 0)
+        self.assertEqual(len(payload), 2)
+        self.assertEqual([item["finding_number"] for item in payload], ["#2", "#3"])
+        self.assertEqual([item["intake_id"] for item in payload], [entry["id"] for entry in intake_payloads])
+        self.assertEqual([entry["source_type"] for entry in intake_payloads], ["mwiz-residual"] * 2)
+        self.assertIn("M-WIZ residual finding [#2]", intake_payloads[0]["raw_text"])
+
 
 def _append(db_path: Path, session_id: str, run_id: str, category: str, note: str) -> None:
     result = _run_cli(
@@ -261,3 +306,36 @@ class _CliResult:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _mwiz_report(*, headline: str, baseline_rows: str, residuals: list[str]) -> str:
+    residual_text = "\n".join(residuals) if residuals else "_No residual findings were reported as open._"
+    return "\n".join(
+        [
+            "# Persona report",
+            "",
+            "## Headline metric",
+            headline,
+            "",
+            "## Baseline comparison table",
+            baseline_rows,
+            "### New findings introduced post-MWIZ",
+            _mwiz_new_findings(),
+            "## Residuals",
+            residual_text,
+        ]
+    )
+
+
+def _mwiz_baseline_rows(rows: list[tuple[str, str, str, str, str]]) -> str:
+    lines = [
+        "| Baseline finding | Severity | Baseline description | Post-MWIZ status | Evidence / notes |",
+        "|---|---|---|---|---|",
+    ]
+    for finding_number, severity, description, status, evidence in rows:
+        lines.append(f"| {finding_number} | {severity} | {description} | {status} | {evidence} |")
+    return "\n".join(lines)
+
+
+def _mwiz_new_findings() -> str:
+    return "\n".join(["| New finding | Severity | Description |", "|---|---|---|"])

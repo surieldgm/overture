@@ -38,6 +38,8 @@ class PersonaFinding:
     number: str
     severity: str
     description: str
+    evidence: str | None = None
+    persona: str | None = None
 
 
 @dataclass(frozen=True)
@@ -382,10 +384,13 @@ def _split_baseline_findings(
     closed: list[PersonaFinding] = []
     residual: list[PersonaFinding] = []
     for row in rows:
+        evidence = row[4] if len(row) > 4 else ""
         entry = PersonaFinding(
             number=_normalize_finding_number(row[0]),
             severity=row[1],
             description=row[2],
+            evidence=evidence,
+            persona=_infer_persona_origin(evidence),
         )
         status = row[3].strip().lower()
         if "closed" in status:
@@ -422,7 +427,7 @@ def _parse_residual_bullet_list(lines: list[str]) -> list[PersonaFinding]:
         payload = match.group(1).strip()
         number_match = re.match(r"(?P<number>#\S+)\s+(?P<rest>.+)", payload)
         if number_match:
-            finding_number = number_match.group("number")
+            finding_number = number_match.group("number").rstrip(":")
             rest = number_match.group("rest")
         else:
             finding_number = f"R{len(residuals) + 1}"
@@ -439,9 +444,22 @@ def _parse_residual_bullet_list(lines: list[str]) -> list[PersonaFinding]:
                 number=_normalize_finding_number(finding_number),
                 severity=severity,
                 description=description,
+                evidence=None,
+                persona=None,
             )
         )
     return residuals
+
+
+def _infer_persona_origin(value: str) -> str | None:
+    normalized = value.lower()
+    if "m-wiz-test-carla" in normalized or "carla" in normalized:
+        return "Carla"
+    if "m-wiz-test-tomas" in normalized or "tomas" in normalized or "tomás" in normalized:
+        return "Tomás"
+    if "m-wiz-test-rocio" in normalized or "rocio" in normalized:
+        return "Rocío"
+    return None
 
 
 def _normalize_finding_number(value: str) -> str:

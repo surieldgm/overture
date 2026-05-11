@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .friction_log import FrictionEntry, FrictionLog
+from .retro_generator import PersonaFinding, _parse_persona_report
 from .intake import IntakeRecord, create_intake_record, load_intake_record, stable_intake_id
 
 
@@ -23,6 +24,19 @@ class SeededIntake:
     friction_entry: FrictionEntry
     intake: IntakeRecord
     path: Path
+
+
+@dataclass(frozen=True)
+class SeededResidualIntake:
+    finding: PersonaFinding
+    intake: IntakeRecord
+    path: Path
+
+
+MWIZ_SEVERITY_HINT_BY_LEVEL = {
+    "critical": "Sprint hint: prioritize for immediate next milestone.",
+    "high": "Sprint hint: prioritize for next milestone.",
+}
 
 
 def seed_confirmed_friction_intakes(
@@ -65,6 +79,39 @@ def seed_m4_designer_experience_intakes(
     return seeded
 
 
+def seed_mwiz_residual_intakes(
+    *,
+    persona_report_path: Path | str,
+    intake_store_dir: Path | str = Path(".overture") / "intake",
+) -> list[SeededResidualIntake]:
+    parsed = _parse_persona_report(persona_report_path)
+    closed = {finding.number for finding in parsed.closed_baseline_findings}
+    persona_by_number: dict[str, str] = {
+        finding.number: finding.persona
+        for finding in parsed.residual_findings
+        if finding.persona
+    }
+
+    deduped: dict[str, PersonaFinding] = {}
+    for finding in parsed.residual_findings:
+        if finding.number in closed or finding.number in deduped:
+            continue
+        persona = finding.persona or persona_by_number.get(finding.number)
+        deduped[finding.number] = (
+            replace(finding, persona=persona) if persona != finding.persona else finding
+        )
+
+    seeded: list[SeededResidualIntake] = []
+    for finding in deduped.values():
+        intake, path = _create_or_load_intake(
+            _mwiz_residual_intake_text(finding),
+            intake_store_dir,
+            source_type="mwiz-residual",
+        )
+        seeded.append(SeededResidualIntake(finding=finding, intake=intake, path=path))
+    return seeded
+
+
 def _intake_text(entry: FrictionEntry) -> str:
     return (
         f"Confirmed operator friction [{entry.category}] "
@@ -80,6 +127,20 @@ def _m4_intake_text(entry: FrictionEntry) -> str:
         f"Source session: {entry.session_id}; run: {entry.run_id}; friction id: {entry.id}.\n"
         f"Designer-confirmed note: {entry.note}"
     )
+
+
+def _mwiz_residual_intake_text(finding: PersonaFinding) -> str:
+    normalized_severity = (finding.severity or "Unknown").strip()
+    hint = MWIZ_SEVERITY_HINT_BY_LEVEL.get(normalized_severity.lower())
+    persona = finding.persona or "Unknown persona"
+    text = (
+        f"M-WIZ residual finding [{finding.number}] from {persona}.\n"
+        f"Severity: {normalized_severity}.\n"
+        f"Problem statement: {finding.description}.\n"
+    )
+    if hint:
+        text += hint
+    return text
 
 
 def _create_or_load_intake(
