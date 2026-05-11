@@ -535,6 +535,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RETRO_OUTPUT_PATH,
         help="Markdown output path. Defaults to .overture/retros/milestone-retro.md.",
     )
+    retro.add_argument(
+        "--persona-report-path",
+        type=Path,
+        help="Generate the retro from an M-WIZ persona re-test report instead of local metrics and frictions.",
+    )
 
     return parser
 
@@ -877,6 +882,7 @@ def _retro(args: argparse.Namespace) -> int:
         path = generate_retro_document(
             db_path=args.db_path,
             output_path=args.output_path,
+            persona_report_path=args.persona_report_path,
             milestone=args.milestone,
             started_at=args.started_at,
             completed_at=args.completed_at,

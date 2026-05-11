@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,10 +33,33 @@ class DesignerRetroData:
     frictions: tuple[FrictionEntry, ...]
 
 
+@dataclass(frozen=True)
+class PersonaFinding:
+    number: str
+    severity: str
+    description: str
+
+
+@dataclass(frozen=True)
+class PersonaMonologue:
+    persona: str
+    text: str
+
+
+@dataclass(frozen=True)
+class ParsedPersonaReport:
+    headline_metric: str
+    closed_baseline_findings: tuple[PersonaFinding, ...]
+    residual_findings: tuple[PersonaFinding, ...]
+    new_findings: tuple[PersonaFinding, ...]
+    monologues: tuple[PersonaMonologue, ...]
+
+
 def generate_retro_document(
     *,
     db_path: Path | str = DEFAULT_METRICS_DB_PATH,
     output_path: Path | str = DEFAULT_RETRO_OUTPUT_PATH,
+    persona_report_path: Path | str | None = None,
     milestone: str,
     started_at: str,
     completed_at: str,
@@ -49,30 +73,32 @@ def generate_retro_document(
     )
     _validate_window(window)
 
-    metrics_store = MetricsStore(db_path)
-    friction_log = FrictionLog(db_path)
-    metrics = _metrics_in_window(metrics_store.iter_stages(), window)
-    frictions = _frictions_in_window(friction_log.iter_entries(), window)
-    observations = _observations_in_window(ObservationLog(db_path).iter_events(), window)
-    ticket_metrics = tuple(
-        ticket
-        for ticket in metrics_store.iter_ticket_rework_counters()
-        if ticket.milestone is None or ticket.milestone == window.milestone
-    )
-    summary = _summarize_metrics(metrics)
-    designer_sections = _designer_sections(metrics, ticket_metrics, observations, frictions)
-
-    target = Path(output_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        render_retro_markdown(
+    if persona_report_path is not None:
+        parsed = _parse_persona_report(persona_report_path)
+        rendered = render_persona_retro_markdown(window, parsed)
+    else:
+        metrics_store = MetricsStore(db_path)
+        friction_log = FrictionLog(db_path)
+        metrics = _metrics_in_window(metrics_store.iter_stages(), window)
+        frictions = _frictions_in_window(friction_log.iter_entries(), window)
+        observations = _observations_in_window(ObservationLog(db_path).iter_events(), window)
+        ticket_metrics = tuple(
+            ticket
+            for ticket in metrics_store.iter_ticket_rework_counters()
+            if ticket.milestone is None or ticket.milestone == window.milestone
+        )
+        summary = _summarize_metrics(metrics)
+        designer_sections = _designer_sections(metrics, ticket_metrics, observations, frictions)
+        rendered = render_retro_markdown(
             window,
             frictions,
             summary,
             designer_sections=designer_sections if window.milestone.upper() == "M3" else (),
-        ),
-        encoding="utf-8",
-    )
+        )
+
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(rendered, encoding="utf-8")
     return target
 
 
@@ -180,6 +206,315 @@ def render_retro_markdown(
         lines.extend(_render_m3_designer_sections(designers))
         lines.extend(_render_m3_team_section(designers))
     return "\n".join(lines)
+
+
+def render_persona_retro_markdown(window: RetroWindow, report: ParsedPersonaReport) -> str:
+    lines: list[str] = [
+        f"# {window.milestone} Retrospective",
+        "",
+        "## M-WIZ Persona Report",
+        "",
+        "### Headline metric",
+        "",
+        f"- {report.headline_metric}",
+        "",
+        "## Closed baseline findings",
+        "",
+    ]
+
+    if report.closed_baseline_findings:
+        for finding in report.closed_baseline_findings:
+            lines.append(f"- {finding.number} ({_normalize_severity(finding.severity)}): {finding.description}")
+    else:
+        lines.append("_No baseline findings were confirmed as closed._")
+
+    lines.extend(["", "## Residual findings carried forward", ""])
+    residuals_by_severity = _group_findings_by_severity(report.residual_findings)
+    if residuals_by_severity:
+        for severity in sorted(residuals_by_severity):
+            lines.append(f"### {severity}")
+            for finding in residuals_by_severity[severity]:
+                lines.append(f"- {finding.number}: {finding.description}")
+            lines.append("")
+    else:
+        lines.append("_No residual findings were carried forward._")
+
+    lines.extend(["## New findings discovered during M-WIZ", ""])
+    if report.new_findings:
+        for finding in report.new_findings:
+            lines.append(f"- {finding.number} ({_normalize_severity(finding.severity)}): {finding.description}")
+    else:
+        lines.append("_No new findings were observed during this run._")
+
+    lines.extend(["", "## Qualitative summary", "", _persona_summary_paragraph(report)])
+    return "\n".join(lines)
+
+
+def _parse_persona_report(path: Path | str) -> ParsedPersonaReport:
+    report_path = Path(path)
+    if not report_path.exists():
+        raise ValueError(f"persona report not found: {report_path}")
+
+    report_lines = report_path.read_text(encoding="utf-8").splitlines()
+    sections: dict[str, list[str]] = {"preamble": []}
+    current_section = "preamble"
+
+    for raw_line in report_lines:
+        heading = _parse_markdown_heading(raw_line)
+        if heading is None:
+            sections[current_section].append(raw_line)
+            continue
+
+        section_key = _normalize_heading(heading)
+        current_section = section_key
+        sections.setdefault(section_key, [])
+
+    headline_metric = _extract_headline_metric(_find_section(sections, "headline metric"))
+    baseline_rows = _parse_markdown_table(
+        _find_section(sections, "baseline comparison table"),
+        expected_columns=5,
+    )
+    if baseline_rows is None:
+        raise ValueError("persona report missing required section: baseline comparison table")
+
+    closed, residual = _split_baseline_findings(baseline_rows)
+    new_findings = tuple(
+        _parse_new_finding_rows(
+            _parse_markdown_table(
+                _find_section(sections, "new findings"),
+                expected_columns=3,
+            )
+        )
+    )
+
+    residual_bullets = _parse_residual_bullet_list(_find_section(sections, "residuals"))
+    residual = list(residual)
+    residual_numbers = {item.number for item in residual}
+    for item in residual_bullets:
+        if item.number not in residual_numbers:
+            residual.append(item)
+            residual_numbers.add(item.number)
+
+    residual = tuple(
+        sorted(
+            residual,
+            key=lambda finding: (finding.number, finding.severity, finding.description),
+        )
+    )
+
+    monologues = tuple(_extract_persona_monologues(report_lines))
+
+    return ParsedPersonaReport(
+        headline_metric=headline_metric,
+        closed_baseline_findings=tuple(sorted(closed, key=lambda finding: finding.number)),
+        residual_findings=tuple(sorted(residual, key=lambda finding: finding.number)),
+        new_findings=tuple(sorted(new_findings, key=lambda finding: finding.number)),
+        monologues=monologues,
+    )
+
+
+def _find_section(sections: dict[str, list[str]], name: str) -> list[str]:
+    if name in sections:
+        return sections[name]
+    for section_name, value in sections.items():
+        if section_name.startswith(name):
+            return value
+    return []
+
+
+def _parse_markdown_heading(line: str) -> str | None:
+    match = re.match(r"^\s*#{1,6}\s+(.*)\s*$", line)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _normalize_heading(raw: str) -> str:
+    return re.sub(r"\s+", " ", raw.strip().lower())
+
+
+def _extract_headline_metric(lines: list[str]) -> str:
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        bold = re.search(r"\*\*(.+?)\*\*", stripped)
+        if bold:
+            return bold.group(1).strip()
+        if stripped.startswith("-"):
+            stripped = stripped.lstrip("-").strip()
+            if stripped:
+                return stripped
+        return stripped
+    raise ValueError("persona report missing required section: headline metric")
+
+
+def _parse_markdown_table(lines: list[str], expected_columns: int) -> list[tuple[str, ...]] | None:
+    rows: list[tuple[str, ...]] = []
+    found_header = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = tuple(cell.strip() for cell in stripped.strip("|").split("|"))
+        if len(cells) <= 2:
+            continue
+        if not found_header:
+            if set(cells) == {"-"} or any("finding" in cell.lower() for cell in cells):
+                found_header = True
+            continue
+        if _is_markdown_separator_row(cells):
+            continue
+        if len(cells) >= expected_columns:
+            rows.append(cells[:expected_columns])
+    return rows if found_header else None
+
+
+def _is_markdown_separator_row(cells: tuple[str, ...]) -> bool:
+    if not cells:
+        return True
+    return all(re.fullmatch(r"-{3,}", cell) is not None for cell in cells if cell)
+
+
+def _split_baseline_findings(
+    rows: list[tuple[str, ...]]
+) -> tuple[tuple[PersonaFinding, ...], tuple[PersonaFinding, ...]]:
+    closed: list[PersonaFinding] = []
+    residual: list[PersonaFinding] = []
+    for row in rows:
+        entry = PersonaFinding(
+            number=_normalize_finding_number(row[0]),
+            severity=row[1],
+            description=row[2],
+        )
+        status = row[3].strip().lower()
+        if "closed" in status:
+            closed.append(entry)
+        elif status.startswith("residual"):
+            residual.append(entry)
+    return tuple(closed), tuple(residual)
+
+
+def _parse_new_finding_rows(rows: list[tuple[str, ...]] | None) -> tuple[PersonaFinding, ...]:
+    if rows is None:
+        return ()
+    findings: list[PersonaFinding] = []
+    for row in rows:
+        findings.append(
+            PersonaFinding(
+                number=_normalize_finding_number(row[0]),
+                severity=row[1],
+                description=row[2],
+            )
+        )
+    return tuple(findings)
+
+
+def _parse_residual_bullet_list(lines: list[str]) -> list[PersonaFinding]:
+    residuals: list[PersonaFinding] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            continue
+        match = re.match(r"-\s*(.+)$", stripped)
+        if not match:
+            continue
+        payload = match.group(1).strip()
+        number_match = re.match(r"(?P<number>#\S+)\s+(?P<rest>.+)", payload)
+        if number_match:
+            finding_number = number_match.group("number")
+            rest = number_match.group("rest")
+        else:
+            finding_number = f"R{len(residuals) + 1}"
+            rest = payload
+        parts = rest.split(" ", 1)
+        if len(parts) == 2:
+            severity = parts[0].strip("()")
+            description = parts[1]
+        else:
+            severity = "Unknown"
+            description = rest
+        residuals.append(
+            PersonaFinding(
+                number=_normalize_finding_number(finding_number),
+                severity=severity,
+                description=description,
+            )
+        )
+    return residuals
+
+
+def _normalize_finding_number(value: str) -> str:
+    return value.strip()
+
+
+def _extract_persona_monologues(lines: list[str]) -> list[PersonaMonologue]:
+    monologues: list[PersonaMonologue] = []
+    current_persona = "Unknown persona"
+    in_persona_section = False
+    for raw_line in lines:
+        heading = _parse_markdown_heading(raw_line)
+        if heading is not None:
+            normalized_heading = _normalize_heading(heading)
+            in_persona_section = "persona section" in normalized_heading
+            if in_persona_section:
+                if ":" in heading:
+                    current_persona = heading.split(":", 1)[1].split("(")[0].strip()
+            continue
+
+        if not in_persona_section:
+            continue
+
+        outcome = re.match(r"^\s*Outcome:\s*(.+)$", raw_line, re.IGNORECASE)
+        if outcome:
+            text = outcome.group(1).strip().strip('"')
+            if text:
+                if all(
+                    quote.persona != current_persona or quote.text != text
+                    for quote in monologues
+                ):
+                    monologues.append(PersonaMonologue(persona=current_persona, text=text))
+            continue
+
+        for quote in re.findall(r'"([^"]+)"', raw_line):
+            quote = quote.strip()
+            if quote and len(quote) >= 12:
+                monologues.append(PersonaMonologue(persona=current_persona, text=quote))
+
+    if not monologues:
+        monologues.append(
+            PersonaMonologue(
+                persona="Summary",
+                text="The report did not include explicit quoted monologues.",
+            )
+        )
+    return monologues
+
+
+def _group_findings_by_severity(
+    findings: Iterable[PersonaFinding],
+) -> dict[str, list[PersonaFinding]]:
+    grouped: dict[str, list[PersonaFinding]] = {}
+    for finding in findings:
+        grouped.setdefault(_normalize_severity(finding.severity), []).append(finding)
+    return grouped
+
+
+def _normalize_severity(value: str) -> str:
+    return (value or "Unknown").strip()
+
+
+def _persona_summary_paragraph(report: ParsedPersonaReport) -> str:
+    closed_ids = [finding.number for finding in report.closed_baseline_findings]
+    if closed_ids:
+        closing = f"Closed baseline findings were confirmed in this run: {', '.join(closed_ids)}."
+    else:
+        closing = "No closed baseline findings were confirmed in this run."
+
+    quotes = [f"{quote.persona}: \"{quote.text}\"" for quote in report.monologues]
+    if quotes:
+        return f"{closing} " + " ".join(quotes)
+    return closing
 
 
 def _metrics_in_window(metrics: Iterable[StageMetric], window: RetroWindow) -> list[StageMetric]:
